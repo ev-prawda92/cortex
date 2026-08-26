@@ -2042,10 +2042,14 @@ async function renderAgents(){
                   </div>
                   <div class="form-group"><label>Model</label>
                     <select id="reg-model">
-                      <option value="claude-sonnet-5">claude-sonnet-5</option>
-                      <option value="claude-opus-5">claude-opus-5</option>
                       <option value="claude-fable-5">claude-fable-5</option>
+                      <option value="claude-opus-5">claude-opus-5</option>
+                      <option value="claude-sonnet-5">claude-sonnet-5</option>
                       <option value="claude-haiku-4-5">claude-haiku-4-5</option>
+                      <option value="claude-opus-4-8">claude-opus-4-8</option>
+                      <option value="claude-opus-4-7">claude-opus-4-7</option>
+                      <option value="claude-opus-4-6">claude-opus-4-6</option>
+                      <option value="claude-sonnet-4-6">claude-sonnet-4-6</option>
                       <option value="gpt-5.6-sol">gpt-5.6-sol</option>
                       <option value="gpt-5.6-terra">gpt-5.6-terra</option>
                       <option value="gpt-5.6-luna">gpt-5.6-luna</option>
@@ -2738,7 +2742,7 @@ async function renderSettings(){
   const s=await (await fetch('/api/settings')).json();
   const providers=['anthropic','openai','gemini'];
   const models={
-    anthropic:['claude-fable-5','claude-opus-5','claude-sonnet-5','claude-haiku-4-5'],
+    anthropic:['claude-fable-5','claude-opus-5','claude-sonnet-5','claude-haiku-4-5','claude-opus-4-8','claude-opus-4-7','claude-opus-4-6','claude-sonnet-4-6'],
     openai:['gpt-5.6-sol','gpt-5.6-terra','gpt-5.6-luna','gpt-5.5','gpt-5.4'],
     gemini:['gemini-3.1-pro','gemini-3.7-flash','gemini-3.6-flash','gemini-3.5-flash-lite','gemini-2.5-pro','gemini-2.5-flash']
   };
