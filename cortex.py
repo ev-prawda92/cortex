@@ -1133,6 +1133,7 @@ def run_live_agent(agent_id: str, body: RunIn):
     if not a.get("live"):
         raise HTTPException(400, "this agent is not marked as live")
 
+    run_start = datetime.now(timezone.utc).isoformat()
     log_event(agent_id, "run.start", {"input": body.claim[:200], "config_version": a["version"]})
 
     cfg = a["config"]
@@ -1142,23 +1143,26 @@ def run_live_agent(agent_id: str, body: RunIn):
     # ── Webhook endpoint: return instructions ──
     if ep_type == "webhook":
         log_event(agent_id, "run.webhook_info", {"endpoint": endpoint.get("url", "")})
-        return {
-            "ok": True,
-            "run": {
-                "claim": body.claim,
-                "outcome": "WEBHOOK_PENDING",
-                "published": False,
-                "steps_used": 0,
-                "config_version": a["version"],
-                "provider": "webhook",
-                "model": "",
-                "trace": [{"kind": "info", "text": f"Send data to webhook: {endpoint.get('url', 'not configured')}"}],
-                "detail": {
-                    "summary": f"Webhook agent — POST your data to the configured endpoint or use /webhooks/{agent_id}/{{event_type}}",
-                    "reason": "", "citations": [], "route_to": None
-                }
+        webhook_now = datetime.now(timezone.utc).isoformat()
+        rec = {
+            "claim": body.claim,
+            "outcome": "WEBHOOK_PENDING",
+            "published": False,
+            "steps_used": 0,
+            "config_version": a["version"],
+            "provider": "webhook",
+            "model": "",
+            "trace": [{"kind": "info", "text": f"Send data to webhook: {endpoint.get('url', 'not configured')}"}],
+            "started_at": run_start,
+            "finished_at": webhook_now,
+            "detail": {
+                "summary": f"Webhook agent — POST your data to the configured endpoint or use /webhooks/{agent_id}/{{event_type}}",
+                "reason": "", "citations": [], "route_to": None
             }
         }
+        RUNS.setdefault(agent_id, []).insert(0, rec)
+        del RUNS[agent_id][12:]
+        return {"ok": True, "run": rec}
 
     # ── REST endpoint: proxy to external URL ──
     if ep_type == "rest" and endpoint.get("url"):
@@ -1170,22 +1174,26 @@ def run_live_agent(agent_id: str, body: RunIn):
                 result = resp.json()
         except Exception as e:
             log_event(agent_id, "run.error", {"message": str(e)})
+            rest_err_end = datetime.now(timezone.utc).isoformat()
             rec = {
                 "claim": body.claim, "outcome": "ERROR", "published": False,
                 "steps_used": 0, "config_version": a["version"],
                 "provider": "rest", "model": "",
                 "trace": [{"kind": "error", "text": str(e)}],
+                "started_at": run_start, "finished_at": rest_err_end,
                 "detail": {"summary": "", "reason": str(e), "citations": [], "route_to": None}
             }
             RUNS.setdefault(agent_id, []).insert(0, rec)
             del RUNS[agent_id][12:]
             return {"ok": False, "error": str(e), "run": rec}
 
+        rest_end = datetime.now(timezone.utc).isoformat()
         rec = {
             "claim": body.claim, "outcome": "COMPLETED", "published": True,
             "steps_used": 1, "config_version": a["version"],
             "provider": "rest", "model": "",
             "trace": [{"kind": "rest_call", "url": endpoint["url"], "status": "ok"}],
+            "started_at": run_start, "finished_at": rest_end,
             "detail": {"summary": json.dumps(result)[:1200], "reason": "", "citations": [], "route_to": None}
         }
         RUNS.setdefault(agent_id, []).insert(0, rec)
@@ -1255,12 +1263,15 @@ def run_live_agent(agent_id: str, body: RunIn):
         outcome, published = "ERROR", False
         log_event(agent_id, "run.error", {"message": res.get("error", "unknown error")})
 
+    run_end = datetime.now(timezone.utc).isoformat()
     rec = {
         "claim": body.claim, "outcome": outcome, "published": published,
         "steps_used": res["steps_used"], "config_version": a["version"],
         "provider": provider,
         "model": model_cfg.get("model_name") or get_model(provider),
         "trace": trace,
+        "started_at": run_start,
+        "finished_at": run_end,
         "detail": {
             "summary": (res.get("final_text") or "")[:1200],
             "reason": res.get("error", ""),
@@ -1794,7 +1805,7 @@ h4{font-size:10.5px;font-weight:600;letter-spacing:.1em;text-transform:uppercase
 <div class="view" id="root"></div>
 
 <script>
-let AGENTS=[], sel=null, pending=null, view='monitor', META={}, USER=null;
+let AGENTS=[], sel=null, pending=null, view='monitor', META={}, USER=null, advancedMode=false;
 const TABS=['monitor','agents','control','runs','integrations','deploy','events','history','automation','settings'];
 
 async function boot(){
@@ -2276,12 +2287,85 @@ function sidebar(){
 
 async function pick(id){ sel=id; pending=null; await render(); }
 
+function toggleAdvanced(){ advancedMode=!advancedMode; renderControl(); }
+
 async function renderControl(){
   if(!sel){document.getElementById('root').innerHTML='<div class="hint" style="padding:40px">Select or register an agent first.</div>';return;}
   const a=await (await fetch('/api/agents/'+sel)).json();
   const cfg=a.config||{};
   const beh=cfg.behavior||{};
   const exec=cfg.execution||{};
+  const model=cfg.model||{};
+
+  const modeToggle=`<div style="display:flex;align-items:center;gap:8px">
+    <span style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em">${advancedMode?'Advanced':'Simple'}</span>
+    <button onclick="toggleAdvanced()" style="position:relative;width:36px;height:18px;border-radius:9px;border:none;background:${advancedMode?'var(--accent)':'#d4c8b8'};cursor:pointer;transition:background .2s">
+      <span style="position:absolute;top:2px;${advancedMode?'right:2px':'left:2px'};width:14px;height:14px;border-radius:50%;background:white;transition:all .2s"></span>
+    </button>
+  </div>`;
+
+  // Simple view: just the essentials
+  const simpleConfig=`<div class="cfg">
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px">
+      <div style="padding:12px;background:#faf8f5;border-radius:6px;border:1px solid var(--line)">
+        <div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:var(--accent);margin-bottom:6px">Model</div>
+        <div style="font-size:14px;font-weight:500">${model.model_name||'--'}</div>
+        <div style="font-size:11px;color:var(--muted);margin-top:2px">${model.provider||'--'} · temp ${model.temperature??'--'}</div>
+      </div>
+      <div style="padding:12px;background:#faf8f5;border-radius:6px;border:1px solid var(--line)">
+        <div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:var(--accent);margin-bottom:6px">Status</div>
+        <div style="font-size:14px;font-weight:500">${a.status} ${a.live?'· <span style="color:var(--seal)">LIVE</span>':''}</div>
+        <div style="font-size:11px;color:var(--muted);margin-top:2px">v${a.version} · ${(a.endpoint||{}).type||'embedded'}</div>
+      </div>
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px">
+      <div style="padding:8px 10px;background:#faf8f5;border-radius:4px;border:1px solid var(--line);text-align:center">
+        <div style="font-size:16px;font-weight:600">${(cfg.data_sources||[]).length}</div>
+        <div style="font-size:9px;color:var(--muted);text-transform:uppercase">Data Sources</div>
+      </div>
+      <div style="padding:8px 10px;background:#faf8f5;border-radius:4px;border:1px solid var(--line);text-align:center">
+        <div style="font-size:16px;font-weight:600">${(cfg.tools||[]).length}</div>
+        <div style="font-size:9px;color:var(--muted);text-transform:uppercase">Tools</div>
+      </div>
+      <div style="padding:8px 10px;background:#faf8f5;border-radius:4px;border:1px solid var(--line);text-align:center">
+        <div style="font-size:16px;font-weight:600">${beh.confidence_threshold??'--'}</div>
+        <div style="font-size:9px;color:var(--muted);text-transform:uppercase">Confidence</div>
+      </div>
+      <div style="padding:8px 10px;background:#faf8f5;border-radius:4px;border:1px solid var(--line);text-align:center">
+        <div style="font-size:16px;font-weight:600">${exec.max_retries??'--'}</div>
+        <div style="font-size:9px;color:var(--muted);text-transform:uppercase">Retries</div>
+      </div>
+    </div>
+  </div>`;
+
+  // Advanced view: full cfgRows + data source management
+  const advancedConfig=`<div class="sect"><h4>Full Configuration</h4>${cfgRows(cfg)}</div>
+    <div class="sect">
+      <h4>Data Sources</h4>
+      <div id="ds-list" style="margin-bottom:10px">
+        ${(cfg.data_sources||[]).map(d=>`<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 10px;margin-bottom:4px;background:#faf8f5;border-radius:4px;border:1px solid var(--line)">
+          <div>
+            <span style="font-weight:500">${esc(d.name)}</span>
+            <span style="font-size:11px;color:var(--muted);margin-left:6px">${d.type}</span>
+            <span style="font-size:10px;padding:1px 6px;border-radius:3px;background:${d.auth_type==='none'?'#e8e0d4':'#e0d4c0'};color:var(--ink);margin-left:4px">${d.auth_type}</span>
+          </div>
+          <button class="btn ghost" style="padding:2px 8px;font-size:10px" onclick="removeDataSource('${esc(d.name)}')">Remove</button>
+        </div>`).join('')||'<div class="hint" style="margin:0">No data sources configured.</div>'}
+      </div>
+      <div style="padding:12px;background:#faf8f5;border-radius:6px;border:1px dashed var(--line);margin-top:8px">
+        <div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--accent);margin-bottom:8px">Add Data Source</div>
+        <div class="form-row" style="grid-template-columns:1fr 1fr 1fr;gap:6px;margin-bottom:8px">
+          <div class="form-group" style="margin:0"><label>Name</label><input id="ds-name" placeholder="e.g. customer_db" style="font-size:11px;padding:6px 8px"></div>
+          <div class="form-group" style="margin:0"><label>Type</label><select id="ds-type" style="font-size:11px;padding:6px 8px"><option value="api">API</option><option value="database">Database</option><option value="file">File / S3</option><option value="webhook">Webhook</option><option value="graphql">GraphQL</option><option value="grpc">gRPC</option><option value="custom">Custom</option></select></div>
+          <div class="form-group" style="margin:0"><label>Auth</label><select id="ds-auth" style="font-size:11px;padding:6px 8px"><option value="api_key">API Key</option><option value="oauth2">OAuth 2.0</option><option value="bearer">Bearer Token</option><option value="basic">Basic Auth</option><option value="connection_string">Connection String</option><option value="iam">IAM Role</option><option value="none">None</option></select></div>
+        </div>
+        <div class="form-row" style="grid-template-columns:2fr 1fr auto;gap:6px;align-items:end">
+          <div class="form-group" style="margin:0"><label>Endpoint / Connection</label><input id="ds-endpoint" placeholder="https://api.example.com/v1 or postgres://..." style="font-size:11px;padding:6px 8px"></div>
+          <div class="form-group" style="margin:0"><label>Refresh</label><select id="ds-refresh" style="font-size:11px;padding:6px 8px"><option value="realtime">Realtime</option><option value="5m">Every 5 min</option><option value="1h">Hourly</option><option value="1d">Daily</option><option value="manual">Manual</option></select></div>
+          <button class="btn accent" style="padding:6px 12px;font-size:11px;margin-bottom:0" onclick="addDataSource()">Add</button>
+        </div>
+      </div>
+    </div>`;
 
   document.getElementById('root').innerHTML=`<div class="wrap">${sidebar()}
     <div class="panel">
@@ -2291,30 +2375,17 @@ async function renderControl(){
           <div class="acct">${esc(a.account||'Custom')}</div>
           <div style="margin-top:4px;font-size:11.5px;color:var(--muted)">${esc(a.description||'')}</div>
         </div>
-        <div style="text-align:right"><div class="vtag">v${a.version} · ${(a.endpoint||{}).type||'embedded'}</div>
-          <div class="ctrls" style="margin-top:8px">
+        <div style="display:flex;flex-direction:column;align-items:flex-end;gap:8px">
+          ${modeToggle}
+          <div class="ctrls">
             <button class="btn ghost" onclick="ctl('start')">Start</button>
             <button class="btn ghost" onclick="ctl('restart')">Restart</button>
             <button class="btn ghost" onclick="ctl('stop')">Stop</button>
-          </div></div>
-      </div>
-      <div class="sect"><h4>Current Config</h4>${cfgRows(cfg)}</div>
-
-      <div class="sect">
-        <h4>Data Sources</h4>
-        <div id="ds-list" style="margin-bottom:10px">
-          ${(cfg.data_sources||[]).map(d=>`<div style="display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid var(--line)">
-            <div><span style="font-weight:500">${esc(d.name)}</span> <span style="font-size:11px;color:var(--muted)">${d.type} · ${d.auth_type}</span></div>
-            <button class="btn ghost" style="padding:2px 8px;font-size:10px" onclick="removeDataSource('${esc(d.name)}')">Remove</button>
-          </div>`).join('')||'<div class="hint" style="margin:0">No data sources. Add one below.</div>'}
-        </div>
-        <div class="form-row" style="grid-template-columns:1fr 1fr 1fr auto;gap:6px;align-items:end">
-          <div class="form-group"><label>Name</label><input id="ds-name" placeholder="e.g. my_api" style="font-size:11px;padding:6px 8px"></div>
-          <div class="form-group"><label>Type</label><select id="ds-type" style="font-size:11px;padding:6px 8px"><option>api</option><option>database</option><option>webhook</option><option>custom</option></select></div>
-          <div class="form-group"><label>Auth</label><select id="ds-auth" style="font-size:11px;padding:6px 8px"><option>api_key</option><option>oauth2</option><option>connection_string</option><option>none</option></select></div>
-          <button class="btn accent" style="padding:6px 10px;font-size:11px;margin-bottom:0" onclick="addDataSource()">Add</button>
+            ${a.live?'<button class="btn ghost" style="color:var(--brick)" onclick="ctl(\'pause\')">Pause</button>':'<button class="btn accent" onclick="ctl(\'golive\')">Go Live</button>'}
+          </div>
         </div>
       </div>
+      ${advancedMode ? advancedConfig : `<div class="sect"><h4>Overview</h4>${simpleConfig}</div>`}
 
       ${a.live ? liveRunPanel(a) : ''}
       <div class="sect">
@@ -2426,13 +2497,34 @@ async function apply(){
 async function ctl(action){ await fetch('/api/agents/'+sel+'/control?action='+action,{method:'POST'}); await boot(); renderControl(); }
 
 /* ═══════════════ RUNS — Execution History + Audit ═══════════════ */
+let runsFilter='ALL';
+function fmtTime(iso){if(!iso)return'—';try{const d=new Date(iso);return d.toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit',second:'2-digit'})}catch(e){return'—'}}
+function calcDuration(start,end){if(!start||!end)return'—';try{const ms=new Date(end)-new Date(start);if(ms<1000)return ms+'ms';if(ms<60000)return(ms/1000).toFixed(1)+'s';return Math.floor(ms/60000)+'m '+(Math.round((ms%60000)/1000))+'s'}catch(e){return'—'}}
+function toggleTrace(id){const el=document.getElementById(id);if(!el)return;const btn=el.previousElementSibling?.querySelector('.trace-toggle');if(el.style.display==='none'){el.style.display='block';if(btn)btn.textContent='▾ Hide trace'}else{el.style.display='none';if(btn)btn.textContent='▸ Show trace'}}
+function setRunsFilter(f,el){runsFilter=f;document.querySelectorAll('.rf-btn').forEach(b=>b.classList.remove('active'));el.classList.add('active');renderRuns();}
+
 async function renderRuns(){
   if(!sel){document.getElementById('root').innerHTML='<div class="hint" style="padding:40px">Select an agent first.</div>';return;}
   const a=AGENTS.find(x=>x.id===sel);
   const r=await (await fetch('/api/agents/'+sel+'/runs')).json();
-  const runs=r.runs||[];
+  let runs=r.runs||[];
 
-  const rows=runs.length?runs.map((run,i)=>{
+  /* outcome counts for filter badges */
+  const counts={ALL:runs.length,COMPLETED:0,ESCALATED:0,ERROR:0,WEBHOOK_PENDING:0};
+  runs.forEach(r=>{if(counts[r.outcome]!==undefined)counts[r.outcome]++;});
+
+  /* apply filter */
+  const filtered=runsFilter==='ALL'?runs:runs.filter(r=>r.outcome===runsFilter);
+
+  const filterBar=`<div style="display:flex;gap:6px;margin-bottom:14px;flex-wrap:wrap">
+    ${['ALL','COMPLETED','ESCALATED','ERROR','WEBHOOK_PENDING'].map(f=>
+      `<button class="rf-btn${runsFilter===f?' active':''}" onclick="setRunsFilter('${f}',this)"
+        style="padding:4px 10px;border-radius:6px;border:1px solid var(--line);background:${runsFilter===f?'var(--ink)':'var(--bg)'};color:${runsFilter===f?'#fff':'var(--faint)'};cursor:pointer;font-size:11px;font-family:'IBM Plex Mono'">${f==='ALL'?'All':f} <span style="opacity:.7">${counts[f]||0}</span></button>`
+    ).join('')}
+  </div>`;
+
+  const rows=filtered.length?filtered.map((run,i)=>{
+    const traceId='trace-'+i+'-'+Date.now();
     const traceHTML=(run.trace||[]).map(t=>{
       if(t.kind==='think') return `<div class="tr think"><span class="trk">think</span> ${esc(t.text||'')}</div>`;
       if(t.kind==='act') return `<div class="tr act"><span class="trk">act</span> <b>${esc(t.tool||'')}</b> ${esc(JSON.stringify(t.args||{})).substring(0,120)}</div>`;
@@ -2442,27 +2534,38 @@ async function renderRuns(){
       if(t.kind==='rest_call') return `<div class="tr act"><span class="trk">rest</span> ${esc(t.url||'')} ${t.status||''}</div>`;
       if(t.kind==='info') return `<div class="tr"><span class="trk">info</span> ${esc(t.text||'')}</div>`;
       if(t.kind==='error') return `<div class="tr esc"><span class="trk">error</span> ${esc(t.text||'')}</div>`;
+      if(t.kind==='gate') return `<div class="tr gatetr"><span class="trk">GATE</span><b>${esc(t.decision||'')}</b></div>`;
       return '';
     }).join('');
+
+    const outcomeColors={COMPLETED:'#1a7',ESCALATED:'#d90',ERROR:'#c33',WEBHOOK_PENDING:'#888'};
+    const dur=calcDuration(run.started_at,run.finished_at);
 
     return `<div class="runbox" style="margin-bottom:12px">
       <div class="runhead">
         <div style="display:flex;gap:10px;align-items:center">
-          <span class="outcome ${run.outcome}">${run.outcome}</span>
-          <span style="font-family:'IBM Plex Mono';font-size:10px;color:var(--faint)">Run #${runs.length-i}</span>
+          <span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:10px;font-weight:600;letter-spacing:.5px;color:#fff;background:${outcomeColors[run.outcome]||'#888'}">${run.outcome}</span>
+          <span style="font-family:'IBM Plex Mono';font-size:10px;color:var(--faint)">Run #${runs.length - runs.indexOf(run)}</span>
         </div>
         <div style="font-size:10px;color:var(--faint);font-family:'IBM Plex Mono';text-align:right">
-          <div>${run.steps_used||0} steps · v${run.config_version}</div>
+          <div>${run.steps_used||0} steps · v${run.config_version} · ${dur!=='—'?'⏱ '+dur:''}</div>
           <div>${run.provider||''} ${run.model||''}</div>
         </div>
+      </div>
+      <div style="padding:6px 13px;background:#faf8f5;font-size:11px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:4px">
+        <div><span style="color:var(--faint)">Started:</span> ${fmtTime(run.started_at)}</div>
+        <div><span style="color:var(--faint)">Finished:</span> ${fmtTime(run.finished_at)}</div>
       </div>
       <div style="padding:8px 13px;background:#faf8f5;font-size:12px;border-bottom:1px solid var(--line)">
         <span class="k">Input:</span> <span class="v">${esc((run.claim||'').substring(0,200))}</span>
       </div>
-      <div class="trace">${traceHTML||'<div style="padding:10px;color:var(--faint)">No trace</div>'}</div>
+      <div style="padding:6px 13px;border-bottom:1px solid var(--line)">
+        <span class="trace-toggle" onclick="toggleTrace('${traceId}')" style="cursor:pointer;font-size:11px;color:var(--accent);user-select:none">▸ Show trace</span>
+      </div>
+      <div class="trace" id="${traceId}" style="display:none">${traceHTML||'<div style="padding:10px;color:var(--faint)">No trace</div>'}</div>
       ${run.detail?.summary?`<div class="concl"><span class="k">Output:</span> ${esc(run.detail.summary.substring(0,500))}</div>`:''}
     </div>`;
-  }).join('') : '<div class="empty" style="padding:20px">No execution history yet. Run an agent from the Control tab.</div>';
+  }).join('') : `<div class="empty" style="padding:20px">${runsFilter==='ALL'?'No execution history yet. Run an agent from the Control tab.':'No '+runsFilter+' runs found.'}</div>`;
 
   document.getElementById('root').innerHTML=`<div class="wrap">${sidebar()}
     <div>
@@ -2470,11 +2573,21 @@ async function renderRuns(){
         <h2 style="margin:0">${esc(a?.name||sel)} — Run History</h2>
         <span class="vtag">${runs.length} runs</span>
       </div>
+      ${filterBar}
       ${rows}
     </div></div>`;
 }
 
 /* ═══════════════ INTEGRATIONS — Code Generation ═══════════════ */
+const INT_META={
+  python:{icon:'🐍',label:'Python',desc:'Ready-to-use Python snippet using the requests library.'},
+  javascript:{icon:'⚡',label:'JavaScript',desc:'Fetch-based JavaScript snippet for browser or Node.js.'},
+  curl:{icon:'📟',label:'cURL',desc:'Command-line cURL request you can run directly in a terminal.'},
+  openapi:{icon:'📄',label:'OpenAPI',desc:'OpenAPI 3.0 spec for this agent endpoint — import into Postman, Swagger, etc.'},
+  webhook:{icon:'🔗',label:'Webhook',desc:'Incoming webhook setup for event-driven integrations.'}
+};
+let intFmt='python';
+
 async function renderIntegrations(){
   if(!sel){document.getElementById('root').innerHTML='<div class="hint" style="padding:40px">Select an agent first to generate integrations.</div>';return;}
   const a=AGENTS.find(x=>x.id===sel);
@@ -2484,31 +2597,65 @@ async function renderIntegrations(){
       <div class="phead">
         <div><h3>Integration Code</h3><div class="acct">${esc(a?.name||sel)}</div></div>
       </div>
-      <div class="tab-row">
-        <button class="tab-btn active" onclick="loadIntCode('python',this)">Python</button>
-        <button class="tab-btn" onclick="loadIntCode('javascript',this)">JavaScript</button>
-        <button class="tab-btn" onclick="loadIntCode('curl',this)">cURL</button>
-        <button class="tab-btn" onclick="loadIntCode('openapi',this)">OpenAPI</button>
-        <button class="tab-btn" onclick="loadIntCode('webhook',this)">Webhook</button>
+      <div style="padding:12px 20px;background:#faf8f5;border-bottom:1px solid var(--line);font-size:12px;display:flex;align-items:center;gap:8px">
+        <span style="color:var(--faint)">Base URL:</span>
+        <input id="int-base-url" type="text" value="${location.origin}" style="flex:1;padding:4px 8px;border:1px solid var(--line);border-radius:4px;font-family:'IBM Plex Mono';font-size:11px" readonly>
+        <button onclick="navigator.clipboard.writeText(document.getElementById('int-base-url').value)" style="padding:4px 8px;border:1px solid var(--line);border-radius:4px;background:var(--bg);cursor:pointer;font-size:10px">Copy URL</button>
       </div>
+      <div class="tab-row">
+        ${Object.entries(INT_META).map(([k,v])=>
+          `<button class="tab-btn${intFmt===k?' active':''}" onclick="loadIntCode('${k}',this)">${v.icon} ${v.label}</button>`
+        ).join('')}
+      </div>
+      <div id="int-desc" style="padding:8px 20px;font-size:11px;color:var(--faint);border-bottom:1px solid var(--line)">${INT_META[intFmt].desc}</div>
       <div class="sect" id="int-code"><div class="hint">Loading...</div></div>
     </div></div>`;
-  loadIntCode('python');
+  loadIntCode(intFmt);
 }
 
 async function loadIntCode(fmt,btn){
+  intFmt=fmt;
   if(btn){
     document.querySelectorAll('.tab-btn').forEach(b=>b.classList.remove('active'));
     btn.classList.add('active');
   }
+  const descEl=document.getElementById('int-desc');
+  if(descEl&&INT_META[fmt]) descEl.textContent=INT_META[fmt].desc;
   const d=await(await fetch('/api/agents/'+sel+'/integration/'+fmt)).json();
   const box=document.getElementById('int-code');
   if(d.ok){
-    box.innerHTML=`<div class="code-block"><button class="copy-btn" onclick="navigator.clipboard.writeText(this.parentElement.querySelector('pre').textContent)">Copy</button><pre>${esc(d.code)}</pre></div>
-      <div class="hint" style="margin-top:12px">Auto-generated for <b>${esc(d.agent_id)}</b>. Customize the endpoint URL and authentication for your environment.</div>`;
+    const highlighted=highlightCode(d.code,fmt);
+    box.innerHTML=`<div class="code-block"><button class="copy-btn" onclick="copyIntCode(this)" style="transition:background .2s">📋 Copy</button><pre>${highlighted}</pre></div>
+      <div style="margin-top:12px;padding:10px 14px;background:#faf8f5;border:1px solid var(--line);border-radius:6px;font-size:11px;display:flex;gap:12px;align-items:center">
+        <span style="font-size:16px">${INT_META[fmt]?.icon||'📄'}</span>
+        <div><b>Agent:</b> ${esc(d.agent_id)} · <b>Format:</b> ${fmt} · <span style="color:var(--faint)">Customize the endpoint URL and auth for your environment.</span></div>
+      </div>`;
   }else{
     box.innerHTML=`<div class="flag">${esc(d.detail||'Error generating code')}</div>`;
   }
+}
+function copyIntCode(btn){
+  const pre=btn.parentElement.querySelector('pre');
+  navigator.clipboard.writeText(pre.textContent);
+  const orig=btn.innerHTML;btn.innerHTML='✅ Copied!';btn.style.background='rgba(26,170,100,.25)';
+  setTimeout(()=>{btn.innerHTML=orig;btn.style.background=''},1500);
+}
+function highlightCode(code,fmt){
+  let h=esc(code);
+  if(fmt==='python'){
+    h=h.replace(/\b(import|from|def|return|if|else|elif|try|except|as|with|for|in|not|and|or|True|False|None|print|raise)\b/g,'<span style="color:#ff7b72">$1</span>');
+    h=h.replace(/(["'])(?:(?!\1).)*\1/g,'<span style="color:#a5d6ff">$&</span>');
+    h=h.replace(/(#[^\n]*)/g,'<span style="color:#8b949e">$1</span>');
+  }else if(fmt==='javascript'){
+    h=h.replace(/\b(const|let|var|function|return|if|else|try|catch|await|async|throw|new|true|false|null|undefined|console)\b/g,'<span style="color:#ff7b72">$1</span>');
+    h=h.replace(/(["'`])(?:(?!\1).)*\1/g,'<span style="color:#a5d6ff">$&</span>');
+    h=h.replace(/(\/\/[^\n]*)/g,'<span style="color:#8b949e">$1</span>');
+  }else if(fmt==='curl'){
+    h=h.replace(/\b(curl)\b/g,'<span style="color:#ff7b72">$1</span>');
+    h=h.replace(/(-[A-Za-z]+)/g,'<span style="color:#d2a8ff">$1</span>');
+    h=h.replace(/(["'])(?:(?!\1).)*\1/g,'<span style="color:#a5d6ff">$&</span>');
+  }
+  return h;
 }
 
 /* ═══════════════ DEPLOY ═══════════════ */
