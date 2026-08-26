@@ -781,6 +781,186 @@ def register_agent(body: RegisterAgentIn):
     log_event(agent_id, "agent.registered", {"name": body.name})
     return {"ok": True, "agent_id": agent_id, "agent": {"id": agent_id, **agent}}
 
+class ImportAgentIn(BaseModel):
+    config_json: str  # raw JSON or YAML string
+    source_format: str = "auto"  # auto | cortex | langchain | crewai | openai | raw
+
+def _detect_and_normalize(raw: dict, source_format: str) -> dict:
+    """Detect agent config format and normalize to CORTEX schema."""
+    fmt = source_format
+
+    if fmt == "auto":
+        # Auto-detect format
+        if "llm" in raw and "tasks" in raw:
+            fmt = "crewai"
+        elif "assistant_id" in raw or "instructions" in raw and "model" in raw.get("", {}).__class__.__name__ == "str":
+            fmt = "openai"
+        elif "llm" in raw and ("prompt" in raw or "chain_type" in raw or "agent_type" in raw):
+            fmt = "langchain"
+        elif "model" in raw and "execution" in raw:
+            fmt = "cortex"
+        else:
+            fmt = "raw"
+
+    result = {
+        "name": raw.get("name", "Imported Agent"),
+        "description": raw.get("description", ""),
+        "source_format": fmt,
+    }
+
+    if fmt == "cortex":
+        # Direct CORTEX config — pass through
+        result["config"] = {k: raw[k] for k in ("model", "execution", "behavior", "data_sources", "tools", "audit") if k in raw}
+        result["name"] = raw.get("name", result["name"])
+        result["description"] = raw.get("description", result["description"])
+        if "endpoint" in raw:
+            result["endpoint_type"] = raw["endpoint"].get("type", "embedded")
+            result["endpoint_url"] = raw["endpoint"].get("url", "")
+
+    elif fmt == "langchain":
+        llm = raw.get("llm", {})
+        result["name"] = raw.get("name", raw.get("agent_type", "LangChain Agent"))
+        result["description"] = raw.get("description", f"Imported from LangChain ({raw.get('agent_type', 'agent')})")
+        result["config"] = {
+            "model": {
+                "provider": _detect_provider(llm.get("model_name", llm.get("model", ""))),
+                "model_name": llm.get("model_name", llm.get("model", "unknown")),
+                "temperature": llm.get("temperature", 0.7),
+                "max_tokens": llm.get("max_tokens", 4096),
+            },
+            "tools": [{"name": t.get("name", t) if isinstance(t, dict) else str(t),
+                        "description": t.get("description", "") if isinstance(t, dict) else "",
+                        "parameters": t.get("args", []) if isinstance(t, dict) else [],
+                        "rate_limit": 100} for t in raw.get("tools", [])],
+        }
+
+    elif fmt == "crewai":
+        llm = raw.get("llm", {})
+        result["name"] = raw.get("name", raw.get("role", "CrewAI Agent"))
+        result["description"] = raw.get("goal", raw.get("description", f"Imported from CrewAI"))
+        result["config"] = {
+            "model": {
+                "provider": _detect_provider(llm.get("model", "")),
+                "model_name": llm.get("model", "unknown"),
+                "temperature": llm.get("temperature", 0.7),
+                "max_tokens": llm.get("max_tokens", 4096),
+            },
+            "tools": [{"name": t.get("name", str(t)) if isinstance(t, dict) else str(t),
+                        "description": t.get("description", "") if isinstance(t, dict) else "",
+                        "parameters": [], "rate_limit": 100} for t in raw.get("tools", [])],
+        }
+        if raw.get("backstory"):
+            result["description"] += f" | Backstory: {raw['backstory'][:200]}"
+
+    elif fmt == "openai":
+        result["name"] = raw.get("name", "OpenAI Assistant")
+        result["description"] = raw.get("description", raw.get("instructions", "")[:200])
+        model_name = raw.get("model", "gpt-4o")
+        result["config"] = {
+            "model": {
+                "provider": "openai",
+                "model_name": model_name,
+                "temperature": raw.get("temperature", 0.7),
+                "max_tokens": raw.get("max_tokens", 4096),
+            },
+            "tools": [{"name": t.get("type", t.get("function", {}).get("name", "tool")),
+                        "description": t.get("function", {}).get("description", ""),
+                        "parameters": list(t.get("function", {}).get("parameters", {}).get("properties", {}).keys()) if isinstance(t, dict) else [],
+                        "rate_limit": 100} for t in raw.get("tools", [])],
+        }
+
+    else:  # raw — best effort
+        result["name"] = raw.get("name", raw.get("agent_name", "Imported Agent"))
+        result["description"] = raw.get("description", raw.get("desc", "Imported agent"))
+        result["config"] = {}
+        # Try to find model info anywhere
+        for mk in ("model", "llm", "model_config"):
+            if mk in raw and isinstance(raw[mk], dict):
+                result["config"]["model"] = {
+                    "provider": _detect_provider(raw[mk].get("model_name", raw[mk].get("model", raw[mk].get("name", "")))),
+                    "model_name": raw[mk].get("model_name", raw[mk].get("model", raw[mk].get("name", "unknown"))),
+                    "temperature": raw[mk].get("temperature", 0.7),
+                    "max_tokens": raw[mk].get("max_tokens", 4096),
+                }
+                break
+        if "tools" in raw and isinstance(raw["tools"], list):
+            result["config"]["tools"] = [{"name": t.get("name", str(t)) if isinstance(t, dict) else str(t),
+                                           "description": t.get("description", "") if isinstance(t, dict) else "",
+                                           "parameters": [], "rate_limit": 100} for t in raw["tools"]]
+
+    return result
+
+def _detect_provider(model_name: str) -> str:
+    m = model_name.lower()
+    if "claude" in m or "anthropic" in m:
+        return "anthropic"
+    elif "gpt" in m or "o3" in m or "o4" in m:
+        return "openai"
+    elif "gemini" in m:
+        return "gemini"
+    return "anthropic"
+
+@app.post("/api/agents/import")
+def import_agent(body: ImportAgentIn):
+    """Import an agent from JSON config (supports LangChain, CrewAI, OpenAI Assistants, or raw)."""
+    import yaml as yaml_mod
+    try:
+        # Try JSON first, then YAML
+        try:
+            raw = json.loads(body.config_json)
+        except json.JSONDecodeError:
+            try:
+                raw = yaml_mod.safe_load(body.config_json)
+            except Exception:
+                raise HTTPException(400, "Could not parse config as JSON or YAML")
+        if not isinstance(raw, dict):
+            raise HTTPException(400, "Config must be a JSON/YAML object")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(400, f"Parse error: {str(e)}")
+
+    normalized = _detect_and_normalize(raw, body.source_format)
+
+    # Register via the same path
+    agent_id = _slugify(normalized["name"])
+    if not agent_id:
+        agent_id = "imported-agent"
+    base_id = agent_id
+    counter = 2
+    while agent_id in AGENTS:
+        agent_id = f"{base_id}-{counter}"
+        counter += 1
+
+    cfg = _default_config()
+    imp_cfg = normalized.get("config", {})
+    for section in ("model", "execution", "behavior", "audit"):
+        if section in imp_cfg:
+            cfg[section].update(imp_cfg[section])
+    if "data_sources" in imp_cfg:
+        cfg["data_sources"] = imp_cfg["data_sources"]
+    if "tools" in imp_cfg:
+        cfg["tools"] = imp_cfg["tools"]
+
+    agent = {
+        "name": normalized["name"],
+        "description": normalized["description"],
+        "account": f"Imported ({normalized.get('source_format', 'auto')})",
+        "status": "stopped",
+        "version": 1,
+        "containment": 0, "resolution": 0, "escalation": 0, "clinical_flags": 0,
+        "live": True,
+        "type": "custom",
+        "endpoint": {"type": normalized.get("endpoint_type", "embedded"), "url": normalized.get("endpoint_url", "")},
+        "config": cfg,
+    }
+    AGENTS[agent_id] = agent
+    _ensure_history(agent_id)
+    _save_agents()
+    log_event(agent_id, "agent.imported", {"name": normalized["name"], "source_format": normalized.get("source_format")})
+    return {"ok": True, "agent_id": agent_id, "detected_format": normalized.get("source_format", "raw"),
+            "agent": {"id": agent_id, **agent}}
+
 @app.delete("/api/agents/{agent_id}")
 def delete_agent(agent_id: str):
     """Remove an agent."""
@@ -1786,7 +1966,62 @@ async function renderAgents(){
         <div class="agent-grid" style="grid-template-columns:1fr">${agentList}</div>
       </div>
       <div>
-        <div class="panel">
+        <!-- Mode toggle -->
+        <div style="display:flex;gap:0;margin-bottom:16px;border:1px solid var(--line);border-radius:6px;overflow:hidden">
+          <button id="mode-register" class="btn" onclick="toggleAgentMode('register')" style="flex:1;border-radius:0;border:none;background:linear-gradient(135deg,#c4632a,#ea580c);color:#fff;padding:10px;font-size:12px;font-weight:600">Register New</button>
+          <button id="mode-import" class="btn" onclick="toggleAgentMode('import')" style="flex:1;border-radius:0;border:none;background:var(--card);color:var(--muted);padding:10px;font-size:12px;font-weight:600">Import Agent</button>
+        </div>
+
+        <!-- Import Panel -->
+        <div class="panel" id="import-panel" style="display:none">
+          <div class="phead"><h3>Import Agent</h3></div>
+          <div class="sect">
+            <div style="font-size:12px;color:var(--muted);margin-bottom:14px">Import an agent from another system. CORTEX auto-detects the config format and maps it to its schema.</div>
+
+            <div class="form-group"><label>Source Format</label>
+              <select id="imp-format" style="padding:8px 10px;border:1px solid var(--line);border-radius:3px;font:inherit;font-size:13px;width:100%">
+                <option value="auto">Auto-detect</option>
+                <option value="cortex">CORTEX (native)</option>
+                <option value="langchain">LangChain</option>
+                <option value="crewai">CrewAI</option>
+                <option value="openai">OpenAI Assistants</option>
+                <option value="raw">Raw JSON / YAML</option>
+              </select>
+            </div>
+
+            <div style="display:flex;gap:0;margin-bottom:12px;border:1px solid var(--line);border-radius:4px;overflow:hidden">
+              <button class="btn" id="imp-tab-paste" onclick="switchImpTab('paste')" style="flex:1;border-radius:0;border:none;background:var(--accentsoft);color:var(--accent);padding:8px;font-size:11px;font-weight:600">Paste Config</button>
+              <button class="btn" id="imp-tab-file" onclick="switchImpTab('file')" style="flex:1;border-radius:0;border:none;background:var(--card);color:var(--muted);padding:8px;font-size:11px;font-weight:600">Upload File</button>
+              <button class="btn" id="imp-tab-url" onclick="switchImpTab('url')" style="flex:1;border-radius:0;border:none;background:var(--card);color:var(--muted);padding:8px;font-size:11px;font-weight:600">From URL</button>
+            </div>
+
+            <div id="imp-paste" class="form-group">
+              <textarea id="imp-config" rows="12" placeholder='Paste agent config here (JSON or YAML)...\n\nExamples:\n\n// LangChain\n{"llm": {"model_name": "gpt-4o"}, "tools": [...]}\n\n// CrewAI\n{"role": "Researcher", "goal": "...", "llm": {"model": "claude-sonnet-4-6"}}\n\n// OpenAI Assistant\n{"name": "My Assistant", "model": "gpt-4o", "instructions": "..."}\n\n// CORTEX native\n{"name": "...", "model": {...}, "execution": {...}}' style="padding:10px;border:1px solid var(--line);border-radius:4px;font-family:'IBM Plex Mono';font-size:11px;resize:vertical;width:100%;background:var(--paper)"></textarea>
+            </div>
+
+            <div id="imp-file" style="display:none" class="form-group">
+              <div style="border:2px dashed var(--line);border-radius:6px;padding:24px;text-align:center;cursor:pointer;transition:border-color .15s" onclick="document.getElementById('imp-file-input').click()" onmouseover="this.style.borderColor='var(--accent)'" onmouseout="this.style.borderColor='var(--line)'">
+                <div style="font-size:24px;margin-bottom:8px">📄</div>
+                <div style="font-size:12px;font-weight:600;color:var(--ink)">Drop a config file or click to browse</div>
+                <div style="font-size:11px;color:var(--faint);margin-top:4px">Supports .json, .yaml, .yml, .toml</div>
+                <input type="file" id="imp-file-input" accept=".json,.yaml,.yml,.toml,.txt" style="display:none" onchange="handleImportFile(this)"/>
+              </div>
+              <div id="imp-file-name" style="margin-top:8px;font-family:'IBM Plex Mono';font-size:11px;color:var(--accent)"></div>
+            </div>
+
+            <div id="imp-url" style="display:none" class="form-group">
+              <label>Registry / Config URL</label>
+              <input id="imp-url-input" placeholder="https://api.example.com/agents/my-agent/config" style="padding:8px 10px;border:1px solid var(--line);border-radius:3px;font:inherit;font-size:13px;width:100%"/>
+              <div style="font-size:10px;color:var(--faint);margin-top:4px">Fetches JSON config from a remote URL</div>
+            </div>
+
+            <button class="btn accent" onclick="importAgent()" style="width:100%;margin-top:8px">Import Agent</button>
+            <div id="imp-msg" style="margin-top:8px;font-size:12px"></div>
+          </div>
+        </div>
+
+        <!-- Register Panel -->
+        <div class="panel" id="register-panel">
           <div class="phead"><h3>Register New Agent</h3></div>
           <div class="sect">
             <div class="reg-form">
@@ -1908,6 +2143,82 @@ async function deleteAgent(id,name){
   if(sel===id && AGENTS.length>1) sel=AGENTS.find(a=>a.id!==id)?.id||null;
   await boot();
   renderAgents();
+}
+
+/* ═══════════════ IMPORT AGENT ═══════════════ */
+let agentPanelMode='register';
+function toggleAgentMode(mode){
+  agentPanelMode=mode;
+  document.getElementById('register-panel').style.display=mode==='register'?'':'none';
+  document.getElementById('import-panel').style.display=mode==='import'?'':'none';
+  const regBtn=document.getElementById('mode-register');
+  const impBtn=document.getElementById('mode-import');
+  if(mode==='register'){
+    regBtn.style.background='linear-gradient(135deg,#c4632a,#ea580c)';regBtn.style.color='#fff';
+    impBtn.style.background='var(--card)';impBtn.style.color='var(--muted)';
+  }else{
+    impBtn.style.background='linear-gradient(135deg,#c4632a,#ea580c)';impBtn.style.color='#fff';
+    regBtn.style.background='var(--card)';regBtn.style.color='var(--muted)';
+  }
+}
+
+let impTab='paste';
+function switchImpTab(tab){
+  impTab=tab;
+  ['paste','file','url'].forEach(t=>{
+    const el=document.getElementById('imp-'+t);
+    const btn=document.getElementById('imp-tab-'+t);
+    if(el) el.style.display=t===tab?'':'none';
+    if(btn){btn.style.background=t===tab?'var(--accentsoft)':'var(--card)';btn.style.color=t===tab?'var(--accent)':'var(--muted)';}
+  });
+}
+
+let importFileContent='';
+function handleImportFile(input){
+  const file=input.files[0]; if(!file) return;
+  document.getElementById('imp-file-name').textContent='Loaded: '+file.name;
+  const reader=new FileReader();
+  reader.onload=e=>{importFileContent=e.target.result;};
+  reader.readAsText(file);
+}
+
+async function importAgent(){
+  const msg=document.getElementById('imp-msg');
+  msg.textContent='';
+  let configStr='';
+
+  if(impTab==='paste'){
+    configStr=document.getElementById('imp-config').value.trim();
+  }else if(impTab==='file'){
+    configStr=importFileContent;
+  }else if(impTab==='url'){
+    const url=document.getElementById('imp-url-input').value.trim();
+    if(!url){msg.innerHTML='<span style="color:var(--brick)">Enter a URL</span>';return;}
+    try{
+      msg.innerHTML='<span style="color:var(--muted)">Fetching config...</span>';
+      const r=await fetch(url);
+      if(!r.ok) throw new Error('HTTP '+r.status);
+      configStr=await r.text();
+    }catch(e){msg.innerHTML='<span style="color:var(--brick)">Failed to fetch: '+e.message+'</span>';return;}
+  }
+
+  if(!configStr){msg.innerHTML='<span style="color:var(--brick)">No config provided</span>';return;}
+
+  const fmt=document.getElementById('imp-format').value;
+  msg.innerHTML='<span style="color:var(--muted)">Importing...</span>';
+
+  try{
+    const r=await fetch('/api/agents/import',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({config_json:configStr,source_format:fmt})});
+    const d=await r.json();
+    if(d.ok){
+      msg.innerHTML='<span style="color:var(--seal)">Imported: <strong>'+esc(d.agent_id)+'</strong> (detected: '+esc(d.detected_format)+')</span>';
+      await boot();
+      setTimeout(()=>renderAgents(),600);
+    }else{
+      msg.innerHTML='<span style="color:var(--brick)">'+(d.detail||'Import failed')+'</span>';
+    }
+  }catch(e){msg.innerHTML='<span style="color:var(--brick)">Error: '+e.message+'</span>';}
 }
 
 /* ═══════════════ CONTROL — Config + Run ═══════════════ */
