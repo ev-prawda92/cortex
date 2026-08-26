@@ -109,7 +109,7 @@ def auth_me(request: Request):
     return {"user": sess}
 
 API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5")
 
 # ─────────────────────────────────────────────── provider settings (Settings tab)
 import providers as providers_mod
@@ -242,7 +242,7 @@ _DEFAULT_AGENTS = {
         "type": "sample",
         "endpoint": {"type": "embedded", "url": ""},
         "config": {
-            "model": {"provider": "anthropic", "model_name": "claude-sonnet-4-6", "temperature": 0.7, "max_tokens": 4096},
+            "model": {"provider": "anthropic", "model_name": "claude-sonnet-5", "temperature": 0.7, "max_tokens": 4096},
             "execution": {"timeout_seconds": 300, "max_retries": 3, "retry_delay_seconds": 60},
             "behavior": {"confidence_threshold": 0.75, "escalation_threshold": "high", "auto_escalate_on_error": True, "confirm_before_action": True},
             "data_sources": [],
@@ -264,7 +264,7 @@ _DEFAULT_AGENTS = {
         "type": "sample",
         "endpoint": {"type": "embedded", "url": ""},
         "config": {
-            "model": {"provider": "anthropic", "model_name": "claude-sonnet-4-6", "temperature": 0.3, "max_tokens": 1024},
+            "model": {"provider": "anthropic", "model_name": "claude-sonnet-5", "temperature": 0.3, "max_tokens": 1024},
             "execution": {"timeout_seconds": 30, "max_retries": 2, "retry_delay_seconds": 5},
             "behavior": {"confidence_threshold": 0.8, "escalation_threshold": "moderate", "auto_escalate_on_error": True, "confirm_before_action": False},
             "data_sources": [],
@@ -285,7 +285,7 @@ _DEFAULT_AGENTS = {
         "type": "sample",
         "endpoint": {"type": "rest", "url": "https://your-api.example.com/agent"},
         "config": {
-            "model": {"provider": "openai", "model_name": "gpt-4o", "temperature": 0.5, "max_tokens": 2048},
+            "model": {"provider": "openai", "model_name": "gpt-5.6-terra", "temperature": 0.5, "max_tokens": 2048},
             "execution": {"timeout_seconds": 120, "max_retries": 3, "retry_delay_seconds": 30},
             "behavior": {"confidence_threshold": 0.85, "escalation_threshold": "low", "auto_escalate_on_error": True, "confirm_before_action": True},
             "data_sources": [
@@ -324,7 +324,7 @@ def _slugify(name: str) -> str:
 def _default_config():
     """Return a blank generic agent config scaffold."""
     return {
-        "model": {"provider": "anthropic", "model_name": "claude-sonnet-4-6", "temperature": 0.7, "max_tokens": 4096},
+        "model": {"provider": "anthropic", "model_name": "claude-sonnet-5", "temperature": 0.7, "max_tokens": 4096},
         "execution": {"timeout_seconds": 300, "max_retries": 3, "retry_delay_seconds": 60},
         "behavior": {"confidence_threshold": 0.75, "escalation_threshold": "high", "auto_escalate_on_error": True, "confirm_before_action": True},
         "data_sources": [],
@@ -855,7 +855,7 @@ def _detect_and_normalize(raw: dict, source_format: str) -> dict:
     elif fmt == "openai":
         result["name"] = raw.get("name", "OpenAI Assistant")
         result["description"] = raw.get("description", raw.get("instructions", "")[:200])
-        model_name = raw.get("model", "gpt-4o")
+        model_name = raw.get("model", "gpt-5.6-terra")
         result["config"] = {
             "model": {
                 "provider": "openai",
@@ -1996,7 +1996,7 @@ async function renderAgents(){
             </div>
 
             <div id="imp-paste" class="form-group">
-              <textarea id="imp-config" rows="12" placeholder='Paste agent config here (JSON or YAML)...\n\nExamples:\n\n// LangChain\n{"llm": {"model_name": "gpt-4o"}, "tools": [...]}\n\n// CrewAI\n{"role": "Researcher", "goal": "...", "llm": {"model": "claude-sonnet-4-6"}}\n\n// OpenAI Assistant\n{"name": "My Assistant", "model": "gpt-4o", "instructions": "..."}\n\n// CORTEX native\n{"name": "...", "model": {...}, "execution": {...}}' style="padding:10px;border:1px solid var(--line);border-radius:4px;font-family:'IBM Plex Mono';font-size:11px;resize:vertical;width:100%;background:var(--paper)"></textarea>
+              <textarea id="imp-config" rows="12" placeholder='Paste agent config here (JSON or YAML)...\n\nExamples:\n\n// LangChain\n{"llm": {"model_name": "gpt-5.6-terra"}, "tools": [...]}\n\n// CrewAI\n{"role": "Researcher", "goal": "...", "llm": {"model": "claude-sonnet-5"}}\n\n// OpenAI Assistant\n{"name": "My Assistant", "model": "gpt-5.6-terra", "instructions": "..."}\n\n// CORTEX native\n{"name": "...", "model": {...}, "execution": {...}}' style="padding:10px;border:1px solid var(--line);border-radius:4px;font-family:'IBM Plex Mono';font-size:11px;resize:vertical;width:100%;background:var(--paper)"></textarea>
             </div>
 
             <div id="imp-file" style="display:none" class="form-group">
@@ -2042,13 +2042,15 @@ async function renderAgents(){
                   </div>
                   <div class="form-group"><label>Model</label>
                     <select id="reg-model">
-                      <option value="claude-sonnet-4-6">claude-sonnet-4-6</option>
-                      <option value="claude-opus-4-6">claude-opus-4-6</option>
+                      <option value="claude-sonnet-5">claude-sonnet-5</option>
+                      <option value="claude-opus-5">claude-opus-5</option>
+                      <option value="claude-fable-5">claude-fable-5</option>
                       <option value="claude-haiku-4-5">claude-haiku-4-5</option>
-                      <option value="gpt-4o">gpt-4o</option>
-                      <option value="gpt-4-turbo">gpt-4-turbo</option>
-                      <option value="gemini-2.0-pro">gemini-2.0-pro</option>
-                      <option value="gemini-2.0-flash">gemini-2.0-flash</option>
+                      <option value="gpt-5.6-sol">gpt-5.6-sol</option>
+                      <option value="gpt-5.6-terra">gpt-5.6-terra</option>
+                      <option value="gpt-5.6-luna">gpt-5.6-luna</option>
+                      <option value="gemini-3.1-pro">gemini-3.1-pro</option>
+                      <option value="gemini-3.7-flash">gemini-3.7-flash</option>
                     </select>
                   </div>
                 </div>
@@ -2097,9 +2099,9 @@ async function renderAgents(){
 
 function fillSample(type){
   const samples={
-    research:{name:'Research Agent',desc:'General-purpose research agent that searches and summarizes information',provider:'anthropic',model:'claude-sonnet-4-6',temp:'0.7',tokens:'4096',conf:'0.75',esc:'high',eptype:'embedded'},
-    router:{name:'Router Agent',desc:'Routes incoming requests to the appropriate handler based on intent',provider:'anthropic',model:'claude-sonnet-4-6',temp:'0.3',tokens:'1024',conf:'0.8',esc:'moderate',eptype:'embedded'},
-    action:{name:'Action Agent',desc:'Executes actions in external systems based on instructions',provider:'openai',model:'gpt-4o',temp:'0.5',tokens:'2048',conf:'0.85',esc:'low',eptype:'rest'}
+    research:{name:'Research Agent',desc:'General-purpose research agent that searches and summarizes information',provider:'anthropic',model:'claude-sonnet-5',temp:'0.7',tokens:'4096',conf:'0.75',esc:'high',eptype:'embedded'},
+    router:{name:'Router Agent',desc:'Routes incoming requests to the appropriate handler based on intent',provider:'anthropic',model:'claude-sonnet-5',temp:'0.3',tokens:'1024',conf:'0.8',esc:'moderate',eptype:'embedded'},
+    action:{name:'Action Agent',desc:'Executes actions in external systems based on instructions',provider:'openai',model:'gpt-5.6-terra',temp:'0.5',tokens:'2048',conf:'0.85',esc:'low',eptype:'rest'}
   };
   const s=samples[type]; if(!s) return;
   document.getElementById('reg-name').value=s.name;
@@ -2736,9 +2738,9 @@ async function renderSettings(){
   const s=await (await fetch('/api/settings')).json();
   const providers=['anthropic','openai','gemini'];
   const models={
-    anthropic:['claude-opus-4-6','claude-sonnet-4-6','claude-haiku-4-5','claude-opus-4-20250514','claude-sonnet-4-20250514','claude-haiku-4-5-20250514'],
-    openai:['gpt-4o','gpt-4o-mini','gpt-4-turbo','o3','o3-mini','o4-mini'],
-    gemini:['gemini-2.5-pro','gemini-2.5-flash','gemini-2.0-pro','gemini-2.0-flash']
+    anthropic:['claude-fable-5','claude-opus-5','claude-sonnet-5','claude-haiku-4-5'],
+    openai:['gpt-5.6-sol','gpt-5.6-terra','gpt-5.6-luna','gpt-5.5','gpt-5.4'],
+    gemini:['gemini-3.1-pro','gemini-3.7-flash','gemini-3.6-flash','gemini-3.5-flash-lite','gemini-2.5-pro','gemini-2.5-flash']
   };
 
   const provOpts=providers.map(p=>{
