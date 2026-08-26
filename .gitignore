@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.DS_Store
+users.json
+settings.json
+*.egg-info/
+.env

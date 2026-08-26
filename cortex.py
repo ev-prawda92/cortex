@@ -979,10 +979,11 @@ def delete_agent(agent_id: str):
 
 class DataSourceIn(BaseModel):
     name: str
-    type: str = "api"  # api | database | webhook | custom
+    type: str = "api"  # api | database | file | webhook | graphql | grpc | custom
     endpoint: str = ""
-    auth_type: str = "api_key"  # api_key | oauth2 | connection_string | none
+    auth_type: str = "api_key"  # api_key | oauth2 | bearer | basic | connection_string | iam | none
     auth_value: str = ""
+    refresh: str = "manual"  # realtime | 5m | 1h | 1d | manual
 
 @app.post("/api/agents/{agent_id}/data-sources")
 def add_data_source(agent_id: str, body: DataSourceIn):
@@ -991,7 +992,7 @@ def add_data_source(agent_id: str, body: DataSourceIn):
     if not a:
         raise HTTPException(404, "agent not found")
     ds = {"name": body.name, "type": body.type, "endpoint": body.endpoint,
-          "auth_type": body.auth_type, "auth_value": body.auth_value}
+          "auth_type": body.auth_type, "auth_value": body.auth_value, "refresh": body.refresh}
     a["config"].setdefault("data_sources", []).append(ds)
     _save_agents()
     log_event(agent_id, "datasource.added", {"name": body.name})
@@ -2343,13 +2344,17 @@ async function renderControl(){
     <div class="sect">
       <h4>Data Sources</h4>
       <div id="ds-list" style="margin-bottom:10px">
-        ${(cfg.data_sources||[]).map(d=>`<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 10px;margin-bottom:4px;background:#faf8f5;border-radius:4px;border:1px solid var(--line)">
-          <div>
-            <span style="font-weight:500">${esc(d.name)}</span>
-            <span style="font-size:11px;color:var(--muted);margin-left:6px">${d.type}</span>
-            <span style="font-size:10px;padding:1px 6px;border-radius:3px;background:${d.auth_type==='none'?'#e8e0d4':'#e0d4c0'};color:var(--ink);margin-left:4px">${d.auth_type}</span>
+        ${(cfg.data_sources||[]).map(d=>`<div style="padding:8px 10px;margin-bottom:4px;background:#faf8f5;border-radius:4px;border:1px solid var(--line)">
+          <div style="display:flex;justify-content:space-between;align-items:center">
+            <div>
+              <span style="font-weight:500">${esc(d.name)}</span>
+              <span style="font-size:10px;padding:1px 6px;border-radius:3px;background:#e0d4c0;color:var(--ink);margin-left:4px">${d.type}</span>
+              <span style="font-size:10px;padding:1px 6px;border-radius:3px;background:${d.auth_type==='none'?'#e8e0d4':'#d4dce0'};color:var(--ink);margin-left:4px">${d.auth_type}</span>
+              ${d.refresh&&d.refresh!=='manual'?`<span style="font-size:10px;padding:1px 6px;border-radius:3px;background:#d4e0d6;color:#2a5a30;margin-left:4px">⟳ ${d.refresh}</span>`:''}
+            </div>
+            <button class="btn ghost" style="padding:2px 8px;font-size:10px" onclick="removeDataSource('${esc(d.name)}')">Remove</button>
           </div>
-          <button class="btn ghost" style="padding:2px 8px;font-size:10px" onclick="removeDataSource('${esc(d.name)}')">Remove</button>
+          ${d.endpoint?`<div style="font-size:10px;color:var(--faint);margin-top:4px;font-family:'IBM Plex Mono'">${esc(d.endpoint).substring(0,80)}</div>`:''}
         </div>`).join('')||'<div class="hint" style="margin:0">No data sources configured.</div>'}
       </div>
       <div style="padding:12px;background:#faf8f5;border-radius:6px;border:1px dashed var(--line);margin-top:8px">
@@ -2416,7 +2421,13 @@ function liveRunPanel(a){
 async function addDataSource(){
   const name=document.getElementById('ds-name').value.trim();
   if(!name) return;
-  const body={name,type:document.getElementById('ds-type').value,auth_type:document.getElementById('ds-auth').value};
+  const body={
+    name,
+    type:document.getElementById('ds-type').value,
+    auth_type:document.getElementById('ds-auth').value,
+    endpoint:document.getElementById('ds-endpoint').value.trim(),
+    refresh:document.getElementById('ds-refresh').value
+  };
   await fetch('/api/agents/'+sel+'/data-sources',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
   await boot(); renderControl();
 }
