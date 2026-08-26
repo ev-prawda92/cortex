@@ -213,7 +213,11 @@ SETTINGS.setdefault("models", {})
 for p, m in providers_mod.DEFAULT_MODELS.items():
     SETTINGS["models"].setdefault(p, m)
 
-_ENV_KEYS = {"anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY", "gemini": "GEMINI_API_KEY"}
+_ENV_KEYS = {
+    "anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY", "gemini": "GEMINI_API_KEY",
+    "xai": "XAI_API_KEY", "perplexity": "PERPLEXITY_API_KEY", "mistral": "MISTRAL_API_KEY",
+    "cohere": "COHERE_API_KEY", "meta": "TOGETHER_API_KEY",
+}
 
 def get_key(provider):
     return SETTINGS["keys"].get(provider) or os.environ.get(_ENV_KEYS.get(provider, ""), "")
@@ -485,7 +489,7 @@ def deterministic_translate(cfg, request):
             notes.append("auto-escalate on error → ON")
 
     # model provider: "switch to openai", "use gemini"
-    for prov in ["anthropic", "openai", "gemini"]:
+    for prov in providers_mod.ALL_PROVIDERS:
         if re.search(rf"\b{prov}\b", r) and any(w in r for w in ["switch", "use", "provider", "change to"]):
             c.setdefault("model", {})["provider"] = prov
             notes.append(f"provider → {prov}")
@@ -898,6 +902,16 @@ def _detect_provider(model_name: str) -> str:
         return "openai"
     elif "gemini" in m:
         return "gemini"
+    elif "grok" in m or "xai" in m:
+        return "xai"
+    elif "sonar" in m or "perplexity" in m:
+        return "perplexity"
+    elif "mistral" in m or "mixtral" in m or "codestral" in m or "pixtral" in m:
+        return "mistral"
+    elif "command" in m or "cohere" in m:
+        return "cohere"
+    elif "llama" in m or "meta" in m:
+        return "meta"
     return "anthropic"
 
 @app.post("/api/agents/import")
@@ -1376,21 +1390,21 @@ def get_settings():
     return {"active": SETTINGS["active"],
             "providers": {p: {"configured": bool(get_key(p)),
                               "masked": _mask(get_key(p)),
-                              "from_env": (not SETTINGS["keys"].get(p)) and bool(os.environ.get(_ENV_KEYS[p], "")),
+                              "from_env": (not SETTINGS["keys"].get(p)) and bool(os.environ.get(_ENV_KEYS.get(p, ""), "")),
                               "model": get_model(p),
                               "label": providers_mod.PROVIDER_LABELS[p]}
-                          for p in ("anthropic", "openai", "gemini")}}
+                          for p in providers_mod.ALL_PROVIDERS}}
 
 
 @app.post("/api/settings")
 def set_settings(body: SettingsIn):
     if body.active:
-        if body.active not in ("anthropic", "openai", "gemini"):
+        if body.active not in providers_mod.ALL_PROVIDERS:
             raise HTTPException(400, "unknown provider")
         SETTINGS["active"] = body.active
     if body.keys:
         for p, k in body.keys.items():
-            if p in ("anthropic", "openai", "gemini"):
+            if p in providers_mod.ALL_PROVIDERS:
                 if k == "":
                     SETTINGS["keys"].pop(p, None)   # empty string clears the stored key
                 elif k:
@@ -1405,7 +1419,7 @@ def set_settings(body: SettingsIn):
 
 @app.post("/api/settings/test/{provider}")
 def test_provider(provider: str):
-    if provider not in ("anthropic", "openai", "gemini"):
+    if provider not in providers_mod.ALL_PROVIDERS:
         raise HTTPException(400, "unknown provider")
     key = get_key(provider)
     if not key:
@@ -1890,7 +1904,7 @@ async function renderMonitor(){
       </div></div>`;
   }).join('')||'<div style="padding:16px;color:var(--faint);font-size:12px;text-align:center">No recent events</div>';
 
-  const providerStatus=['anthropic','openai','gemini'].map(p=>{
+  const providerStatus=['anthropic','openai','gemini','xai','perplexity','mistral','cohere','meta'].map(p=>{
     const prov=s.providers?.[p]||{};
     const dot=prov.configured?'green':'gray';
     return `<div class="health-row">
@@ -2050,23 +2064,56 @@ async function renderAgents(){
                 <h4>Model Config</h4>
                 <div class="form-row">
                   <div class="form-group"><label>Provider</label>
-                    <select id="reg-provider"><option value="anthropic">Anthropic</option><option value="openai">OpenAI</option><option value="gemini">Google Gemini</option></select>
+                    <select id="reg-provider"><option value="anthropic">Anthropic</option><option value="openai">OpenAI</option><option value="gemini">Google Gemini</option><option value="xai">xAI (Grok)</option><option value="perplexity">Perplexity</option><option value="mistral">Mistral AI</option><option value="cohere">Cohere</option><option value="meta">Meta (Together)</option></select>
                   </div>
                   <div class="form-group"><label>Model</label>
                     <select id="reg-model">
-                      <option value="claude-fable-5">claude-fable-5</option>
-                      <option value="claude-opus-5">claude-opus-5</option>
-                      <option value="claude-sonnet-5">claude-sonnet-5</option>
-                      <option value="claude-haiku-4-5">claude-haiku-4-5</option>
-                      <option value="claude-opus-4-8">claude-opus-4-8</option>
-                      <option value="claude-opus-4-7">claude-opus-4-7</option>
-                      <option value="claude-opus-4-6">claude-opus-4-6</option>
-                      <option value="claude-sonnet-4-6">claude-sonnet-4-6</option>
-                      <option value="gpt-5.6-sol">gpt-5.6-sol</option>
-                      <option value="gpt-5.6-terra">gpt-5.6-terra</option>
-                      <option value="gpt-5.6-luna">gpt-5.6-luna</option>
-                      <option value="gemini-3.1-pro">gemini-3.1-pro</option>
-                      <option value="gemini-3.7-flash">gemini-3.7-flash</option>
+                      <optgroup label="Anthropic">
+                        <option value="claude-fable-5">claude-fable-5</option>
+                        <option value="claude-opus-5">claude-opus-5</option>
+                        <option value="claude-sonnet-5" selected>claude-sonnet-5</option>
+                        <option value="claude-haiku-4-5">claude-haiku-4-5</option>
+                        <option value="claude-opus-4-8">claude-opus-4-8</option>
+                        <option value="claude-opus-4-7">claude-opus-4-7</option>
+                        <option value="claude-opus-4-6">claude-opus-4-6</option>
+                        <option value="claude-sonnet-4-6">claude-sonnet-4-6</option>
+                      </optgroup>
+                      <optgroup label="OpenAI">
+                        <option value="gpt-5.6-sol">gpt-5.6-sol</option>
+                        <option value="gpt-5.6-terra">gpt-5.6-terra</option>
+                        <option value="gpt-5.6-luna">gpt-5.6-luna</option>
+                      </optgroup>
+                      <optgroup label="Google Gemini">
+                        <option value="gemini-3.1-pro">gemini-3.1-pro</option>
+                        <option value="gemini-3.7-flash">gemini-3.7-flash</option>
+                      </optgroup>
+                      <optgroup label="xAI (Grok)">
+                        <option value="grok-3">grok-3</option>
+                        <option value="grok-3-mini">grok-3-mini</option>
+                        <option value="grok-2">grok-2</option>
+                      </optgroup>
+                      <optgroup label="Perplexity">
+                        <option value="sonar-pro">sonar-pro</option>
+                        <option value="sonar">sonar</option>
+                        <option value="sonar-deep-research">sonar-deep-research</option>
+                        <option value="sonar-reasoning-pro">sonar-reasoning-pro</option>
+                      </optgroup>
+                      <optgroup label="Mistral AI">
+                        <option value="mistral-large-latest">mistral-large</option>
+                        <option value="mistral-medium-latest">mistral-medium</option>
+                        <option value="mistral-small-latest">mistral-small</option>
+                        <option value="codestral-latest">codestral</option>
+                      </optgroup>
+                      <optgroup label="Cohere">
+                        <option value="command-r-plus">command-r-plus</option>
+                        <option value="command-r">command-r</option>
+                        <option value="command-a-03-2025">command-a</option>
+                      </optgroup>
+                      <optgroup label="Meta (via Together)">
+                        <option value="meta-llama/Llama-4-Maverick-17B-128E-Instruct-Turbo">Llama 4 Maverick</option>
+                        <option value="meta-llama/Llama-4-Scout-17B-16E-Instruct">Llama 4 Scout</option>
+                        <option value="meta-llama/Meta-Llama-3.3-70B-Instruct-Turbo">Llama 3.3 70B</option>
+                      </optgroup>
                     </select>
                   </div>
                 </div>
@@ -2898,11 +2945,16 @@ async function renderEventLog(){
 /* ═══════════════ SETTINGS ═══════════════ */
 async function renderSettings(){
   const s=await (await fetch('/api/settings')).json();
-  const providers=['anthropic','openai','gemini'];
+  const providers=['anthropic','openai','gemini','xai','perplexity','mistral','cohere','meta'];
   const models={
     anthropic:['claude-fable-5','claude-opus-5','claude-sonnet-5','claude-haiku-4-5','claude-opus-4-8','claude-opus-4-7','claude-opus-4-6','claude-sonnet-4-6'],
     openai:['gpt-5.6-sol','gpt-5.6-terra','gpt-5.6-luna','gpt-5.5','gpt-5.4'],
-    gemini:['gemini-3.1-pro','gemini-3.7-flash','gemini-3.6-flash','gemini-3.5-flash-lite','gemini-2.5-pro','gemini-2.5-flash']
+    gemini:['gemini-3.1-pro','gemini-3.7-flash','gemini-3.6-flash','gemini-3.5-flash-lite','gemini-2.5-pro','gemini-2.5-flash'],
+    xai:['grok-3','grok-3-mini','grok-2'],
+    perplexity:['sonar-pro','sonar','sonar-deep-research','sonar-reasoning-pro','sonar-reasoning'],
+    mistral:['mistral-large-latest','mistral-medium-latest','mistral-small-latest','codestral-latest','pixtral-large-latest'],
+    cohere:['command-r-plus','command-r','command-a-03-2025'],
+    meta:['meta-llama/Llama-4-Maverick-17B-128E-Instruct-Turbo','meta-llama/Llama-4-Scout-17B-16E-Instruct','meta-llama/Meta-Llama-3.3-70B-Instruct-Turbo']
   };
 
   const provOpts=providers.map(p=>{
@@ -2955,7 +3007,7 @@ async function testProvider(p){
 }
 async function saveSettings(){
   const keys={},models={};
-  ['anthropic','openai','gemini'].forEach(p=>{
+  ['anthropic','openai','gemini','xai','perplexity','mistral','cohere','meta'].forEach(p=>{
     const k=document.getElementById('key_'+p).value;
     const m=document.getElementById('model_'+p).value;
     if(k) keys[p]=k;
