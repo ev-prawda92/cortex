@@ -2558,6 +2558,71 @@ def _save_run_to_db(agent_id: str, rec: dict):
     )
 
 
+# The escalate tool every agent gets.
+#
+# ESCALATED is a first-class outcome — it is in the runs enum, on the Runs
+# filter tabs, and it drives the escalation metric on every agent card. But
+# providers.run_tool_loop only sets escalated=True when a tool whose NAME
+# contains "escalate" is called, and no agent config defines one. So the flag
+# could never fire, every non-crashing run recorded COMPLETED, and the outcome
+# column measured uptime rather than judgement.
+#
+# Giving every agent this tool is what makes "I can't do this confidently" a
+# recordable result instead of a sentence buried in a summary nobody parses.
+ESCALATE_TOOL = {
+    "name": "escalate",
+    "description": (
+        "Escalate this task to a human instead of answering. Use when you "
+        "cannot complete the task confidently, the request is ambiguous or "
+        "out of scope, a required tool or data source is unavailable, or "
+        "acting would be risky without review. Escalating is a valid outcome "
+        "and is preferred over guessing."
+    ),
+    "parameters": ["reason"],
+    "input_schema": {
+        "type": "object",
+        "properties": {"reason": {"type": "string",
+                                  "description": "Why this needs a human."}},
+        "required": ["reason"],
+    },
+}
+
+
+def _tools_for(tools_cfg: list) -> list:
+    """Agent-configured tools plus the implicit escalate tool.
+
+    An agent that already defines its own escalate-style tool keeps it; we do
+    not shadow a real handler with this one.
+    """
+    tools = [{
+        "name": t["name"],
+        "description": t.get("description", ""),
+        "input_schema": {"type": "object", "properties": {
+            p: {"type": "string"} for p in t.get("parameters", [])}},
+    } for t in (tools_cfg or [])]
+
+    if not any("escalate" in (t.get("name") or "").lower() for t in tools):
+        tools.append({k: ESCALATE_TOOL[k]
+                      for k in ("name", "description", "input_schema")})
+    return tools
+
+
+def _run_tool(name: str, input_data: dict) -> str:
+    """Execute a tool call.
+
+    escalate is genuinely implemented — calling it is the signal, and
+    run_tool_loop has already recorded it by the time this returns. Everything
+    else has no handler wired up yet and says so plainly, so the model can
+    reason about the failure rather than treating a placeholder as data.
+    """
+    if "escalate" in (name or "").lower():
+        reason = (input_data or {}).get("reason", "no reason given")
+        return f"Escalated to a human. Reason recorded: {reason}"
+    return (f"[Tool '{name}' called with {json.dumps(input_data)}. "
+            f"No handler is registered for this tool, so no real action was "
+            f"taken and no data was returned.]")
+
+
 def _execute_agent(agent_id: str, claim: str) -> dict:
     """Execute an agent using its CURRENT Cortex config, and record the run.
 
@@ -2663,21 +2728,13 @@ def _execute_agent(agent_id: str, claim: str) -> dict:
         system_parts.append(f"- available tools: {', '.join(t['name'] for t in tools_cfg)}")
     system = "\n".join(system_parts)
 
-    tools = []
-    for t in tools_cfg:
-        tools.append({
-            "name": t["name"], "description": t.get("description", ""),
-            "input_schema": {"type": "object", "properties": {p: {"type": "string"} for p in t.get("parameters", [])}}
-        })
-
-    def _default_tool_handler(name, input_data):
-        return f"[Tool '{name}' called with {json.dumps(input_data)}. No handler registered — returning placeholder.]"
+    tools = _tools_for(tools_cfg)
 
     res = providers_mod.run_tool_loop(
         provider=provider, api_key=key,
         model=model_cfg.get("model_name") or get_model(provider),
         system=system, tools=tools, user_message=claim,
-        process_tool_call=_default_tool_handler,
+        process_tool_call=_run_tool,
         max_iterations=execution.get("max_retries", 3) + 1)
 
     trace = res["trace"]

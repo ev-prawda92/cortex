@@ -128,17 +128,12 @@ def _execute_cycle(agent_id: str, agent_dict: dict) -> dict:
         system_parts.append(f"- available tools: {', '.join(t['name'] for t in tools_cfg)}")
     system = "\n".join(system_parts)
 
-    tools = []
-    for t in tools_cfg:
-        tools.append({
-            "name": t["name"], "description": t.get("description", ""),
-            "input_schema": {"type": "object", "properties": {
-                p: {"type": "string"} for p in t.get("parameters", [])
-            }}
-        })
-
-    def _tool_handler(name, input_data):
-        return f"[Tool '{name}' called with {json.dumps(input_data)}. Placeholder response.]"
+    # Same tool set and handler the API path uses, so a continuous cycle and a
+    # manual run behave identically — including the implicit escalate tool,
+    # without which a daemon run can never record anything but COMPLETED.
+    from cortex import _tools_for, _run_tool
+    tools = _tools_for(tools_cfg)
+    _tool_handler = _run_tool
 
     model_name = model_cfg.get("model_name") or _get_model(provider)
 
