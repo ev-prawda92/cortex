@@ -61,7 +61,7 @@ def configure(session_factory, agent_model, run_saver, get_key_fn, get_model_fn,
 class AgentRunState:
     """Tracks the daemon's view of one agent's continuous execution."""
     __slots__ = ("agent_id", "last_run_at", "next_run_at", "cycle_count",
-                 "consecutive_errors", "paused", "last_error")
+                 "consecutive_errors", "paused", "last_error", "last_skip")
 
     def __init__(self, agent_id: str):
         self.agent_id = agent_id
@@ -71,6 +71,7 @@ class AgentRunState:
         self.consecutive_errors: int = 0
         self.paused: bool = False
         self.last_error: str = ""
+        self.last_skip: str = ""   # why the last tick was skipped, if it was
 
 
 _agent_states: Dict[str, AgentRunState] = {}
@@ -87,15 +88,26 @@ def _execute_cycle(agent_id: str, agent_dict: dict) -> dict:
     provider = model_cfg.get("provider", "anthropic")
     key = _get_key(provider)
 
+    # A skip is not a run. Returning skipped=True keeps these out of the runs
+    # table entirely: a missing key or a missing instruction is a setup problem,
+    # and recording it as a run inflates run counts and drags down success rates
+    # for a config version that never actually executed.
     if not key:
-        return {"ok": False, "error": f"No API key for {provider}"}
+        return {"ok": False, "skipped": True,
+                "skip_reason": f"No API key configured for {provider}",
+                "config_version": agent_dict.get("version", 1)}
 
     # Build the standing instruction
     standing = cfg.get("standing_instruction", "").strip()
     if not standing:
         standing = agent_dict.get("description", "").strip()
     if not standing:
-        standing = f"You are {agent_dict.get('name', agent_id)}. Execute your primary function and report results."
+        # Previously this invented "Execute your primary function and report
+        # results" and billed a model call for it every interval, forever.
+        # An agent nobody has given an instruction has nothing to do.
+        return {"ok": False, "skipped": True,
+                "skip_reason": "No standing instruction or description — nothing to run",
+                "config_version": agent_dict.get("version", 1)}
 
     # Add cycle context
     state = _agent_states.get(agent_id)
@@ -217,11 +229,25 @@ def _tick():
             # Execute
             state.last_run_at = now
             try:
-                if _log_event:
-                    _log_event(aid, "daemon.cycle_start", {"cycle": state.cycle_count + 1})
-
                 result = _execute_cycle(aid, agent_dict)
+
+                if result.get("skipped"):
+                    reason = result.get("skip_reason", "skipped")
+                    # Log only when the reason changes, so a permanently
+                    # misconfigured agent doesn't flood the event log.
+                    if state.last_skip != reason:
+                        state.last_skip = reason
+                        if _log_event:
+                            _log_event(aid, "daemon.cycle_skipped", {"reason": reason})
+                    # Not an error and not a run — just nothing to do. Check
+                    # again on a slow cadence in case the setup gets fixed.
+                    state.next_run_at = time.time() + max(interval, 300)
+                    continue
+
+                state.last_skip = ""
                 state.cycle_count += 1
+                if _log_event:
+                    _log_event(aid, "daemon.cycle_start", {"cycle": state.cycle_count})
 
                 if result.get("ok"):
                     state.consecutive_errors = 0
