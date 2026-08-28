@@ -625,8 +625,14 @@ class WorkflowRecorder:
         recorder.finalize(db, wr)
     """
 
-    def begin(self, db: Session, wf: dict, owner_id: str = None) -> WorkflowRun:
-        """Open (or reuse) the WorkflowRun row for a bus workflow."""
+    def begin(self, db: Session, wf: dict, owner_id: str = None,
+              definition: list = None) -> WorkflowRun:
+        """Open (or reuse) the WorkflowRun row for a bus workflow.
+
+        `definition` is the original step list, untruncated. Storing it is what
+        makes a run replayable — the dict from to_dict() clips instructions to
+        200 chars, so replaying from that would silently alter the workflow.
+        """
         bus_id = wf.get("id", "")
         existing = None
         if bus_id:
@@ -642,7 +648,7 @@ class WorkflowRecorder:
             owner_id=owner_id,
             bus_workflow_id=bus_id,
             name=wf.get("name", ""),
-            definition=wf.get("steps", {}),
+            definition=(definition if definition else wf.get("steps", {})),
             status="running",
             step_count=len(wf.get("steps", {}) or {}),
         )
@@ -741,6 +747,29 @@ class WorkflowRecorder:
             return 0
         return 1 + max((self._depth(d, steps_def, _seen) for d in deps),
                        default=-1)
+
+    def replay_payload(self, wr: WorkflowRun) -> list:
+        """Rebuild a create_workflow() step list from a stored definition.
+
+        Handles both shapes: the raw list captured at creation, and the older
+        dict-of-steps form from to_dict() for runs recorded before replay
+        existed. The dict form has truncated instructions — accurate to what
+        was recorded, but not necessarily to what was authored.
+        """
+        d = wr.definition
+        if isinstance(d, list):
+            return [dict(s) for s in d]
+        if isinstance(d, dict):
+            out = []
+            for key, s in d.items():
+                if not isinstance(s, dict):
+                    continue
+                out.append({"id": key,
+                            "agent_id": s.get("agent_id", ""),
+                            "instruction": s.get("instruction", "") or "Proceed.",
+                            "depends_on": s.get("depends_on", []) or []})
+            return out
+        return []
 
     def history(self, db: Session, owner_id: str = None, limit: int = 50) -> list:
         """Recent workflow runs, newest first."""

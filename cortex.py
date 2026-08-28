@@ -3599,7 +3599,8 @@ def comms_run_workflow(workflow_id: str, request: Request):
     wr = None
     try:
         try:
-            wr = p2_recorder.begin(db, wf_before, owner_id=sess.get("user_id"))
+            wr = p2_recorder.begin(db, wf_before, owner_id=sess.get("user_id"),
+                                   definition=message_bus.get_definition(workflow_id))
         except Exception as e:
             print(f"[phase2] could not open workflow record for {workflow_id}: {e}")
 
@@ -3711,6 +3712,62 @@ def p2_workflow_run_detail(run_id: str, request: Request):
         d = wr.to_dict()
         d["step_detail"] = [s.to_dict() for s in wr.steps]
         return d
+    finally:
+        db.close()
+
+
+@app.post("/api/phase2/workflow-runs/{run_id}/rerun")
+def p2_rerun_workflow(run_id: str, request: Request):
+    """Replay a recorded workflow from its stored definition.
+
+    Patterns need a sequence to run more than once, and the bus forgets
+    definitions on restart — so replaying from the recorded definition is how
+    a workflow stays repeatable across sessions.
+    """
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "not authenticated")
+
+    db = SessionLocal()
+    try:
+        src_run = db.query(phase2.WorkflowRun).filter(
+            phase2.WorkflowRun.id == run_id).first()
+        if not src_run:
+            raise HTTPException(404, "workflow run not found")
+
+        steps = p2_recorder.replay_payload(src_run)
+        if not steps:
+            raise HTTPException(400, "this run has no replayable definition")
+
+        created = message_bus.create_workflow(
+            src_run.name or "Replay", steps, created_by=sess.get("user_id"))
+        wid = created.get("workflow_id") or (created.get("workflow") or {}).get("id")
+        if not wid:
+            raise HTTPException(500, "could not recreate workflow")
+
+        wf_now = message_bus.get_workflow(wid)
+        wr = p2_recorder.begin(db, wf_now, owner_id=sess.get("user_id"),
+                               definition=message_bus.get_definition(wid))
+
+        # Drive every wave to completion. Bounded so a malformed DAG whose
+        # steps never become ready cannot spin here forever.
+        waves = 0
+        for _ in range(len(steps) + 2):
+            result = message_bus.run_workflow(wid)
+            waves += 1
+            try:
+                p2_recorder.record_wave(db, wr, result,
+                                        result.get("workflow") or wf_now)
+            except Exception as e:
+                print(f"[phase2] replay recording failed for {wid}: {e}")
+            if (result.get("remaining") or 0) == 0:
+                break
+
+        p2_recorder.finalize(db, wr)
+        return {"ok": True, "workflow_run_id": wr.id, "bus_workflow_id": wid,
+                "waves": waves, "replayed_from": run_id,
+                "status": wr.status, "steps": wr.step_count,
+                "succeeded": wr.steps_succeeded}
     finally:
         db.close()
 
@@ -6850,15 +6907,31 @@ function wfHistoryCard(runs){
       <td style="font-family:monospace;font-size:11px">${r.succeeded}/${r.steps}</td>
       <td style="font-family:monospace;font-size:11px">${Math.round(r.latency_ms)}ms</td>
       <td style="font-family:monospace;font-size:11px">${r.cost_usd?('$'+r.cost_usd.toFixed(4)):'—'}</td>
-    </tr>` + (wfOpenRun===r.id?`<tr><td colspan="5" style="padding:0">
+      <td><button class="btn-sm" title="Run this exact workflow again"
+        onclick="event.stopPropagation();wfRerun('${esc(r.id)}')">Re-run</button></td>
+    </tr>` + (wfOpenRun===r.id?`<tr><td colspan="6" style="padding:0">
       <div id="wf-steps-${esc(r.id)}" style="padding:8px 12px;background:var(--paper);font-size:11px;color:var(--muted)">loading steps…</div></td></tr>`:'');
   }).join('');
 
   return `<div class="stat-card"><div class="card-title">Run history</div>
     <table class="data-table">
-      <thead><tr><th>Workflow</th><th>Status</th><th>Steps</th><th>Latency</th><th>Cost</th></tr></thead>
+      <thead><tr><th>Workflow</th><th>Status</th><th>Steps</th><th>Latency</th><th>Cost</th><th></th></tr></thead>
       <tbody>${rows}</tbody></table>
-    <div class="hint" style="margin-top:8px">Click a run to see its steps.</div></div>`;
+    <div class="hint" style="margin-top:8px">Click a run to see its steps. Re-run repeats it exactly — that repeat is what forms a pattern.</div>
+    <div id="wf-rerun" style="margin-top:6px;font-size:12px"></div></div>`;
+}
+
+async function wfRerun(id){
+  const el=document.getElementById('wf-rerun');
+  if(el) el.innerHTML='<span style="color:var(--muted)">Replaying…</span>';
+  const r=await fetch('/api/phase2/workflow-runs/'+id+'/rerun',{method:'POST'})
+    .then(x=>x.json()).catch(()=>null);
+  if(el){
+    el.innerHTML = (r&&r.ok)
+      ? `<span style="color:var(--terra)">Replayed — ${r.succeeded}/${r.steps} steps ok.</span> <span style="color:var(--muted)">Hit Analyze to score the pattern.</span>`
+      : `<span style="color:var(--brick)">${esc((r&&r.detail)||'Replay failed.')}</span>`;
+  }
+  setTimeout(renderWorkflows,700);
 }
 
 async function wfToggleRun(id){
@@ -7023,4 +7096,6 @@ boot();
 if __name__ == "__main__":
     print("CORTEX Agent Ops Hub — http://localhost:3000")
     print("model-assisted" if API_KEY else "rule-based (set ANTHROPIC_API_KEY for model translation)")
-    uvicorn.run(app, host="0.0.0.0", port=3000)
+    # PORT lets you run a second instance, or dodge a port that's already taken.
+    uvicorn.run(app, host=os.environ.get("HOST", "0.0.0.0"),
+                port=int(os.environ.get("PORT", "3000")))

@@ -17,3 +17,7 @@ docker-compose.override.yml
 data/
 *.db
 *.sqlite3
+
+# Virtualenv
+.venv/
+venv/

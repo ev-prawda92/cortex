@@ -82,6 +82,9 @@ class Workflow:
     def __init__(self, name: str, steps: List[dict], created_by: str = None):
         Workflow._counter += 1
         self.id = f"wf-{Workflow._counter:04d}"
+        # to_dict() truncates instructions for display; keep the original list
+        # verbatim so a workflow can be replayed exactly as it was authored.
+        self.raw_steps = [dict(s) for s in steps]
         self.name = name
         self.created_by = created_by
         self.created_at = datetime.now(timezone.utc).isoformat()
@@ -280,6 +283,11 @@ class MessageBus:
     def get_workflow(self, workflow_id: str) -> dict:
         wf = self._workflows.get(workflow_id)
         return wf.to_dict() if wf else {"error": "not found"}
+
+    def get_definition(self, workflow_id: str) -> List[dict]:
+        """The original step list a workflow was created from, untruncated."""
+        wf = self._workflows.get(workflow_id)
+        return list(getattr(wf, "raw_steps", [])) if wf else []
 
     def list_workflows(self) -> List[dict]:
         return [wf.to_dict() for wf in self._workflows.values()]
