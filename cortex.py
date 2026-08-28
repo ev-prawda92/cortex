@@ -194,6 +194,10 @@ def _get_session(request: Request) -> dict | None:
     user_id = payload.get("sub", "")
     # Verify user still exists in DB and look up admin status
     is_admin = False
+    # role/org live on the user row, not in the token: create_token() only
+    # signs sub/email/name, so reading them from the payload always yielded
+    # the "FDE" default no matter what the user actually chose at signup.
+    role, org = "FDE", ""
     try:
         db = SessionLocal()
         user = db.query(User).filter(User.id == user_id).first()
@@ -201,11 +205,14 @@ def _get_session(request: Request) -> dict | None:
             db.close()
             return None  # User was deleted — treat as unauthenticated
         is_admin = user.is_admin or False
+        od = user.oauth_data or {}
+        role = od.get("role") or "FDE"
+        org = od.get("org") or ""
         db.close()
     except Exception:
         pass
     return {"email": payload.get("email", ""), "name": payload.get("name", ""),
-            "role": payload.get("role", "FDE"), "org": payload.get("org", ""),
+            "role": role, "org": org,
             "user_id": user_id, "is_admin": is_admin}
 
 
