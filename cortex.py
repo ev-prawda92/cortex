@@ -4381,6 +4381,8 @@ h4{font-size:10.5px;font-weight:600;letter-spacing:.1em;text-transform:uppercase
         <button class="navbtn" id="nav-attestations" onclick="setView('attestations');closeMore()">Attestations</button>
         <button class="navbtn" id="nav-approvals" onclick="setView('approvals');closeMore()">Approvals</button>
         <button class="navbtn" id="nav-admin" onclick="setView('admin');closeMore()" style="display:none">Admin</button>
+        <button class="navbtn" id="nav-alltabs" onclick="toggleAllTabs()"
+          style="border-top:1px solid rgba(255,255,255,.12);opacity:.75;font-size:11px">▸ Show all tabs</button>
       </div>
     </div>
   </div>
@@ -4400,7 +4402,7 @@ h4{font-size:10.5px;font-weight:600;letter-spacing:.1em;text-transform:uppercase
 
 <script>
 let AGENTS=[], sel=null, pending=null, view='monitor', META={}, USER=null, advancedMode=false;
-const TABS=['monitor','agents','observability','control','runs','usage','integrations','deploy','events','history','automation','templates','teams','plugins','comms','recovery','attestations','approvals','analytics','runtime','settings'];
+const TABS=['monitor','agents','observability','control','runs','usage','integrations','deploy','events','history','automation','templates','teams','plugins','comms','workflows','recovery','attestations','approvals','analytics','runtime','settings'];
 
 async function boot(){
   // Load user session
@@ -4413,6 +4415,7 @@ async function boot(){
     document.getElementById('user-name').textContent=uname;
     document.getElementById('user-avatar').textContent=uname.split(' ').map(w=>(w||'')[0]||'').join('').toUpperCase().slice(0,2)||'U';
     if(USER.is_admin){document.getElementById('nav-admin').style.display='';}
+    applyRoleNav();
   }catch(e){console.error('boot auth:',e);}
   try{
     const r=await fetch('/api/agents'); const d=await r.json();
@@ -4432,7 +4435,46 @@ async function doLogout(){
 }
 
 const PRIMARY_TABS=['monitor','agents','observability','runs','usage','analytics','runtime','settings'];
-const MORE_TABS=['control','integrations','deploy','events','history','automation','templates','teams','plugins','comms','recovery','attestations','approvals','admin'];
+const MORE_TABS=['control','integrations','deploy','events','history','automation','templates','teams','plugins','comms','workflows','recovery','attestations','approvals','admin'];
+
+/* ── Role-based nav ──────────────────────────────────────────
+   Every tab still works and every API stays open — this only decides which
+   buttons are worth showing someone by default. A PM does not need the
+   plugin registry in their way; an engineer does. "Show all tabs" is always
+   one click away, because a hidden tab someone knows exists is worse than
+   a crowded nav. */
+const ROLE_TABS={
+  FDE:      ['monitor','agents','control','runs','deploy','integrations',
+             'templates','events','workflows','recovery','settings'],
+  PM:       ['monitor','agents','runs','analytics','usage','approvals',
+             'attestations','teams','settings'],
+  Engineer: ['monitor','agents','control','runs','runtime','observability',
+             'events','integrations','deploy','plugins','comms','workflows',
+             'automation','history','recovery','settings'],
+  Admin:    null,   // null = show everything
+};
+
+function showingAllTabs(){
+  try{ return localStorage.getItem('cortex_all_tabs')==='1'; }catch(e){ return false; }
+}
+function toggleAllTabs(){
+  try{ localStorage.setItem('cortex_all_tabs', showingAllTabs()?'0':'1'); }catch(e){}
+  applyRoleNav();
+  closeMore();
+}
+function applyRoleNav(){
+  const allowed = ROLE_TABS[(USER&&USER.role)||''] || null;
+  const showAll = showingAllTabs() || !allowed;
+  TABS.forEach(v=>{
+    const el=document.getElementById('nav-'+v);
+    if(!el) return;
+    if(v==='admin'){ return; }              // admin has its own is_admin gate
+    // Never hide the tab you are currently looking at.
+    el.style.display = (showAll || allowed.includes(v) || v===view) ? '' : 'none';
+  });
+  const t=document.getElementById('nav-alltabs');
+  if(t) t.textContent = showAll ? '▾ Fewer tabs' : '▸ Show all tabs';
+}
 function setActiveNav(){
   TABS.forEach(v=>{
     const el=document.getElementById('nav-'+v);
@@ -4448,6 +4490,7 @@ document.addEventListener('click',function(e){if(!e.target.closest('.more-wrap')
 
 async function render(){
   setActiveNav();
+  applyRoleNav();
   const fn={monitor:renderMonitor,agents:renderAgents,control:renderControl,runs:renderRuns,
     integrations:renderIntegrations,deploy:renderDeploy,events:renderEventLog,
     history:renderHistory,automation:renderAutomation,templates:renderTemplates,
