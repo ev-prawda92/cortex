@@ -207,8 +207,16 @@ def run_tool_loop(provider: str, api_key: str, model: str, system: str,
         return {"ok": False, "error": str(e), "trace": trace,
                 "steps_used": len([t for t in trace if t["kind"] == "act"]), "escalated": escalated}
 
+    # Estimate token usage from trace (rough: 4 chars ≈ 1 token)
+    input_chars = len(system) + len(user_message) + sum(len(str(t.get("result", ""))) for t in trace if t.get("kind") == "observe")
+    output_chars = len(final or "") + sum(len(t.get("text", "")) for t in trace if t.get("kind") == "think")
+    input_tokens = max(1, input_chars // 4)
+    output_tokens = max(1, output_chars // 4)
+
     return {"ok": True, "final_text": final, "trace": trace,
-            "steps_used": len([t for t in trace if t["kind"] == "act"]), "escalated": escalated}
+            "steps_used": len([t for t in trace if t["kind"] == "act"]), "escalated": escalated,
+            "input_tokens": input_tokens, "output_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens}
 
 
 def _loop_anthropic(api_key, model, system, tools, user_message, observe, trace, max_iters):

@@ -1,2 +1,18 @@
-anthropic>=0.25.0
-python-dotenv>=1.0.0
+# CORTEX — Python Dependencies
+# Core
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+pydantic>=2.0
+
+# HTTP client (for LLM provider calls)
+httpx>=0.27.0
+
+# Database
+sqlalchemy>=2.0
+psycopg2-binary>=2.9
+
+# YAML support (agent import)
+pyyaml>=6.0
+
+# MCP server (optional — for IDE integration)
+# mcp[cli]>=1.0

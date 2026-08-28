@@ -3,5 +3,17 @@ __pycache__/
 .DS_Store
 users.json
 settings.json
+agents.json
 *.egg-info/
 .env
+.env.local
+*.pem
+*.key
+
+# Docker
+docker-compose.override.yml
+
+# Data
+data/
+*.db
+*.sqlite3

@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>CORTEX — The Control Plane for AI Agents</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@600;700;800;900&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet"/>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#0f0a06;--card:#1a1208;--fg:#f5f0eb;--muted:#8a93a0;--accent:#f97316;--accent2:#fbbf24;--line:#2d1810}
+html{scroll-behavior:smooth}
+body{font-family:'IBM Plex Sans',system-ui,sans-serif;background:var(--bg);color:var(--fg);line-height:1.6;overflow-x:hidden}
+
+/* ── NAV ── */
+.topnav{position:fixed;top:0;left:0;right:0;z-index:100;background:rgba(15,10,6,.92);backdrop-filter:blur(12px);border-bottom:1px solid rgba(196,99,42,.15);padding:0 40px;display:flex;align-items:center;justify-content:space-between;height:56px}
+.topnav .logo{font-family:'Archivo';font-weight:900;font-size:20px;letter-spacing:.14em;background:linear-gradient(135deg,#f97316,#fbbf24);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+.topnav .links{display:flex;gap:28px;align-items:center}
+.topnav .links a{color:var(--muted);text-decoration:none;font-size:13px;font-weight:500;transition:color .15s}
+.topnav .links a:hover{color:var(--accent)}
+.cta-btn{display:inline-block;padding:10px 24px;background:linear-gradient(135deg,#c4632a,#ea580c);color:#fff;border:none;border-radius:6px;font-size:13px;font-weight:600;cursor:pointer;font-family:'IBM Plex Sans';letter-spacing:.04em;text-decoration:none;transition:transform .15s,box-shadow .15s}
+.cta-btn:hover{transform:translateY(-2px);box-shadow:0 8px 30px rgba(196,99,42,.4)}
+.cta-btn.ghost{background:transparent;border:1px solid rgba(196,99,42,.5);color:var(--accent)}
+.cta-btn.ghost:hover{background:rgba(196,99,42,.1);border-color:var(--accent)}
+
+/* ── HERO ── */
+.hero{min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:120px 40px 80px;position:relative;overflow:hidden}
+.hero::before{content:'';position:absolute;top:-200px;left:50%;transform:translateX(-50%);width:800px;height:800px;background:radial-gradient(circle,rgba(249,115,22,.12) 0%,transparent 70%);pointer-events:none}
+.hero-badge{display:inline-block;padding:6px 16px;background:rgba(249,115,22,.1);border:1px solid rgba(249,115,22,.25);border-radius:20px;font-size:11px;font-weight:600;letter-spacing:.08em;color:var(--accent);margin-bottom:24px;font-family:'IBM Plex Mono'}
+.hero h1{font-family:'Archivo';font-weight:900;font-size:clamp(40px,6vw,72px);line-height:1.05;max-width:800px;margin-bottom:20px}
+.hero h1 .grad{background:linear-gradient(135deg,#f97316,#fbbf24);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+.hero p{font-size:clamp(16px,2vw,20px);color:var(--muted);max-width:600px;line-height:1.65;margin-bottom:36px}
+.hero-actions{display:flex;gap:16px;flex-wrap:wrap;justify-content:center}
+.hero-visual{margin-top:60px;max-width:900px;width:100%;border-radius:12px;border:1px solid var(--line);overflow:hidden;box-shadow:0 30px 80px rgba(0,0,0,.5)}
+.hero-visual img{width:100%;display:block}
+.hero-terminal{background:#1a1208;border-radius:12px;border:1px solid var(--line);padding:24px 28px;font-family:'IBM Plex Mono';font-size:13px;color:var(--muted);text-align:left;max-width:700px;width:100%;margin-top:48px;box-shadow:0 30px 80px rgba(0,0,0,.5)}
+.hero-terminal .prompt{color:var(--accent)}
+.hero-terminal .cmd{color:var(--fg)}
+.hero-terminal .comment{color:#5a5040}
+
+/* ── SECTIONS ── */
+section{padding:100px 40px}
+.container{max-width:1100px;margin:0 auto}
+.section-label{font-family:'IBM Plex Mono';font-size:11px;font-weight:600;letter-spacing:.1em;color:var(--accent);margin-bottom:12px}
+.section-title{font-family:'Archivo';font-weight:800;font-size:clamp(28px,4vw,40px);margin-bottom:16px;line-height:1.15}
+.section-desc{font-size:16px;color:var(--muted);max-width:600px;line-height:1.7;margin-bottom:48px}
+
+/* ── FEATURE GRID ── */
+.feature-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:20px}
+.feature-card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:28px;transition:border-color .2s,transform .2s}
+.feature-card:hover{border-color:rgba(249,115,22,.35);transform:translateY(-2px)}
+.feature-icon{font-size:28px;margin-bottom:14px}
+.feature-card h3{font-family:'Archivo';font-weight:700;font-size:16px;margin-bottom:8px;color:var(--fg)}
+.feature-card p{font-size:13px;color:var(--muted);line-height:1.65}
+
+/* ── ARCHITECTURE ── */
+.arch-stack{display:flex;flex-direction:column;gap:0;max-width:700px;margin:0 auto}
+.arch-layer{padding:20px 28px;border:1px solid var(--line);text-align:center;transition:all .2s;position:relative}
+.arch-layer:first-child{border-radius:10px 10px 0 0}
+.arch-layer:last-child{border-radius:0 0 10px 10px}
+.arch-layer:hover{border-color:var(--accent);z-index:1}
+.arch-layer .layer-name{font-family:'Archivo';font-weight:700;font-size:15px;color:var(--fg)}
+.arch-layer .layer-desc{font-size:12px;color:var(--muted);margin-top:4px}
+.arch-layer.highlight{background:linear-gradient(135deg,rgba(196,99,42,.15),rgba(249,115,22,.08));border-color:var(--accent)}
+.arch-layer.highlight .layer-name{color:var(--accent)}
+.arch-arrow{text-align:center;font-size:18px;color:var(--line);line-height:1;padding:4px 0}
+
+/* ── STATS BAR ── */
+.stats-bar{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:20px;padding:60px 0}
+.stat{text-align:center}
+.stat .num{font-family:'Archivo';font-weight:900;font-size:40px;background:linear-gradient(135deg,#f97316,#fbbf24);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+.stat .label{font-size:12px;color:var(--muted);letter-spacing:.06em;margin-top:4px}
+
+/* ── USE CASES ── */
+.use-cases{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.use-case{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:24px;display:flex;gap:16px;align-items:flex-start;transition:border-color .2s}
+.use-case:hover{border-color:rgba(249,115,22,.3)}
+.use-case .uc-icon{font-size:24px;flex-shrink:0;margin-top:2px}
+.use-case h4{font-family:'Archivo';font-weight:700;font-size:14px;margin-bottom:6px;color:var(--fg)}
+.use-case p{font-size:12px;color:var(--muted);line-height:1.6}
+
+/* ── CTA SECTION ── */
+.cta-section{text-align:center;padding:100px 40px;background:linear-gradient(180deg,transparent,rgba(196,99,42,.06))}
+.cta-section h2{font-family:'Archivo';font-weight:900;font-size:clamp(28px,4vw,44px);margin-bottom:16px}
+.cta-section p{font-size:16px;color:var(--muted);margin-bottom:32px;max-width:500px;margin-left:auto;margin-right:auto}
+
+/* ── FOOTER ── */
+.footer{padding:40px;text-align:center;border-top:1px solid var(--line);font-size:12px;color:var(--muted)}
+.footer a{color:var(--accent);text-decoration:none}
+
+/* ── RESPONSIVE ── */
+@media(max-width:768px){
+  .topnav{padding:0 20px}
+  .topnav .links{gap:16px}
+  .hero{padding:100px 20px 60px}
+  section{padding:60px 20px}
+  .feature-grid{grid-template-columns:1fr}
+  .use-cases{grid-template-columns:1fr}
+  .stats-bar{grid-template-columns:repeat(2,1fr)}
+}
+</style>
+</head>
+<body>
+
+<!-- NAV -->
+<nav class="topnav">
+  <div class="logo">CORTEX</div>
+  <div class="links">
+    <a href="#features">Features</a>
+    <a href="#architecture">Architecture</a>
+    <a href="#use-cases">Use Cases</a>
+    <a href="/login" class="cta-btn" style="padding:7px 18px;font-size:12px">Sign In</a>
+  </div>
+</nav>
+
+<!-- HERO -->
+<section class="hero">
+  <div class="hero-badge">OPEN SOURCE &middot; SELF-HOSTED &middot; PROVIDER-AGNOSTIC</div>
+  <h1>The Control Plane<br/>for <span class="grad">AI Agents</span></h1>
+  <p>Register, configure, run, and monitor any AI agent from a single ops hub. Full provenance, RBAC, human approval workflows, and enterprise-grade attestation — all in one place.</p>
+  <div class="hero-actions">
+    <a href="https://github.com/cortex-ai/cortex" class="cta-btn">Get Started</a>
+    <a href="#architecture" class="cta-btn ghost">See Architecture</a>
+  </div>
+  <div class="hero-terminal">
+    <div><span class="comment"># Deploy in 30 seconds</span></div>
+    <div><span class="prompt">$</span> <span class="cmd">git clone https://github.com/cortex-ai/cortex.git</span></div>
+    <div><span class="prompt">$</span> <span class="cmd">cd cortex && docker compose up -d</span></div>
+    <div><span class="comment"># That's it. Open http://localhost:3000</span></div>
+    <div style="margin-top:12px"><span class="comment"># Or run an agent via API</span></div>
+    <div><span class="prompt">$</span> <span class="cmd">curl -X POST localhost:3000/api/agents/my-bot/run \</span></div>
+    <div>&nbsp;&nbsp;&nbsp;&nbsp;<span class="cmd">-H "Authorization: Bearer ctx_..." \</span></div>
+    <div>&nbsp;&nbsp;&nbsp;&nbsp;<span class="cmd">-d '{"message": "Summarize Q3 results"}'</span></div>
+  </div>
+</section>
+
+<!-- STATS -->
+<div class="container">
+  <div class="stats-bar">
+    <div class="stat"><div class="num">5</div><div class="label">ARCHITECTURE LAYERS</div></div>
+    <div class="stat"><div class="num">14</div><div class="label">API ENDPOINTS</div></div>
+    <div class="stat"><div class="num">3</div><div class="label">LLM PROVIDERS</div></div>
+    <div class="stat"><div class="num">&infin;</div><div class="label">AGENTS SUPPORTED</div></div>
+  </div>
+</div>
+
+<!-- FEATURES -->
+<section id="features">
+  <div class="container">
+    <div class="section-label">CAPABILITIES</div>
+    <div class="section-title">Everything you need to run agents safely at scale</div>
+    <div class="section-desc">Cortex doesn't own your data or lock you into a provider. It controls access, enforces policy, and gives you a full audit trail.</div>
+
+    <div class="feature-grid">
+      <div class="feature-card">
+        <div class="feature-icon">🔗</div>
+        <h3>Provider-Agnostic Runtime</h3>
+        <p>Swap between Anthropic, OpenAI, and Google models with a single setting change. No vendor lock-in, ever.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">📜</div>
+        <h3>Tamper-Evident Attestation</h3>
+        <p>Every agent action creates a hash-chained provenance record. Verify the entire chain with one click. Built for compliance.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">🛡️</div>
+        <h3>RBAC & Human Approvals</h3>
+        <p>Role-based access with per-agent scope overrides. Gate high-risk actions behind human approval workflows.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">📊</div>
+        <h3>Usage Analytics</h3>
+        <p>Real-time dashboards: token usage, run volume, latency percentiles, cost tracking, success rates — all in one view.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">🔔</div>
+        <h3>Webhooks & Notifications</h3>
+        <p>HMAC-signed webhook delivery for run events. In-app notifications with real-time badge updates. Never miss an escalation.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">🧠</div>
+        <h3>Embedded AI Assistant</h3>
+        <p>Context-aware AI chat built into the monitoring page. Ask questions about your agents using live production data.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">📦</div>
+        <h3>Agent Templates</h3>
+        <p>Save and share agent configurations as reusable templates. One-click clone from a curated template library.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">🔑</div>
+        <h3>API Keys & OAuth</h3>
+        <p>Scoped API keys for programmatic access. Google and GitHub SSO for team authentication.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">🐳</div>
+        <h3>One-Command Deploy</h3>
+        <p>Docker Compose for local dev, ready for Kubernetes. PostgreSQL for reliability, environment variables for config.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ARCHITECTURE -->
+<section id="architecture" style="background:rgba(26,18,8,.5)">
+  <div class="container" style="text-align:center">
+    <div class="section-label">THE STACK</div>
+    <div class="section-title" style="margin-left:auto;margin-right:auto">Five layers. One control plane.</div>
+    <div class="section-desc" style="margin-left:auto;margin-right:auto">Cortex sits at layer 3 — the orchestration layer between your agents and the outside world. It doesn't own your data. It controls how intelligence flows.</div>
+
+    <div class="arch-stack">
+      <div class="arch-layer">
+        <div class="layer-name">Layer 5 &middot; Enterprise</div>
+        <div class="layer-desc">Attestation, compliance, audit trails, RBAC, human approvals</div>
+      </div>
+      <div class="arch-arrow">↕</div>
+      <div class="arch-layer">
+        <div class="layer-name">Layer 4 &middot; Integrations</div>
+        <div class="layer-desc">Webhooks, APIs, data sources, external tools</div>
+      </div>
+      <div class="arch-arrow">↕</div>
+      <div class="arch-layer highlight">
+        <div class="layer-name">Layer 3 &middot; CORTEX</div>
+        <div class="layer-desc">The control plane — orchestrate, monitor, gate, and audit every agent action</div>
+      </div>
+      <div class="arch-arrow">↕</div>
+      <div class="arch-layer">
+        <div class="layer-name">Layer 2 &middot; Agents</div>
+        <div class="layer-desc">Custom agents, imported configs, templates, any framework</div>
+      </div>
+      <div class="arch-arrow">↕</div>
+      <div class="arch-layer">
+        <div class="layer-name">Layer 1 &middot; Models</div>
+        <div class="layer-desc">Anthropic Claude, OpenAI GPT, Google Gemini — swap freely</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- USE CASES -->
+<section id="use-cases">
+  <div class="container">
+    <div class="section-label">USE CASES</div>
+    <div class="section-title">Built for teams that ship agents</div>
+    <div class="section-desc">From startups deploying their first agent to enterprises managing hundreds.</div>
+
+    <div class="use-cases">
+      <div class="use-case">
+        <div class="uc-icon">🏥</div>
+        <div>
+          <h4>Healthcare & Life Sciences</h4>
+          <p>Attestation trails for every clinical decision. HIPAA-ready audit logging. Human-in-the-loop for high-risk actions.</p>
+        </div>
+      </div>
+      <div class="use-case">
+        <div class="uc-icon">🏦</div>
+        <div>
+          <h4>Financial Services</h4>
+          <p>Hash-chained provenance for regulatory compliance. Role-based access for trading desk agents. Complete decision traceability.</p>
+        </div>
+      </div>
+      <div class="use-case">
+        <div class="uc-icon">🛒</div>
+        <div>
+          <h4>E-Commerce & Support</h4>
+          <p>Deploy customer support agents with containment tracking. Monitor resolution rates. Auto-escalate to humans when needed.</p>
+        </div>
+      </div>
+      <div class="use-case">
+        <div class="uc-icon">🔬</div>
+        <div>
+          <h4>Research & Development</h4>
+          <p>Run experiments across providers and models. Compare outputs. Track token costs. Template successful configurations.</p>
+        </div>
+      </div>
+      <div class="use-case">
+        <div class="uc-icon">⚙️</div>
+        <div>
+          <h4>DevOps & Platform Teams</h4>
+          <p>Centralize agent management. API-first design for CI/CD integration. Webhook-driven automation. One dashboard for everything.</p>
+        </div>
+      </div>
+      <div class="use-case">
+        <div class="uc-icon">🏢</div>
+        <div>
+          <h4>Enterprise AI Teams</h4>
+          <p>RBAC with per-agent scoping. Approval workflows for production changes. Multi-tenant ready. SSO with Google and GitHub.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- CTA -->
+<section class="cta-section">
+  <h2>Ready to take <span style="background:linear-gradient(135deg,#f97316,#fbbf24);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text">control</span>?</h2>
+  <p>Self-host in 30 seconds. No vendor lock-in. No data leaves your infrastructure.</p>
+  <div style="display:flex;gap:16px;justify-content:center;flex-wrap:wrap">
+    <a href="https://github.com/cortex-ai/cortex" class="cta-btn">Deploy Now</a>
+    <a href="https://github.com/cortex-ai/cortex" class="cta-btn ghost">View on GitHub</a>
+  </div>
+</section>
+
+<!-- FOOTER -->
+<div class="footer">
+  <p><strong style="color:var(--fg)">CORTEX</strong> — The control plane that safely connects AI agents to the real world.</p>
+  <p style="margin-top:8px">Open source &middot; Self-hosted &middot; <a href="https://github.com/cortex-ai/cortex">GitHub</a></p>
+</div>
+
+</body></html>

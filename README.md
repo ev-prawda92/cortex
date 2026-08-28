@@ -1,107 +1,240 @@
-# CORTEX — Agent Control Plane
+<p align="center">
+  <img src="https://img.shields.io/badge/CORTEX-Agent_Ops_Hub-f97316?style=for-the-badge&labelColor=1a1208" alt="Cortex"/>
+</p>
 
-A real-time dashboard for monitoring, configuring, and managing AI agents in production. Built for healthcare and enterprise use cases where agents need human oversight, version control, and audit trails.
+<h1 align="center">CORTEX</h1>
+<p align="center"><strong>The control plane that safely connects AI agents to the real world.</strong></p>
 
-## Features
+<p align="center">
+  <img src="https://img.shields.io/badge/python-3.12-blue?logo=python&logoColor=white" alt="Python 3.12"/>
+  <img src="https://img.shields.io/badge/FastAPI-0.100+-green?logo=fastapi&logoColor=white" alt="FastAPI"/>
+  <img src="https://img.shields.io/badge/PostgreSQL-16-336791?logo=postgresql&logoColor=white" alt="PostgreSQL"/>
+  <img src="https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white" alt="Docker"/>
+  <img src="https://img.shields.io/badge/License-MIT-yellow" alt="MIT License"/>
+  <img src="https://img.shields.io/badge/PRs-welcome-brightgreen" alt="PRs Welcome"/>
+</p>
 
-- **Monitor** — Live dashboards showing agent metrics (containment, resolution, escalation rates)
-- **Control** — Edit agent configs in plain English; propose diffs; version every change
-- **History** — Full version history and rollback for all agent configurations
-- **Automation** — Time-based scheduling and event-triggered execution
-- **Runs** — Execution logs and output from each agent run
-- **Settings** — Multi-provider LLM key management (Anthropic, OpenAI, Gemini)
-- **Glossary** — Configuration guide and explanation of all agent settings
-- **Integrations** — Deploy agents to external systems (webhooks, APIs)
-- **Diagnostics** — Real-world case studies showing agent reasoning and escalation
+<p align="center">
+  <a href="#quickstart">Quickstart</a> •
+  <a href="#features">Features</a> •
+  <a href="#architecture">Architecture</a> •
+  <a href="#api">API</a> •
+  <a href="#deployment">Deployment</a> •
+  <a href="#contributing">Contributing</a>
+</p>
 
-## Quick Start
+---
+
+## What is Cortex?
+
+Cortex is a **self-hosted agent operations platform** — register, configure, run, and monitor any AI agent from a single dashboard. It doesn't own your data or lock you into a provider. It controls access, enforces policy, and gives you a complete audit trail.
+
+**Cortex sits at layer 3** of the modern AI stack — the orchestration layer between your agents and the outside world:
+
+```
+┌─────────────────────────────────────────┐
+│  Layer 5 · Enterprise                   │  Attestation, RBAC, compliance
+├─────────────────────────────────────────┤
+│  Layer 4 · Integrations                 │  Webhooks, APIs, data sources
+├═════════════════════════════════════════╡
+│  Layer 3 · CORTEX  ◄── you are here    │  Orchestrate, monitor, gate, audit
+├═════════════════════════════════════════╡
+│  Layer 2 · Agents                       │  Custom, imported, templates
+├─────────────────────────────────────────┤
+│  Layer 1 · Models                       │  Claude, GPT, Gemini — swap freely
+└─────────────────────────────────────────┘
+```
+
+## Quickstart
+
+### Docker (recommended)
 
 ```bash
-cd CortexUpdated
+git clone https://github.com/cortex-ai/cortex.git
+cd cortex
+docker compose up -d
+```
+
+Open **http://localhost:3000** → create an account → start registering agents.
+
+### Manual
+
+```bash
+pip install -r requirements.txt
+export DATABASE_URL="postgresql://user:pass@localhost:5432/cortex"
 python3 cortex.py
 ```
 
-Then open **http://localhost:3000** in your browser.
+### Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `DATABASE_URL` | `postgresql://cortex:cortex@localhost:5432/cortex` | PostgreSQL connection string |
+| `SECRET_KEY` | auto-generated | JWT signing key |
+| `ANTHROPIC_API_KEY` | — | Enables Anthropic Claude models |
+| `OPENAI_API_KEY` | — | Enables OpenAI GPT models |
+| `GOOGLE_API_KEY` | — | Enables Google Gemini models |
+| `GOOGLE_CLIENT_ID` | — | Google OAuth SSO |
+| `GITHUB_CLIENT_ID` | — | GitHub OAuth SSO |
+
+## Features
+
+### Core Platform
+- **Provider-agnostic runtime** — swap between Anthropic, OpenAI, and Google with one setting
+- **Natural language control** — describe changes in English, review diffs, approve explicitly
+- **Agent templates** — save, share, and clone agent configurations
+- **Multi-endpoint support** — embedded execution, REST proxy, webhook-triggered
+- **Import agents** from OpenAI Assistants, LangChain, or custom JSON
+
+### Enterprise
+- **Tamper-evident attestation** — hash-chained provenance records (SHA-256, linked `prev_hash`)
+- **RBAC** — viewer / operator / admin roles with per-agent scope overrides
+- **Human approval workflows** — gate high-risk actions behind manual approval
+- **Scoped API keys** — `agents:read`, `agents:run`, `agents:write` permissions
+- **OAuth SSO** — Google and GitHub authentication
+
+### Observability
+- **Usage analytics dashboard** — token usage, run volume, latency (avg + P95), success rates
+- **Real-time monitoring** — agent status, health scores, activity feeds
+- **HMAC-signed webhooks** — event delivery with auto-disable after repeated failures
+- **In-app notifications** — real-time badge updates, dismiss/mark-read
+- **Full run traces** — every step recorded with provider, model, and token counts
+
+### Built-in Intelligence
+- **Embedded AI assistant** — context-aware chat on the monitoring page, uses live agent data
+- **Automated diagnostics** — config vs. platform issue detection with fix recommendations
+- **Deterministic fallback** — works without an API key for common change types
 
 ## Architecture
 
-**One-file backend** (FastAPI):
-- Single `cortex.py` file contains the entire server
-- Serves embedded HTML/CSS/JS dashboard
-- No build step required
-
-**Multi-provider support**:
-- `providers.py` — Abstraction for Anthropic, OpenAI, Gemini
-- `automation.py` — Time-based and event-triggered scheduling
-- `settings.json` — Persisted API keys and model configuration
-
-**Agent configs**:
-- Structured YAML-like configs with posture (replace/augment/support)
-- Journey settings (channels, timing, retry logic)
-- Escalation thresholds and routing
-- Prompt templates
-
-## File Structure
-
 ```
-cortex.py              # Main FastAPI server + embedded dashboard
-providers.py           # Multi-provider LLM abstraction
-automation.py          # Scheduling and event triggers
-settings.json          # API keys and model choices (created at runtime)
-automation.json        # Automation schedules per agent (created at runtime)
+cortex/
+├── cortex.py          # FastAPI app + embedded dashboard (single-file)
+├── db.py              # SQLAlchemy models + session management
+├── auth.py            # JWT, password hashing, OAuth flows
+├── providers.py       # Multi-provider LLM abstraction
+├── automation.py      # Scheduling + event trigger engine
+├── landing.html       # Marketing / product landing page
+├── Dockerfile         # Production container
+├── docker-compose.yml # One-command deploy
+└── requirements.txt   # Python dependencies
 ```
 
-## Configuration
+### Database Schema (14 tables)
 
-### API Keys
+| Table | Purpose |
+|---|---|
+| `users` | Authentication (email/password + OAuth) |
+| `agents` | Agent configs, status, metrics |
+| `runs` | Execution history with full traces |
+| `data_sources` | Agent data source configurations |
+| `settings` | Per-instance provider settings |
+| `api_keys` | Scoped API keys for external callers |
+| `webhooks` | Webhook subscriptions with HMAC signing |
+| `agent_templates` | Reusable agent config templates |
+| `notifications` | In-app user notifications |
+| `attestations` | Hash-chained provenance records |
+| `user_roles` | RBAC role assignments |
+| `approval_requests` | Human approval workflows |
+| `audit_log` | Immutable event audit trail |
+| `oauth_states` | CSRF protection for OAuth flows |
 
-Keys are stored in `settings.json` (auto-created). You can set them:
-1. In the **Settings** tab of the dashboard
-2. Via environment variables: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`
-3. Or directly in `settings.json`
+## API
 
-### Models
+All endpoints are under `/api/`. Authentication is via JWT cookie or `Authorization: Bearer ctx_...` API key.
 
-Default models are set in `providers.py`. Override in **Settings** tab.
+### Agents
+```
+GET    /api/agents                    # List all agents
+GET    /api/agents/:id                # Get agent details
+POST   /api/agents/register           # Register a new agent
+POST   /api/agents/import             # Import from external format
+POST   /api/agents/:id/run            # Execute an agent
+POST   /api/agents/:id/propose        # Propose a config change
+POST   /api/agents/:id/apply          # Apply an approved change
+POST   /api/agents/:id/control?action= # Start/stop an agent
+DELETE /api/agents/:id                # Delete an agent
+```
 
-## Development
+### Enterprise
+```
+GET    /api/attestations              # List provenance records
+GET    /api/attestations/verify/:id   # Verify an agent's chain
+GET    /api/roles                     # List role assignments
+POST   /api/roles                     # Set a user's role
+GET    /api/approvals                 # List approval requests
+POST   /api/approvals/:id             # Approve or reject
+```
 
-To add a new agent:
-1. Add it to the `AGENTS` dict in `cortex.py`
-2. Set its config (posture, channels, escalation rules)
-3. Add default automation settings in `automation.py`
-4. Reload the dashboard
+### Operations
+```
+GET    /api/analytics                 # Usage analytics dashboard
+GET    /api/metrics/portfolio         # Portfolio health metrics
+GET    /api/events                    # Event log
+GET    /api/notifications             # User notifications
+POST   /api/webhooks                  # Create webhook subscription
+GET    /api/templates                 # List agent templates
+POST   /api/assistant/chat            # AI assistant query
+```
 
-## API Endpoints
+### Auth & Admin
+```
+POST   /api/auth/signup               # Create account
+POST   /api/auth/login                # Sign in
+GET    /api/auth/me                   # Current user
+GET    /api/admin/users               # List users (admin)
+GET    /api/admin/stats               # System statistics
+POST   /api/keys                      # Create API key
+```
 
-- `GET /api/agents` — List all agents
-- `GET /api/agents/{id}` — Get agent details
-- `POST /api/agents/{id}/run` — Run agent with input
-- `GET /api/agents/{id}/automation` — Get automation config
-- `POST /api/agents/{id}/automation` — Update automation config
-- `POST /api/agents/{id}/propose` — Propose config change
-- `POST /api/agents/{id}/apply` — Apply approved change
-- `POST /api/agents/{id}/history` — Get version history
+## Deployment
 
-## Security Notes
+### Docker Compose (recommended)
 
-- `settings.json` and `automation.json` are created with `0o600` (read/write for owner only)
-- API keys are masked in the UI (first 7 + last 4 chars)
-- Add these files to `.gitignore` before committing
-- Use environment variables for sensitive data in production
+The included `docker-compose.yml` starts Cortex + PostgreSQL 16:
 
-## Status
+```bash
+docker compose up -d
+```
 
-**v0.2.0** — Early stages. Core features working:
-- ✅ Dashboard rendering
-- ✅ Agent monitoring
-- ✅ Config management with diffs
-- ✅ Version control and rollback
-- ✅ Automation scheduling
-- ✅ Multi-provider LLM support
-- 🔧 Integration deployment (framework ready)
-- 🔧 Real-time agent execution output
+### Production Checklist
+
+- [ ] Set `SECRET_KEY` to a strong random value
+- [ ] Configure at least one LLM provider API key
+- [ ] Set up OAuth credentials for SSO (optional)
+- [ ] Run behind a reverse proxy (nginx/Caddy) with TLS
+- [ ] Set `DATABASE_URL` to a managed PostgreSQL instance
+- [ ] Enable backups for the PostgreSQL database
+
+### Kubernetes
+
+Cortex is a single stateless container — deploy with a standard Deployment + Service + Ingress. Point `DATABASE_URL` at your managed Postgres.
+
+## Design Principles
+
+1. **Cortex does not own customer data** — it controls access only
+2. **API keys are saved but owned by the user/company** — Cortex is a passthrough
+3. **Lightweight and easy to adopt** — single binary, Docker-ready, no complex setup
+4. **Human stays in the loop** — config changes require explicit approval
+5. **Provider-agnostic** — no vendor lock-in at any layer
+6. **Tamper-evident** — hash-chained attestation for every action
+
+## Contributing
+
+PRs are welcome. Please:
+
+1. Fork the repo
+2. Create a feature branch
+3. Make your changes
+4. Run the test suite
+5. Submit a PR with a clear description
 
 ## License
 
-MIT
+MIT License — see [LICENSE](LICENSE) for details.
+
+---
+
+<p align="center">
+  <strong>CORTEX</strong> — The control plane that safely connects AI agents to the real world.
+</p>
