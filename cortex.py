@@ -2438,8 +2438,10 @@ def _save_run_to_db(agent_id: str, rec: dict):
     """Persist a run record to the database, fire webhooks, and create notifications."""
     try:
         db = SessionLocal()
+        run_id = gen_id()
+        rec["id"] = run_id          # so callers can reference the run they just caused
         run = RunModel(
-            id=gen_id(), agent_id=agent_id,
+            id=run_id, agent_id=agent_id,
             claim=rec.get("claim", ""),
             outcome=rec.get("outcome", ""),
             published=rec.get("published", False),
@@ -2556,18 +2558,17 @@ def _save_run_to_db(agent_id: str, rec: dict):
     )
 
 
-@app.post("/api/agents/{agent_id}/run")
-def run_live_agent(agent_id: str, body: RunIn, request: Request):
+def _execute_agent(agent_id: str, claim: str) -> dict:
+    """Execute an agent using its CURRENT Cortex config, and record the run.
+
+    Shared by the /api/agents/{id}/run route and the /webhooks/{id}/{event}
+    trigger so both paths execute identically — one implementation, one set of
+    outcomes, one place a run gets written. Behaviour depends on the agent's
+    endpoint type:
+        embedded  run through the active LLM provider with the agent's tools
+        rest      POST to the agent's configured endpoint URL
+        webhook   return instructions for the caller to send data
     """
-    Execute an agent using its CURRENT Cortex config.
-    Behavior depends on the agent's endpoint type:
-    - embedded: Run using the active LLM provider with the agent's tools
-    - rest: POST to the agent's configured endpoint URL
-    - webhook: Return instructions for the client to send data
-    """
-    sess = _get_session(request)
-    if sess and not _check_scope(sess, "agents:run"):
-        raise HTTPException(403, "API key missing required scope: agents:run")
     db = SessionLocal()
     try:
         a_row = db.query(AgentModel).filter(AgentModel.id == agent_id).first()
@@ -2581,7 +2582,7 @@ def run_live_agent(agent_id: str, body: RunIn, request: Request):
         db.close()
 
     run_start = datetime.now(timezone.utc).isoformat()
-    log_event(agent_id, "run.start", {"input": body.claim[:200], "config_version": a_version})
+    log_event(agent_id, "run.start", {"input": claim[:200], "config_version": a_version})
 
     cfg = a["config"]
     endpoint = a.get("endpoint", {})
@@ -2592,7 +2593,7 @@ def run_live_agent(agent_id: str, body: RunIn, request: Request):
         log_event(agent_id, "run.webhook_info", {"endpoint": endpoint.get("url", "")})
         webhook_now = datetime.now(timezone.utc).isoformat()
         rec = {
-            "claim": body.claim, "outcome": "WEBHOOK_PENDING", "published": False,
+            "claim": claim, "outcome": "WEBHOOK_PENDING", "published": False,
             "steps_used": 0, "config_version": a_version,
             "provider": "webhook", "model": "",
             "trace": [{"kind": "info", "text": f"Send data to webhook: {endpoint.get('url', 'not configured')}"}],
@@ -2607,14 +2608,14 @@ def run_live_agent(agent_id: str, body: RunIn, request: Request):
         import httpx
         try:
             with httpx.Client(timeout=cfg.get("execution", {}).get("timeout_seconds", 120)) as client:
-                resp = client.post(endpoint["url"], json={"claim": body.claim, "config": cfg})
+                resp = client.post(endpoint["url"], json={"claim": claim, "config": cfg})
                 resp.raise_for_status()
                 result = resp.json()
         except Exception as e:
             log_event(agent_id, "run.error", {"message": str(e)})
             rest_err_end = datetime.now(timezone.utc).isoformat()
             rec = {
-                "claim": body.claim, "outcome": "ERROR", "published": False,
+                "claim": claim, "outcome": "ERROR", "published": False,
                 "steps_used": 0, "config_version": a_version,
                 "provider": "rest", "model": "",
                 "trace": [{"kind": "error", "text": str(e)}],
@@ -2626,7 +2627,7 @@ def run_live_agent(agent_id: str, body: RunIn, request: Request):
 
         rest_end = datetime.now(timezone.utc).isoformat()
         rec = {
-            "claim": body.claim, "outcome": "COMPLETED", "published": True,
+            "claim": claim, "outcome": "COMPLETED", "published": True,
             "steps_used": 1, "config_version": a_version,
             "provider": "rest", "model": "",
             "trace": [{"kind": "rest_call", "url": endpoint["url"], "status": "ok"}],
@@ -2675,7 +2676,7 @@ def run_live_agent(agent_id: str, body: RunIn, request: Request):
     res = providers_mod.run_tool_loop(
         provider=provider, api_key=key,
         model=model_cfg.get("model_name") or get_model(provider),
-        system=system, tools=tools, user_message=body.claim,
+        system=system, tools=tools, user_message=claim,
         process_tool_call=_default_tool_handler,
         max_iterations=execution.get("max_retries", 3) + 1)
 
@@ -2693,9 +2694,8 @@ def run_live_agent(agent_id: str, body: RunIn, request: Request):
         log_event(agent_id, "run.error", {"message": res.get("error", "unknown error")})
 
     run_end = datetime.now(timezone.utc).isoformat()
-    sess = _get_session(body._request) if hasattr(body, '_request') else None
     rec = {
-        "claim": body.claim, "outcome": outcome, "published": published,
+        "claim": claim, "outcome": outcome, "published": published,
         "steps_used": res["steps_used"], "config_version": a_version,
         "provider": provider,
         "model": model_cfg.get("model_name") or get_model(provider),
@@ -2725,6 +2725,15 @@ def run_live_agent(agent_id: str, body: RunIn, request: Request):
     if res["ok"]:
         return {"ok": True, "run": rec}
     return {"ok": False, "error": res.get("error", "run failed"), "run": rec}
+
+
+@app.post("/api/agents/{agent_id}/run")
+def run_live_agent(agent_id: str, body: RunIn, request: Request):
+    """Run an agent once with the supplied input."""
+    sess = _get_session(request)
+    if sess and not _check_scope(sess, "agents:run"):
+        raise HTTPException(403, "API key missing required scope: agents:run")
+    return _execute_agent(agent_id, body.claim)
 
 
 @app.get("/api/agents/{agent_id}/runs")
@@ -3127,14 +3136,49 @@ def webhook_trigger(agent_id: str, event_type: str):
     finally:
         db.close()
 
-    should_run, reason = automation_mod.check_event_trigger(agent_id, event_type)
-    if not should_run:
-        return {"ok": False, "reason": reason}
+    # check_event_trigger returns a plain bool — it is false both when automation
+    # is disabled for the agent and when this event type is not subscribed, so
+    # say which rather than reporting a bare refusal.
+    if not automation_mod.check_event_trigger(agent_id, event_type):
+        auto = automation_mod.get_agent_automation(agent_id) or {}
+        reason = ("automation is not enabled for this agent"
+                  if not auto.get("enabled")
+                  else f"'{event_type}' is not in this agent's event triggers")
+        log_event(agent_id, "webhook.ignored", {"event": event_type, "reason": reason})
+        return {"ok": False, "executed": False, "agent_id": agent_id,
+                "event": event_type, "reason": reason}
 
-    # TODO: Actually run the agent here
-    # For now, just record that the event was received
-    automation_mod.record_run(agent_id, success=True)
-    return {"ok": True, "executed": True, "agent_id": agent_id, "event": event_type}
+    # Run the agent for real, through the same path the API route uses. The
+    # caller is told what actually happened rather than that it was received.
+    log_event(agent_id, "webhook.trigger", {"event": event_type})
+    try:
+        result = _execute_agent(agent_id, f"[webhook:{event_type}] Event received.")
+    except HTTPException as e:
+        log_event(agent_id, "webhook.error", {"event": event_type, "detail": str(e.detail)})
+        return {"ok": False, "executed": False, "agent_id": agent_id,
+                "event": event_type, "error": e.detail}
+    except Exception as e:
+        log_event(agent_id, "webhook.error", {"event": event_type, "error": str(e)[:500]})
+        return {"ok": False, "executed": False, "agent_id": agent_id,
+                "event": event_type, "error": str(e)[:500]}
+
+    # _execute_agent returns a "run" only when one actually happened. Without
+    # one it could not start at all (no provider key, for instance) — which is
+    # not an execution, and must not be reported as one.
+    run = result.get("run")
+    if run is None:
+        log_event(agent_id, "webhook.not_executed",
+                  {"event": event_type, "error": result.get("error", "")})
+        return {"ok": False, "executed": False, "agent_id": agent_id,
+                "event": event_type,
+                "error": result.get("error", "agent could not be executed")}
+
+    automation_mod.record_run(agent_id)
+    return {"ok": bool(result.get("ok")), "executed": True,
+            "agent_id": agent_id, "event": event_type,
+            "run_id": run.get("id", ""),
+            "outcome": run.get("outcome", ""),
+            "run_summary": (run.get("detail", {}) or {}).get("summary", "")[:500]}
 
 
 # ═══════════════════════════════════════════════════════════════
