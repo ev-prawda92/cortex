@@ -39,7 +39,7 @@ from db import (
     get_db, init_db, gen_id, utcnow,
     User, Agent as AgentModel, Run as RunModel,
     DataSource as DataSourceModel, Setting, AuditLog, OAuthState, ApiKey,
-    Webhook, AgentTemplate, Notification,
+    Webhook, AgentTemplate, Notification, AgentRelease,
     Attestation, UserRole, ApprovalRequest,
     get_or_create_setting, set_setting, log_audit,
     SessionLocal,
@@ -2791,6 +2791,122 @@ def run_live_agent(agent_id: str, body: RunIn, request: Request):
     if sess and not _check_scope(sess, "agents:run"):
         raise HTTPException(403, "API key missing required scope: agents:run")
     return _execute_agent(agent_id, body.claim)
+
+
+class ReleaseIn(BaseModel):
+    environment: str
+    version: int | None = None      # defaults to the agent's current version
+    note: str = ""
+
+
+@app.get("/api/agents/{agent_id}/releases")
+def list_releases(agent_id: str, request: Request):
+    """Which config version each of the client's environments is running."""
+    if not _get_session(request):
+        raise HTTPException(401, "not authenticated")
+    db = SessionLocal()
+    try:
+        rows = db.query(AgentRelease).filter(AgentRelease.agent_id == agent_id).all()
+        return {"agent_id": agent_id, "releases": [r.to_dict() for r in rows]}
+    finally:
+        db.close()
+
+
+@app.post("/api/agents/{agent_id}/release")
+def release_agent(agent_id: str, body: ReleaseIn, request: Request):
+    """Mark a config version live in one of the client's environments.
+
+    This does not push anything. It records the pointer; the environment picks
+    it up on its next fetch of /api/agents/{id}/config.
+    """
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "not authenticated")
+    env = (body.environment or "").strip().lower()
+    if not env:
+        raise HTTPException(400, "environment is required")
+
+    db = SessionLocal()
+    try:
+        a_row = db.query(AgentModel).filter(AgentModel.id == agent_id).first()
+        if not a_row:
+            raise HTTPException(404, "agent not found")
+
+        version = body.version or a_row.version or 1
+        # Only release a version that actually exists — releasing a version
+        # with no snapshot behind it would leave the environment fetching a
+        # config nobody can reconstruct.
+        snap = (db.query(AgentVersion)
+                .filter(AgentVersion.agent_id == agent_id,
+                        AgentVersion.version == version).first())
+        if not snap:
+            raise HTTPException(400, f"agent has no recorded v{version} to release")
+
+        rec = (db.query(AgentRelease)
+               .filter(AgentRelease.agent_id == agent_id,
+                       AgentRelease.environment == env).first())
+        previous = rec.active_version if rec else None
+        if not rec:
+            rec = AgentRelease(agent_id=agent_id, owner_id=sess.get("user_id"),
+                               environment=env, active_version=version)
+            db.add(rec)
+        else:
+            rec.active_version = version
+        rec.released_by = sess.get("user_id")
+        rec.released_by_email = sess.get("email", "")
+        rec.note = (body.note or "")[:512]
+        rec.updated_at = utcnow()
+        db.commit()
+
+        log_event(agent_id, "release", {"environment": env, "version": version,
+                                        "previous": previous})
+        return {"ok": True, "environment": env, "active_version": version,
+                "previous_version": previous, "release": rec.to_dict()}
+    finally:
+        db.close()
+
+
+@app.get("/api/agents/{agent_id}/config")
+def fetch_released_config(agent_id: str, request: Request, env: str = "production"):
+    """The config an environment should be running. Called by the client's agent.
+
+    Authenticate with an API key carrying agents:read. Returns the snapshot at
+    the released version, not the agent's current working config — that is the
+    whole point of releasing.
+    """
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "not authenticated")
+    if not _check_scope(sess, "agents:read"):
+        raise HTTPException(403, "API key missing required scope: agents:read")
+
+    env = (env or "production").strip().lower()
+    db = SessionLocal()
+    try:
+        rec = (db.query(AgentRelease)
+               .filter(AgentRelease.agent_id == agent_id,
+                       AgentRelease.environment == env).first())
+        if not rec:
+            raise HTTPException(404, f"no version released to '{env}' for this agent")
+
+        snap = (db.query(AgentVersion)
+                .filter(AgentVersion.agent_id == agent_id,
+                        AgentVersion.version == rec.active_version).first())
+        if not snap:
+            raise HTTPException(500,
+                f"v{rec.active_version} is released to '{env}' but its snapshot is missing")
+
+        # Record the pickup so "released" and "running" stay distinguishable.
+        rec.last_fetched_at = utcnow()
+        rec.fetch_count = (rec.fetch_count or 0) + 1
+        db.commit()
+
+        return {"agent_id": agent_id, "environment": env,
+                "version": rec.active_version,
+                "config": snap.config or {},
+                "released_at": rec.updated_at.isoformat() if rec.updated_at else None}
+    finally:
+        db.close()
 
 
 @app.get("/api/agents/{agent_id}/runs")
@@ -5666,102 +5782,114 @@ function highlightCode(code,fmt){
 async function renderDeploy(){
   if(!sel){document.getElementById('root').innerHTML='<div class="hint" style="padding:40px">Select an agent first.</div>';return;}
   const a=AGENTS.find(x=>x.id===sel);
-  const cfg=(await(await fetch('/api/agents/'+sel)).json()).config||{};
+  const [cfgRes,relRes]=await Promise.all([
+    fetch('/api/agents/'+sel).then(r=>r.json()).catch(()=>({})),
+    fetch('/api/agents/'+sel+'/releases').then(r=>r.json()).catch(()=>({releases:[]})),
+  ]);
+  const cfg=cfgRes.config||{}, cur=a?.version||1;
+  const rel={}; (relRes.releases||[]).forEach(r=>{rel[r.environment]=r;});
 
+  const ago=iso=>{
+    if(!iso) return 'never';
+    const s=Math.floor((Date.now()-new Date(iso).getTime())/1000);
+    if(s<60) return 'just now';
+    if(s<3600) return Math.floor(s/60)+'m ago';
+    if(s<86400) return Math.floor(s/3600)+'h ago';
+    return Math.floor(s/86400)+'d ago';
+  };
+
+  const envCard=name=>{
+    const r=rel[name];
+    if(!r) return `<div class="env-card" style="border-left:3px solid var(--faint)">
+      <div style="display:flex;justify-content:space-between;align-items:start">
+        <div><div class="env-name">${esc(name[0].toUpperCase()+name.slice(1))}</div>
+          <div class="env-url" style="color:var(--faint)">No version released</div></div>
+        <span class="pill stopped">none</span></div></div>`;
+
+    const behind = r.active_version < cur;
+    const neverFetched = !r.last_fetched_at;
+    return `<div class="env-card" style="border-left:3px solid ${neverFetched?'var(--ochre)':'var(--seal)'}">
+      <div style="display:flex;justify-content:space-between;align-items:start">
+        <div><div class="env-name">${esc(name[0].toUpperCase()+name.slice(1))}</div>
+          <div class="env-url">running v${r.active_version}</div></div>
+        <span class="pill ${neverFetched?'stopped':'running'}">${neverFetched?'not picked up':'live'}</span>
+      </div>
+      <div class="env-status">
+        <div class="health-dot ${neverFetched?'gray':'green'}"></div>
+        <span>released ${esc(ago(r.released_at))}${r.released_by_email?' by '+esc(r.released_by_email):''}
+          · fetched ${esc(ago(r.last_fetched_at))}${r.fetch_count?' ('+r.fetch_count+'x)':''}</span>
+      </div>
+      ${r.note?`<div class="hint" style="margin-top:6px">${esc(r.note)}</div>`:''}
+      ${neverFetched?`<div class="flag" style="margin-top:6px;font-size:11px">This environment has never fetched its config. Released, but not confirmed running.</div>`:''}
+      ${behind?`<div class="hint" style="margin-top:6px">Behind — this workspace is on v${cur}.</div>`:''}
+    </div>`;
+  };
+
+  const origin=location.origin;
   document.getElementById('root').innerHTML=`<div class="wrap">${sidebar()}
     <div>
-      <h2>${esc(a?.name||sel)} — Deployment</h2>
-
+      <h2>${esc(a?.name||sel)} — Releases</h2>
       <div class="panel" style="margin-bottom:16px">
-        <div class="phead"><h3>Environments</h3></div>
+        <div class="phead"><h3>Environments</h3><span class="vtag">workspace v${cur}</span></div>
         <div class="sect">
-          <div class="env-card" style="border-left:3px solid var(--seal)">
-            <div style="display:flex;justify-content:space-between;align-items:start">
-              <div>
-                <div class="env-name">Development</div>
-                <div class="env-url">http://localhost:3000</div>
-              </div>
-              <span class="pill running">active</span>
-            </div>
-            <div class="env-status">
-              <div class="health-dot green"></div>
-              <span>Running · v${a?.version||1} · ${(cfg.model||{}).provider||'anthropic'}</span>
-            </div>
+          <div class="hint" style="margin-bottom:10px">
+            CORTEX does not run your agents — it holds their config. Releasing marks a version live
+            for an environment; your agent picks it up on its next fetch.
           </div>
-
-          <div class="env-card" style="border-left:3px solid var(--faint)">
-            <div style="display:flex;justify-content:space-between;align-items:start">
-              <div>
-                <div class="env-name">Staging</div>
-                <div class="env-url" style="color:var(--faint)">Not configured</div>
-              </div>
-              <span class="pill stopped">inactive</span>
-            </div>
-            <div class="env-status"><div class="health-dot gray"></div><span>Not deployed</span></div>
-          </div>
-
-          <div class="env-card" style="border-left:3px solid var(--faint)">
-            <div style="display:flex;justify-content:space-between;align-items:start">
-              <div>
-                <div class="env-name">Production</div>
-                <div class="env-url" style="color:var(--faint)">Not configured</div>
-              </div>
-              <span class="pill stopped">inactive</span>
-            </div>
-            <div class="env-status"><div class="health-dot gray"></div><span>Not deployed</span></div>
-          </div>
+          ${envCard('staging')}${envCard('production')}
         </div>
       </div>
 
       <div class="panel" style="margin-bottom:16px">
-        <div class="phead"><h3>Deploy Agent</h3></div>
+        <div class="phead"><h3>Release a version</h3></div>
         <div class="sect">
-          <div class="form-group" style="margin-bottom:12px"><label>Target Environment</label>
-            <select id="deploy-env" style="padding:8px 10px;border:1px solid var(--line);border-radius:3px;font-size:13px">
-              <option value="staging">Staging</option>
-              <option value="production">Production</option>
-            </select>
-          </div>
-          <div class="form-group" style="margin-bottom:12px"><label>Endpoint URL</label>
-            <input id="deploy-url" placeholder="https://api.yourcompany.com/agents" style="padding:8px 10px;border:1px solid var(--line);border-radius:3px;font-size:13px">
-          </div>
-          <div class="form-group" style="margin-bottom:12px"><label>API Key / Auth Token</label>
-            <input id="deploy-key" type="password" placeholder="Bearer token or API key" style="padding:8px 10px;border:1px solid var(--line);border-radius:3px;font-size:13px">
-          </div>
-          <div style="display:flex;gap:8px;align-items:center">
-            <button class="btn accent" onclick="deployAgent()">Deploy v${a?.version||1}</button>
-            <span id="deploy-msg" style="font-size:11px"></span>
-          </div>
-          <div class="hint">Pushes the current agent config and version to the target environment. The agent will be available at the configured endpoint.</div>
+          <div class="form-group"><label>Environment</label>
+            <select id="rel-env"><option value="staging">Staging</option><option value="production">Production</option></select></div>
+          <div class="form-group"><label>Version</label>
+            <input id="rel-ver" type="number" min="1" max="${cur}" value="${cur}">
+            <div class="hint" style="margin-top:4px">Defaults to this workspace's current version. Lower it to roll an environment back.</div></div>
+          <div class="form-group"><label>Note (optional)</label>
+            <input id="rel-note" placeholder="e.g. loosened confidence threshold after the Tuesday regression"></div>
+          <button class="btn accent" onclick="releaseAgent()">Release</button>
+          <div id="rel-msg" style="margin-top:10px;font-size:12px"></div>
         </div>
       </div>
 
       <div class="panel">
-        <div class="phead"><h3>Deployment Checklist</h3></div>
-        <div class="sect" style="font-size:12.5px;line-height:2">
-          <div><input type="checkbox"> API key configured for ${(cfg.model||{}).provider||'provider'}</div>
-          <div><input type="checkbox"> Data sources authenticated and accessible</div>
-          <div><input type="checkbox"> Rate limits set on all tools</div>
-          <div><input type="checkbox"> Audit logging enabled</div>
-          <div><input type="checkbox"> Escalation routing configured</div>
-          <div><input type="checkbox"> Agent tested with sample inputs</div>
-          <div><input type="checkbox"> Confirm-before-action set appropriately</div>
+        <div class="phead"><h3>How your agent fetches this</h3></div>
+        <div class="sect">
+          <div class="hint" style="margin-bottom:8px">One call at boot, or on an interval. Needs an API key with <span class="mono">agents:read</span>.</div>
+          <pre class="mono" style="background:var(--paper);border:1px solid var(--line);border-radius:4px;padding:10px;font-size:11px;overflow-x:auto;white-space:pre">curl -H "Authorization: Bearer ctx_..." \\
+  "${esc(origin)}/api/agents/${esc(sel)}/config?env=production"</pre>
+          <div class="hint" style="margin-top:8px">Returns the config snapshot at the released version, plus the version number — so your runtime can log which config it is actually on.</div>
         </div>
       </div>
     </div></div>`;
 }
 
-async function deployAgent(){
-  const env=document.getElementById('deploy-env').value;
-  const url=document.getElementById('deploy-url').value.trim();
-  const msg=document.getElementById('deploy-msg');
-  if(!url){msg.innerHTML='<span style="color:var(--brick)">Endpoint URL required</span>';return;}
-  msg.innerHTML='<span style="color:var(--accent)"><span class="spin">&#x25D4;</span> Deploying...</span>';
-  // Simulated deploy — in production this would POST config to the target
-  setTimeout(()=>{
-    msg.innerHTML='<span style="color:var(--seal)">Deployed to '+esc(env)+'</span>';
-  },1500);
+async function releaseAgent(){
+  const env=document.getElementById('rel-env').value;
+  const ver=parseInt(document.getElementById('rel-ver').value,10);
+  const note=document.getElementById('rel-note').value.trim();
+  const msg=document.getElementById('rel-msg');
+  if(!ver||ver<1){msg.innerHTML='<span style="color:var(--brick)">Pick a version.</span>';return;}
+  msg.innerHTML='<span style="color:var(--accent)"><span class="spin">&#x25D4;</span> Releasing…</span>';
+  let d;
+  try{
+    d=await (await fetch('/api/agents/'+sel+'/release',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({environment:env,version:ver,note:note})})).json();
+  }catch(e){ msg.innerHTML='<span style="color:var(--brick)">Request failed: '+esc(e.message)+'</span>'; return; }
+  if(d&&d.ok){
+    msg.innerHTML='<span style="color:var(--seal)">v'+d.active_version+' released to '+esc(env)+'.</span>'
+      +' <span style="color:var(--muted)">It goes live there on the next fetch'
+      +(d.previous_version?', replacing v'+d.previous_version:'')+'.</span>';
+  }else{
+    msg.innerHTML='<span style="color:var(--brick)">'+esc((d&&(d.error||d.detail))||'Release failed.')+'</span>';
+  }
+  setTimeout(renderDeploy,900);
 }
+
 
 /* ═══════════════ HISTORY ═══════════════ */
 async function renderHistory(){

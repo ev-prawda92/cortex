@@ -4,6 +4,7 @@ __pycache__/
 users.json
 settings.json
 agents.json
+automation.json
 *.egg-info/
 .env
 .env.local

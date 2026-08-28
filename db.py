@@ -269,6 +269,57 @@ class DataSource(Base):
     agent = relationship("Agent", back_populates="data_sources")
 
 
+class AgentRelease(Base):
+    """Which config version is live in one of the client's environments.
+
+    CORTEX does not host agents — they run wherever the customer runs them.
+    So a "deployment" here is not a push to a machine; it is a pointer. This
+    row says "production is on v4", and the customer's running agent asks
+    CORTEX what it should be using.
+
+    That direction matters. A push model needs every customer to build and
+    operate a config receiver before CORTEX does anything for them. A pull
+    model costs them one HTTP call, and it means this table records what an
+    environment is actually running rather than what we last tried to send it.
+    """
+    __tablename__ = "agent_releases"
+
+    id = Column(String(64), primary_key=True, default=gen_id)
+    agent_id = Column(String(64), ForeignKey("agents.id"), nullable=False, index=True)
+    owner_id = Column(String(64), ForeignKey("users.id"), nullable=True, index=True)
+
+    environment = Column(String(32), nullable=False)   # staging | production | <custom>
+    active_version = Column(Integer, nullable=False)   # -> agent_versions.version
+
+    released_by = Column(String(64), nullable=True)    # user_id
+    released_by_email = Column(String(255), default="")
+    note = Column(String(512), default="")
+
+    # Set whenever the environment actually fetches its config, so you can tell
+    # "released" from "picked up" — an environment that never polls is a real
+    # failure mode and should be visible rather than assumed away.
+    last_fetched_at = Column(DateTime(timezone=True), nullable=True)
+    fetch_count = Column(Integer, default=0)
+
+    created_at = Column(DateTime(timezone=True), default=utcnow)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+    __table_args__ = (
+        Index("ix_release_agent_env", "agent_id", "environment"),
+    )
+
+    def to_dict(self):
+        return {
+            "environment": self.environment,
+            "active_version": self.active_version,
+            "released_by_email": self.released_by_email or "",
+            "note": self.note or "",
+            "released_at": self.updated_at.isoformat() if self.updated_at else None,
+            "last_fetched_at": self.last_fetched_at.isoformat() if self.last_fetched_at else None,
+            "fetch_count": self.fetch_count or 0,
+        }
+
+
 class Setting(Base):
     """Key-value settings table — one row per setting."""
     __tablename__ = "settings"
