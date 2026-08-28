@@ -23,42 +23,191 @@ import os
 import re
 import copy
 import json
+import time
 import hashlib
 import secrets
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, HTTPException, Request, Response, Cookie
+from fastapi import FastAPI, HTTPException, Request, Response, Cookie, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel
 import uvicorn
 
-app = FastAPI(title="Cortex", version="0.2.0")
+import db as db_mod
+from db import (
+    get_db, init_db, gen_id, utcnow,
+    User, Agent as AgentModel, Run as RunModel,
+    DataSource as DataSourceModel, Setting, AuditLog, OAuthState, ApiKey,
+    Webhook, AgentTemplate, Notification,
+    Attestation, UserRole, ApprovalRequest,
+    get_or_create_setting, set_setting, log_audit,
+    SessionLocal,
+)
+import auth as auth_mod
+from auth import (
+    hash_password, verify_password, create_token, decode_token,
+    get_google_auth_url, get_github_auth_url,
+    exchange_google_code, exchange_github_code,
+    oauth_providers_available, BASE_URL,
+)
+
+app = FastAPI(title="Cortex", version="0.3.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# ── Auth / SSO ──────────────────────────────────────────────────────
-# In production, swap this for real OAuth2/SAML. For now, local user store + sessions.
-USERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "users.json")
-SESSIONS: dict[str, dict] = {}   # token -> {email, name, role, org}
 
-def _load_users() -> list[dict]:
-    if os.path.exists(USERS_FILE):
-        with open(USERS_FILE) as f:
-            return json.load(f)
-    return []
+# ── Startup: initialize database ────────────────────────────────────
+@app.on_event("startup")
+def on_startup():
+    global SETTINGS
+    init_db()
+    # Seed sample agents if the database is empty
+    _db = SessionLocal()
+    try:
+        if _db.query(AgentModel).count() == 0:
+            try:
+                _seed_sample_agents(_db)
+            except Exception:
+                _db.rollback()  # another worker may have seeded first
+        # Ensure default settings exist
+        get_or_create_setting(_db, "provider_keys", {})
+        get_or_create_setting(_db, "provider_models", dict(providers_mod.DEFAULT_MODELS))
+        get_or_create_setting(_db, "active_provider", {"active": "anthropic"})
+    finally:
+        _db.close()
+    # Load settings from DB into the in-memory cache
+    SETTINGS = _load_settings()
 
-def _save_users(users: list[dict]):
-    with open(USERS_FILE, "w") as f:
-        json.dump(users, f, indent=2)
+    # Configure and start the continuous agent daemon
+    daemon_mod.configure(
+        session_factory=SessionLocal,
+        agent_model=AgentModel,
+        run_saver=_save_run_to_db,
+        get_key_fn=get_key,
+        get_model_fn=get_model,
+        settings_getter=_load_settings,
+        providers_mod=providers_mod,
+        log_event_fn=log_event,
+        car_engine=_car_engine,
+    )
+    daemon_mod.start_daemon()
 
-def _hash_pw(pw: str) -> str:
-    return hashlib.sha256(pw.encode()).hexdigest()
+    # Wire the agent-to-agent message bus to the real executor
+    message_bus.set_trigger_fn(_bus_trigger_agent)
+
+    # Enable observability plugins by default and start the evaluator loop
+    for _p in ("cortex-logger", "cortex-alerts", "cortex-cost-guard"):
+        try:
+            plugin_manager.enable(_p)
+        except Exception:
+            pass
+    _start_obs_evaluator()
+
+
+def _bus_trigger_agent(to_agent: str, instruction: str, triggered_by: str = None,
+                       user_id: str = None) -> dict:
+    """Executor used by the agent-to-agent message bus to run a target agent."""
+    db = SessionLocal()
+    try:
+        a = db.query(AgentModel).filter(AgentModel.id == to_agent).first()
+        if not a:
+            return {"ok": False, "error": "agent not found"}
+        agent_dict = {"id": a.id, "name": a.name, "description": a.description or "",
+                      "config": copy.deepcopy(a.config or {})}
+    finally:
+        db.close()
+    # Inject the triggering instruction as this cycle's standing instruction
+    agent_dict["config"]["standing_instruction"] = instruction
+    try:
+        rec = daemon_mod._execute_cycle(to_agent, agent_dict)
+        if isinstance(rec, dict) and rec.get("outcome"):
+            rec.setdefault("run_id", gen_id())
+            rec["user_id"] = user_id
+            _save_run_to_db(to_agent, rec)
+        return {"ok": True, "outcome": rec.get("outcome", ""),
+                "detail": rec.get("detail", {})}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+_OBS_EVALUATOR_STARTED = False
+
+def _start_obs_evaluator():
+    """Background loop: evaluate alert rules, purge expired recycle-bin agents."""
+    global _OBS_EVALUATOR_STARTED
+    if _OBS_EVALUATOR_STARTED:
+        return
+    _OBS_EVALUATOR_STARTED = True
+
+    def _loop():
+        purge_counter = 0
+        while True:
+            try:
+                fired = obs.check_alerts()
+                for alert in fired:
+                    stream_manager.emit_alert(
+                        alert.get("rule_name", ""), alert.get("severity", "info"),
+                        alert.get("message", ""))
+                    obs.metrics.gauge("alerts.firing", obs.alerts.stats()["firing"])
+                # Purge expired recycle-bin agents once an hour (~ every 120 ticks)
+                purge_counter += 1
+                if purge_counter >= 120:
+                    purge_counter = 0
+                    _db = SessionLocal()
+                    try:
+                        n = purge_expired_agents(_db)
+                        if n:
+                            obs.log("info", f"Purged {n} expired agents from recycle bin",
+                                    source="recycle-bin")
+                    finally:
+                        _db.close()
+            except Exception:
+                pass
+            time.sleep(30)
+
+    t = threading.Thread(target=_loop, daemon=True, name="obs-evaluator")
+    t.start()
+
+
+# ── Auth helpers ────────────────────────────────────────────────────
 
 def _get_session(request: Request) -> dict | None:
+    """Extract user from JWT cookie, Authorization header, or API key."""
     token = request.cookies.get("cortex_session")
-    if token and token in SESSIONS:
-        return SESSIONS[token]
-    return None
+    if not token:
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer ") and not auth_header.startswith("Bearer ctx_"):
+            token = auth_header[7:]
+    if not token:
+        # Fallback: try API key authentication
+        api_sess = _authenticate_api_key(request)
+        if api_sess:
+            return api_sess
+        return None
+    payload = decode_token(token)
+    if not payload:
+        # Token invalid — still try API key as fallback
+        api_sess = _authenticate_api_key(request)
+        if api_sess:
+            return api_sess
+        return None
+    user_id = payload.get("sub", "")
+    # Verify user still exists in DB and look up admin status
+    is_admin = False
+    try:
+        db = SessionLocal()
+        user = db.query(User).filter(User.id == user_id).first()
+        if not user:
+            db.close()
+            return None  # User was deleted — treat as unauthenticated
+        is_admin = user.is_admin or False
+        db.close()
+    except Exception:
+        pass
+    return {"email": payload.get("email", ""), "name": payload.get("name", ""),
+            "role": payload.get("role", "FDE"), "org": payload.get("org", ""),
+            "user_id": user_id, "is_admin": is_admin}
+
 
 class SignupBody(BaseModel):
     name: str
@@ -73,32 +222,48 @@ class LoginBody(BaseModel):
 
 @app.post("/api/auth/signup")
 def signup(body: SignupBody):
-    users = _load_users()
-    if any(u["email"].lower() == body.email.lower() for u in users):
-        raise HTTPException(400, "Email already registered")
-    user = {"name": body.name, "email": body.email, "password": _hash_pw(body.password),
-            "role": body.role, "org": body.org, "created": datetime.now(timezone.utc).isoformat()}
-    users.append(user)
-    _save_users(users)
-    token = secrets.token_urlsafe(32)
-    SESSIONS[token] = {"email": user["email"], "name": user["name"], "role": user["role"], "org": user["org"]}
-    return {"ok": True, "token": token, "user": {"name": user["name"], "email": user["email"], "role": user["role"], "org": user["org"]}}
+    db = SessionLocal()
+    try:
+        existing = db.query(User).filter(User.email == body.email.lower()).first()
+        if existing:
+            raise HTTPException(400, "Email already registered")
+        # First user ever registered becomes admin automatically
+        is_first_user = db.query(User).count() == 0
+        user = User(
+            id=gen_id(), email=body.email.lower(),
+            password_hash=hash_password(body.password),
+            name=body.name, is_active=True, is_admin=is_first_user,
+            oauth_data={"role": body.role, "org": body.org},
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        token = create_token(user.id, user.email, user.name)
+        role = (user.oauth_data or {}).get("role", "FDE")
+        org = (user.oauth_data or {}).get("org", "")
+        return {"ok": True, "token": token, "user": {"name": user.name, "email": user.email, "role": role, "org": org, "is_admin": user.is_admin or False}}
+    finally:
+        db.close()
 
 @app.post("/api/auth/login")
 def login(body: LoginBody):
-    users = _load_users()
-    match = next((u for u in users if u["email"].lower() == body.email.lower()), None)
-    if not match or match["password"] != _hash_pw(body.password):
-        raise HTTPException(401, "Invalid email or password")
-    token = secrets.token_urlsafe(32)
-    SESSIONS[token] = {"email": match["email"], "name": match["name"], "role": match.get("role","FDE"), "org": match.get("org","")}
-    return {"ok": True, "token": token, "user": {"name": match["name"], "email": match["email"], "role": match.get("role","FDE"), "org": match.get("org","")}}
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.email == body.email.lower()).first()
+        if not user or not user.password_hash or not verify_password(body.password, user.password_hash):
+            raise HTTPException(401, "Invalid email or password")
+        user.last_login = utcnow()
+        db.commit()
+        token = create_token(user.id, user.email, user.name)
+        role = (user.oauth_data or {}).get("role", "FDE")
+        org = (user.oauth_data or {}).get("org", "")
+        return {"ok": True, "token": token, "user": {"name": user.name, "email": user.email, "role": role, "org": org, "is_admin": user.is_admin or False}}
+    finally:
+        db.close()
 
 @app.post("/api/auth/logout")
 def logout(request: Request):
-    token = request.cookies.get("cortex_session")
-    if token and token in SESSIONS:
-        del SESSIONS[token]
+    # JWT is stateless — client just clears the cookie
     return {"ok": True}
 
 @app.get("/api/auth/me")
@@ -106,26 +271,999 @@ def auth_me(request: Request):
     sess = _get_session(request)
     if not sess:
         raise HTTPException(401, "Not authenticated")
+    # Verify the user still exists in the database
+    if sess.get("user_id") and not sess.get("is_api_key"):
+        db = SessionLocal()
+        try:
+            user = db.query(User).filter(User.id == sess["user_id"]).first()
+            if not user:
+                raise HTTPException(401, "User no longer exists — please sign up again")
+        finally:
+            db.close()
     return {"user": sess}
+
+# ── OAuth Routes ────────────────────────────────────────────────────
+
+@app.get("/api/auth/providers")
+def auth_providers():
+    """Return which OAuth providers are configured."""
+    return oauth_providers_available()
+
+@app.get("/api/auth/login/google")
+def login_google():
+    if not oauth_providers_available().get("google"):
+        raise HTTPException(400, "Google OAuth not configured")
+    state = secrets.token_urlsafe(32)
+    db = SessionLocal()
+    try:
+        db.add(OAuthState(state=state, provider="google"))
+        db.commit()
+    finally:
+        db.close()
+    return RedirectResponse(get_google_auth_url(state))
+
+@app.get("/api/auth/callback/google")
+async def callback_google(code: str = "", state: str = ""):
+    db = SessionLocal()
+    try:
+        oauth_state = db.query(OAuthState).filter(OAuthState.state == state).first()
+        if not oauth_state:
+            raise HTTPException(400, "Invalid OAuth state")
+        db.delete(oauth_state)
+        db.commit()
+
+        info = await exchange_google_code(code)
+        user = db.query(User).filter(User.email == info["email"].lower()).first()
+        if not user:
+            user = User(id=gen_id(), email=info["email"].lower(), name=info["name"],
+                        avatar_url=info.get("avatar_url", ""),
+                        oauth_provider="google", oauth_id=info["oauth_id"],
+                        oauth_data={"role": "FDE", "org": ""})
+            db.add(user)
+        else:
+            user.oauth_provider = user.oauth_provider or "google"
+            user.oauth_id = user.oauth_id or info["oauth_id"]
+            user.avatar_url = user.avatar_url or info.get("avatar_url", "")
+        user.last_login = utcnow()
+        db.commit()
+        db.refresh(user)
+        token = create_token(user.id, user.email, user.name)
+        resp = RedirectResponse("/")
+        resp.set_cookie("cortex_session", token, httponly=True, samesite="lax", max_age=72*3600)
+        return resp
+    finally:
+        db.close()
+
+@app.get("/api/auth/login/github")
+def login_github():
+    if not oauth_providers_available().get("github"):
+        raise HTTPException(400, "GitHub OAuth not configured")
+    state = secrets.token_urlsafe(32)
+    db = SessionLocal()
+    try:
+        db.add(OAuthState(state=state, provider="github"))
+        db.commit()
+    finally:
+        db.close()
+    return RedirectResponse(get_github_auth_url(state))
+
+@app.get("/api/auth/callback/github")
+async def callback_github(code: str = "", state: str = ""):
+    db = SessionLocal()
+    try:
+        oauth_state = db.query(OAuthState).filter(OAuthState.state == state).first()
+        if not oauth_state:
+            raise HTTPException(400, "Invalid OAuth state")
+        db.delete(oauth_state)
+        db.commit()
+
+        info = await exchange_github_code(code)
+        user = db.query(User).filter(User.email == info["email"].lower()).first()
+        if not user:
+            user = User(id=gen_id(), email=info["email"].lower(), name=info["name"],
+                        avatar_url=info.get("avatar_url", ""),
+                        oauth_provider="github", oauth_id=info["oauth_id"],
+                        oauth_data={"role": "FDE", "org": ""})
+            db.add(user)
+        else:
+            user.oauth_provider = user.oauth_provider or "github"
+            user.oauth_id = user.oauth_id or info["oauth_id"]
+            user.avatar_url = user.avatar_url or info.get("avatar_url", "")
+        user.last_login = utcnow()
+        db.commit()
+        db.refresh(user)
+        token = create_token(user.id, user.email, user.name)
+        resp = RedirectResponse("/")
+        resp.set_cookie("cortex_session", token, httponly=True, samesite="lax", max_age=72*3600)
+        return resp
+    finally:
+        db.close()
 
 API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5")
 
+
+# ── Admin API ──────────────────────────────────────────────────────
+
+def _require_admin(request: Request) -> dict:
+    """Verify the request is from an admin user."""
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "Not authenticated")
+    if not sess.get("is_admin"):
+        raise HTTPException(403, "Admin access required")
+    return sess
+
+
+@app.get("/api/admin/users")
+def admin_list_users(request: Request):
+    _require_admin(request)
+    db = SessionLocal()
+    try:
+        users = db.query(User).order_by(User.created_at.desc()).all()
+        return {"users": [
+            {"id": u.id, "email": u.email, "name": u.name or "",
+             "is_admin": u.is_admin or False, "is_active": u.is_active if u.is_active is not None else True,
+             "created_at": u.created_at.isoformat() if u.created_at else None,
+             "last_login": u.last_login.isoformat() if u.last_login else None,
+             "oauth_provider": u.oauth_provider or "",
+             "role": (u.oauth_data or {}).get("role", "FDE"),
+             "org": (u.oauth_data or {}).get("org", "")}
+            for u in users
+        ]}
+    finally:
+        db.close()
+
+
+class AdminToggleBody(BaseModel):
+    is_admin: bool | None = None
+    is_active: bool | None = None
+
+
+@app.post("/api/admin/users/{user_id}")
+def admin_update_user(user_id: str, body: AdminToggleBody, request: Request):
+    admin = _require_admin(request)
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.id == user_id).first()
+        if not user:
+            raise HTTPException(404, "User not found")
+        # Prevent admin from removing their own admin status
+        if body.is_admin is not None:
+            if user_id == admin["user_id"] and not body.is_admin:
+                raise HTTPException(400, "Cannot remove your own admin status. Transfer admin to another user first.")
+            user.is_admin = body.is_admin
+        if body.is_active is not None:
+            if user_id == admin["user_id"] and not body.is_active:
+                raise HTTPException(400, "Cannot deactivate yourself")
+            user.is_active = body.is_active
+        db.commit()
+        log_audit(db, admin["user_id"], "admin_update_user",
+                  {"target_user": user_id, "changes": body.dict(exclude_none=True)})
+        return {"ok": True, "user_id": user_id}
+    finally:
+        db.close()
+
+
+@app.delete("/api/admin/users/{user_id}")
+def admin_delete_user(user_id: str, request: Request):
+    admin = _require_admin(request)
+    if user_id == admin["user_id"]:
+        raise HTTPException(400, "Cannot delete yourself")
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.id == user_id).first()
+        if not user:
+            raise HTTPException(404, "User not found")
+        if user.is_admin:
+            raise HTTPException(400, "Cannot delete an admin user. Remove admin status first.")
+        db.delete(user)
+        db.commit()
+        log_audit(db, admin["user_id"], "admin_delete_user", {"target_user": user_id, "email": user.email})
+        return {"ok": True}
+    finally:
+        db.close()
+
+
+@app.get("/api/admin/stats")
+def admin_stats(request: Request):
+    _require_admin(request)
+    db = SessionLocal()
+    try:
+        from sqlalchemy import func
+        total_users = db.query(User).count()
+        active_users = db.query(User).filter(User.is_active == True).count()
+        admin_users = db.query(User).filter(User.is_admin == True).count()
+        total_agents = db.query(AgentModel).count()
+        total_runs = db.query(RunModel).count()
+        token_totals = db.query(
+            func.coalesce(func.sum(RunModel.input_tokens), 0),
+            func.coalesce(func.sum(RunModel.output_tokens), 0),
+            func.coalesce(func.sum(RunModel.total_tokens), 0),
+        ).first()
+        return {"total_users": total_users, "active_users": active_users,
+                "admin_users": admin_users, "total_agents": total_agents,
+                "total_runs": total_runs,
+                "total_input_tokens": token_totals[0],
+                "total_output_tokens": token_totals[1],
+                "total_tokens": token_totals[2]}
+    finally:
+        db.close()
+
+
+# ── API Key Management ─────────────────────────────────────────────
+
+class CreateApiKeyBody(BaseModel):
+    name: str
+    scopes: list = ["agents:read", "agents:run"]
+
+
+@app.post("/api/keys")
+def create_api_key(body: CreateApiKeyBody, request: Request):
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "Not authenticated")
+    # Generate a random API key
+    raw_key = f"ctx_{secrets.token_hex(24)}"
+    prefix = raw_key[:12]
+    key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
+    db = SessionLocal()
+    try:
+        api_key = ApiKey(
+            id=gen_id(), user_id=sess["user_id"],
+            name=body.name, key_hash=key_hash, prefix=prefix,
+            scopes=body.scopes, is_active=True,
+        )
+        db.add(api_key)
+        db.commit()
+        log_audit(db, sess["user_id"], "api_key.created", {"name": body.name, "prefix": prefix})
+        # Return the full key ONCE — it can't be retrieved again
+        return {"ok": True, "key": raw_key, "prefix": prefix, "name": body.name, "id": api_key.id}
+    finally:
+        db.close()
+
+
+@app.get("/api/keys")
+def list_api_keys(request: Request):
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "Not authenticated")
+    db = SessionLocal()
+    try:
+        keys = db.query(ApiKey).filter(ApiKey.user_id == sess["user_id"]).order_by(ApiKey.created_at.desc()).all()
+        return {"keys": [
+            {"id": k.id, "name": k.name, "prefix": k.prefix,
+             "scopes": k.scopes or [], "is_active": k.is_active or False,
+             "created_at": k.created_at.isoformat() if k.created_at else None,
+             "last_used_at": k.last_used_at.isoformat() if k.last_used_at else None}
+            for k in keys
+        ]}
+    finally:
+        db.close()
+
+
+@app.delete("/api/keys/{key_id}")
+def revoke_api_key(key_id: str, request: Request):
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "Not authenticated")
+    db = SessionLocal()
+    try:
+        key = db.query(ApiKey).filter(ApiKey.id == key_id, ApiKey.user_id == sess["user_id"]).first()
+        if not key:
+            raise HTTPException(404, "API key not found")
+        db.delete(key)
+        db.commit()
+        return {"ok": True}
+    finally:
+        db.close()
+
+
+def _authenticate_api_key(request: Request) -> dict | None:
+    """Check for API key in Authorization header (Bearer ctx_...)."""
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer ctx_"):
+        return None
+    raw_key = auth[7:]
+    key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
+    db = SessionLocal()
+    try:
+        api_key = db.query(ApiKey).filter(ApiKey.key_hash == key_hash, ApiKey.is_active == True).first()
+        if not api_key:
+            return None
+        api_key.last_used_at = utcnow()
+        user = db.query(User).filter(User.id == api_key.user_id).first()
+        db.commit()
+        return {"user_id": api_key.user_id, "email": user.email if user else "",
+                "name": user.name if user else "", "scopes": api_key.scopes or [],
+                "is_api_key": True, "is_admin": False}
+    finally:
+        db.close()
+
+
+def _check_scope(sess: dict, required_scope: str) -> bool:
+    """Check if session has a required scope. JWT users have all scopes; API keys check explicitly."""
+    if not sess:
+        return False
+    if not sess.get("is_api_key"):
+        return True  # JWT-authenticated users have full access
+    return required_scope in (sess.get("scopes") or [])
+
+
+# ─────────────────────────────────────────────── webhooks
+import hmac
+import threading
+import urllib.request
+
+def _fire_webhooks(agent_id: str, event: str, payload: dict):
+    """Fire matching webhook subscriptions in a background thread."""
+    def _send():
+        db = SessionLocal()
+        try:
+            hooks = db.query(Webhook).filter(
+                Webhook.is_active == True,
+                Webhook.failure_count < 5,
+            ).all()
+            for hook in hooks:
+                if hook.agent_id and hook.agent_id != agent_id:
+                    continue
+                if hook.events and event not in hook.events:
+                    continue
+                body = json.dumps({"event": event, "agent_id": agent_id, "data": payload, "timestamp": utcnow().isoformat()}).encode()
+                headers = {"Content-Type": "application/json"}
+                if hook.secret:
+                    sig = hmac.new(hook.secret.encode(), body, hashlib.sha256).hexdigest()
+                    headers["X-Cortex-Signature"] = f"sha256={sig}"
+                try:
+                    req = urllib.request.Request(hook.url, data=body, headers=headers, method="POST")
+                    urllib.request.urlopen(req, timeout=10)
+                    hook.failure_count = 0
+                    hook.last_triggered_at = utcnow()
+                except Exception:
+                    hook.failure_count = (hook.failure_count or 0) + 1
+                    if hook.failure_count >= 5:
+                        hook.is_active = False
+            db.commit()
+        except Exception:
+            pass
+        finally:
+            db.close()
+    threading.Thread(target=_send, daemon=True).start()
+
+
+def _create_notification(user_id: str, agent_id: str, event: str, title: str, body: str = ""):
+    """Create an in-app notification for a user."""
+    db = SessionLocal()
+    try:
+        notif = Notification(id=gen_id(), user_id=user_id, agent_id=agent_id,
+                             event=event, title=title, body=body)
+        db.add(notif)
+        db.commit()
+    except Exception:
+        pass
+    finally:
+        db.close()
+
+
+def _create_attestation(agent_id: str, run_id: str = None, sess: dict = None,
+                        action: str = "", action_input: str = "", action_result: str = "",
+                        action_summary: str = "", provider: str = "", model: str = "",
+                        data_sources: list = None, input_tokens: int = 0, output_tokens: int = 0,
+                        human_approval_required: bool = False, human_approval_granted: bool = False,
+                        human_approver_id: str = None):
+    """Create an immutable, hash-chained attestation record."""
+    db = SessionLocal()
+    try:
+        # Look up agent info
+        agent = db.query(AgentModel).filter(AgentModel.id == agent_id).first()
+        agent_name = agent.name if agent else ""
+        agent_version = agent.version if agent else 1
+
+        # Get previous hash for chain integrity
+        prev = db.query(Attestation).filter(
+            Attestation.agent_id == agent_id
+        ).order_by(Attestation.created_at.desc()).first()
+        prev_hash = prev.record_hash if prev else "0" * 64
+
+        # Build the record
+        record = Attestation(
+            id=gen_id(), run_id=run_id, agent_id=agent_id,
+            agent_name=agent_name, agent_version=agent_version,
+            authorized_by=sess.get("user_id", "") if sess else "",
+            authorizer_email=sess.get("email", "") if sess else "",
+            auth_method="api_key" if (sess and sess.get("is_api_key")) else "session",
+            provider=provider, model=model,
+            action=action, action_input=(action_input or "")[:500],
+            action_result=action_result, action_summary=(action_summary or "")[:500],
+            data_sources_accessed=data_sources or [],
+            human_approval_required=human_approval_required,
+            human_approval_granted=human_approval_granted,
+            human_approver_id=human_approver_id,
+            input_tokens=input_tokens, output_tokens=output_tokens,
+            total_tokens=input_tokens + output_tokens,
+            prev_hash=prev_hash,
+        )
+        # Compute record hash for tamper evidence
+        hash_input = f"{record.id}|{record.agent_id}|{record.authorized_by}|{record.action}|{record.action_result}|{record.provider}|{record.model}|{prev_hash}"
+        record.record_hash = hashlib.sha256(hash_input.encode()).hexdigest()
+        db.add(record)
+        db.commit()
+        return record.id
+    except Exception:
+        return None
+    finally:
+        db.close()
+
+
+# ─────────────────────────────────────────────── attestation API
+
+@app.get("/api/attestations")
+def list_attestations(request: Request, agent_id: str = "", limit: int = 50):
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "Not authenticated")
+    db = SessionLocal()
+    try:
+        q = db.query(Attestation)
+        if agent_id:
+            q = q.filter(Attestation.agent_id == agent_id)
+        records = q.order_by(Attestation.created_at.desc()).limit(limit).all()
+        return {"attestations": [
+            {"id": r.id, "run_id": r.run_id, "agent_id": r.agent_id,
+             "agent_name": r.agent_name, "agent_version": r.agent_version,
+             "authorized_by": r.authorizer_email, "auth_method": r.auth_method,
+             "provider": r.provider, "model": r.model,
+             "action": r.action, "action_input": r.action_input,
+             "action_result": r.action_result, "action_summary": r.action_summary,
+             "data_sources_accessed": r.data_sources_accessed or [],
+             "human_approval_required": r.human_approval_required or False,
+             "human_approval_granted": r.human_approval_granted or False,
+             "input_tokens": r.input_tokens, "output_tokens": r.output_tokens,
+             "total_tokens": r.total_tokens,
+             "record_hash": r.record_hash, "prev_hash": r.prev_hash,
+             "created_at": r.created_at.isoformat() if r.created_at else None}
+            for r in records
+        ]}
+    finally:
+        db.close()
+
+@app.get("/api/attestations/{attestation_id}")
+def get_attestation(attestation_id: str, request: Request):
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "Not authenticated")
+    db = SessionLocal()
+    try:
+        r = db.query(Attestation).filter(Attestation.id == attestation_id).first()
+        if not r:
+            raise HTTPException(404, "Attestation not found")
+        return {"id": r.id, "run_id": r.run_id, "agent_id": r.agent_id,
+                "agent_name": r.agent_name, "agent_version": r.agent_version,
+                "authorized_by": r.authorizer_email, "auth_method": r.auth_method,
+                "provider": r.provider, "model": r.model,
+                "action": r.action, "action_input": r.action_input,
+                "action_result": r.action_result, "action_summary": r.action_summary,
+                "data_sources_accessed": r.data_sources_accessed or [],
+                "policy_checked": r.policy_checked or False, "policy_passed": r.policy_passed,
+                "policy_details": r.policy_details or {},
+                "human_approval_required": r.human_approval_required or False,
+                "human_approval_granted": r.human_approval_granted or False,
+                "human_approver_id": r.human_approver_id or "",
+                "input_tokens": r.input_tokens, "output_tokens": r.output_tokens,
+                "total_tokens": r.total_tokens,
+                "record_hash": r.record_hash, "prev_hash": r.prev_hash,
+                "created_at": r.created_at.isoformat() if r.created_at else None}
+    finally:
+        db.close()
+
+@app.get("/api/attestations/verify/{agent_id}")
+def verify_attestation_chain(agent_id: str, request: Request):
+    """Verify the hash chain integrity for an agent's attestation records."""
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "Not authenticated")
+    db = SessionLocal()
+    try:
+        records = db.query(Attestation).filter(
+            Attestation.agent_id == agent_id
+        ).order_by(Attestation.created_at.asc()).all()
+        if not records:
+            return {"ok": True, "total": 0, "message": "No attestation records"}
+        broken = []
+        for i, r in enumerate(records):
+            expected_prev = records[i-1].record_hash if i > 0 else "0" * 64
+            if r.prev_hash != expected_prev:
+                broken.append({"id": r.id, "index": i, "expected_prev": expected_prev, "actual_prev": r.prev_hash})
+        return {"ok": len(broken) == 0, "total": len(records), "broken_links": broken,
+                "message": "Chain intact" if not broken else f"{len(broken)} broken link(s) detected"}
+    finally:
+        db.close()
+
+# ─────────────────────────────────────────────── RBAC
+
+@app.get("/api/roles")
+def list_user_roles(request: Request):
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "Not authenticated")
+    if not sess.get("is_admin"):
+        raise HTTPException(403, "Admin access required")
+    db = SessionLocal()
+    try:
+        roles = db.query(UserRole).all()
+        users = {u.id: u for u in db.query(User).all()}
+        return {"roles": [
+            {"id": r.id, "user_id": r.user_id,
+             "user_email": users[r.user_id].email if r.user_id in users else "",
+             "user_name": users[r.user_id].name if r.user_id in users else "",
+             "role": r.role, "scope": r.scope,
+             "created_at": r.created_at.isoformat() if r.created_at else None}
+            for r in roles
+        ]}
+    finally:
+        db.close()
+
+class SetRoleBody(BaseModel):
+    user_id: str
+    role: str = "operator"  # viewer | operator | admin
+    scope: str = "global"
+
+@app.post("/api/roles")
+def set_user_role(body: SetRoleBody, request: Request):
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "Not authenticated")
+    if not sess.get("is_admin"):
+        raise HTTPException(403, "Admin access required")
+    if body.role not in ("viewer", "operator", "admin"):
+        raise HTTPException(400, "Invalid role. Must be: viewer, operator, admin")
+    db = SessionLocal()
+    try:
+        existing = db.query(UserRole).filter(
+            UserRole.user_id == body.user_id, UserRole.scope == body.scope
+        ).first()
+        if existing:
+            existing.role = body.role
+        else:
+            db.add(UserRole(id=gen_id(), user_id=body.user_id, role=body.role,
+                            scope=body.scope, granted_by=sess["user_id"]))
+        db.commit()
+        return {"ok": True}
+    finally:
+        db.close()
+
+def _get_user_role(user_id: str, agent_id: str = None) -> str:
+    """Get effective role for a user. Agent-scoped role overrides global."""
+    db = SessionLocal()
+    try:
+        # Check admin flag first
+        user = db.query(User).filter(User.id == user_id).first()
+        if user and user.is_admin:
+            return "admin"
+        # Check agent-specific role
+        if agent_id:
+            agent_role = db.query(UserRole).filter(
+                UserRole.user_id == user_id, UserRole.scope == f"agent:{agent_id}"
+            ).first()
+            if agent_role:
+                return agent_role.role
+        # Check global role
+        global_role = db.query(UserRole).filter(
+            UserRole.user_id == user_id, UserRole.scope == "global"
+        ).first()
+        return global_role.role if global_role else "operator"  # default to operator
+    finally:
+        db.close()
+
+# ─────────────────────────────────────────────── approval workflows
+
+@app.get("/api/approvals")
+def list_approvals(request: Request, status: str = "pending"):
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "Not authenticated")
+    db = SessionLocal()
+    try:
+        q = db.query(ApprovalRequest).filter(ApprovalRequest.status == status)
+        approvals = q.order_by(ApprovalRequest.created_at.desc()).limit(50).all()
+        return {"approvals": [
+            {"id": a.id, "agent_id": a.agent_id, "run_id": a.run_id,
+             "action": a.action, "context": a.context or {},
+             "status": a.status, "requested_by": a.requested_by,
+             "decided_by": a.decided_by, "decision_note": a.decision_note,
+             "created_at": a.created_at.isoformat() if a.created_at else None,
+             "expires_at": a.expires_at.isoformat() if a.expires_at else None}
+            for a in approvals
+        ]}
+    finally:
+        db.close()
+
+class ApprovalDecisionBody(BaseModel):
+    decision: str  # approved | rejected
+    note: str = ""
+
+@app.post("/api/approvals/{approval_id}")
+def decide_approval(approval_id: str, body: ApprovalDecisionBody, request: Request):
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "Not authenticated")
+    if body.decision not in ("approved", "rejected"):
+        raise HTTPException(400, "Decision must be 'approved' or 'rejected'")
+    # Check role — viewers can't approve
+    role = _get_user_role(sess["user_id"])
+    if role == "viewer":
+        raise HTTPException(403, "Viewers cannot approve actions")
+    db = SessionLocal()
+    try:
+        approval = db.query(ApprovalRequest).filter(ApprovalRequest.id == approval_id).first()
+        if not approval:
+            raise HTTPException(404, "Approval request not found")
+        if approval.status != "pending":
+            raise HTTPException(400, f"Already {approval.status}")
+        approval.status = body.decision
+        approval.decided_by = sess["user_id"]
+        approval.decided_at = utcnow()
+        approval.decision_note = body.note
+        db.commit()
+        # Notify the requester
+        if approval.requested_by:
+            _create_notification(approval.requested_by, approval.agent_id,
+                                 f"approval.{body.decision}",
+                                 f"Action {'approved' if body.decision == 'approved' else 'rejected'}: {approval.action}",
+                                 body.note or "")
+        return {"ok": True, "status": body.decision}
+    finally:
+        db.close()
+
+
+class WebhookBody(BaseModel):
+    url: str
+    events: list = ["run.completed", "run.error"]
+    agent_id: str = ""
+    secret: str = ""
+
+@app.post("/api/webhooks")
+def create_webhook(body: WebhookBody, request: Request):
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "Not authenticated")
+    db = SessionLocal()
+    try:
+        hook = Webhook(id=gen_id(), user_id=sess["user_id"], url=body.url,
+                       events=body.events, agent_id=body.agent_id or None,
+                       secret=body.secret or secrets.token_hex(16))
+        db.add(hook)
+        db.commit()
+        return {"ok": True, "id": hook.id, "secret": hook.secret}
+    finally:
+        db.close()
+
+@app.get("/api/webhooks")
+def list_webhooks(request: Request):
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "Not authenticated")
+    db = SessionLocal()
+    try:
+        hooks = db.query(Webhook).filter(Webhook.user_id == sess["user_id"]).order_by(Webhook.created_at.desc()).all()
+        return {"webhooks": [
+            {"id": h.id, "url": h.url, "events": h.events or [], "agent_id": h.agent_id or "",
+             "is_active": h.is_active or False, "failure_count": h.failure_count or 0,
+             "last_triggered_at": h.last_triggered_at.isoformat() if h.last_triggered_at else None,
+             "created_at": h.created_at.isoformat() if h.created_at else None}
+            for h in hooks
+        ]}
+    finally:
+        db.close()
+
+@app.delete("/api/webhooks/{hook_id}")
+def delete_webhook(hook_id: str, request: Request):
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "Not authenticated")
+    db = SessionLocal()
+    try:
+        hook = db.query(Webhook).filter(Webhook.id == hook_id, Webhook.user_id == sess["user_id"]).first()
+        if not hook:
+            raise HTTPException(404, "Webhook not found")
+        db.delete(hook)
+        db.commit()
+        return {"ok": True}
+    finally:
+        db.close()
+
+@app.post("/api/webhooks/{hook_id}/test")
+def test_webhook(hook_id: str, request: Request):
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "Not authenticated")
+    db = SessionLocal()
+    try:
+        hook = db.query(Webhook).filter(Webhook.id == hook_id, Webhook.user_id == sess["user_id"]).first()
+        if not hook:
+            raise HTTPException(404, "Webhook not found")
+        body = json.dumps({"event": "webhook.test", "agent_id": "test", "data": {"message": "Test from Cortex"}, "timestamp": utcnow().isoformat()}).encode()
+        headers = {"Content-Type": "application/json"}
+        if hook.secret:
+            sig = hmac.new(hook.secret.encode(), body, hashlib.sha256).hexdigest()
+            headers["X-Cortex-Signature"] = f"sha256={sig}"
+        try:
+            req = urllib.request.Request(hook.url, data=body, headers=headers, method="POST")
+            urllib.request.urlopen(req, timeout=10)
+            return {"ok": True}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+    finally:
+        db.close()
+
+# ─────────────────────────────────────────────── agent templates
+
+class TemplateBody(BaseModel):
+    name: str
+    description: str = ""
+    category: str = "custom"
+    icon: str = ""
+
+@app.post("/api/templates")
+def create_template(body: TemplateBody, request: Request):
+    """Create a new empty template or save from an existing agent (use /api/templates/from-agent)."""
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "Not authenticated")
+    db = SessionLocal()
+    try:
+        tmpl = AgentTemplate(id=gen_id(), created_by=sess["user_id"], name=body.name,
+                             description=body.description, category=body.category,
+                             icon=body.icon, config={})
+        db.add(tmpl)
+        db.commit()
+        return {"ok": True, "id": tmpl.id}
+    finally:
+        db.close()
+
+class TemplateFromAgentBody(BaseModel):
+    agent_id: str
+    name: str
+    description: str = ""
+    category: str = "custom"
+    icon: str = ""
+
+@app.post("/api/templates/from-agent")
+def create_template_from_agent(body: TemplateFromAgentBody, request: Request):
+    """Snapshot an agent's current config as a reusable template."""
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "Not authenticated")
+    db = SessionLocal()
+    try:
+        agent = db.query(AgentModel).filter(AgentModel.id == body.agent_id).first()
+        if not agent:
+            raise HTTPException(404, "Agent not found")
+        config_snapshot = {
+            "config": agent.config or {},
+            "endpoint": agent.endpoint or {},
+            "description": agent.description or "",
+            "agent_type": agent.agent_type or "custom",
+        }
+        tmpl = AgentTemplate(id=gen_id(), created_by=sess["user_id"], name=body.name,
+                             description=body.description or agent.description,
+                             category=body.category, icon=body.icon,
+                             config=config_snapshot)
+        db.add(tmpl)
+        db.commit()
+        return {"ok": True, "id": tmpl.id}
+    finally:
+        db.close()
+
+@app.get("/api/templates")
+def list_templates(request: Request):
+    db = SessionLocal()
+    try:
+        tmpls = db.query(AgentTemplate).order_by(AgentTemplate.use_count.desc()).all()
+        return {"templates": [
+            {"id": t.id, "name": t.name, "description": t.description,
+             "category": t.category, "icon": t.icon or "🤖",
+             "is_public": t.is_public or False, "use_count": t.use_count or 0,
+             "created_at": t.created_at.isoformat() if t.created_at else None}
+            for t in tmpls
+        ]}
+    finally:
+        db.close()
+
+@app.post("/api/templates/{template_id}/clone")
+def clone_from_template(template_id: str, request: Request):
+    """Create a new agent from a template."""
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "Not authenticated")
+    db = SessionLocal()
+    try:
+        tmpl = db.query(AgentTemplate).filter(AgentTemplate.id == template_id).first()
+        if not tmpl:
+            raise HTTPException(404, "Template not found")
+        cfg = tmpl.config or {}
+        slug = f"{tmpl.name.lower().replace(' ','-')}-{gen_id()[:6]}"
+        agent = AgentModel(
+            id=gen_id(), owner_id=sess["user_id"], slug=slug,
+            name=f"{tmpl.name} (copy)", description=cfg.get("description", tmpl.description),
+            agent_type=cfg.get("agent_type", "custom"),
+            config=cfg.get("config", {}), endpoint=cfg.get("endpoint", {}),
+            status="stopped", live=False, version=1,
+        )
+        db.add(agent)
+        tmpl.use_count = (tmpl.use_count or 0) + 1
+        db.commit()
+        return {"ok": True, "agent_id": agent.id, "slug": agent.slug}
+    finally:
+        db.close()
+
+@app.delete("/api/templates/{template_id}")
+def delete_template(template_id: str, request: Request):
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "Not authenticated")
+    db = SessionLocal()
+    try:
+        tmpl = db.query(AgentTemplate).filter(AgentTemplate.id == template_id).first()
+        if not tmpl:
+            raise HTTPException(404, "Template not found")
+        if tmpl.created_by != sess["user_id"] and not sess.get("is_admin"):
+            raise HTTPException(403, "Not authorized")
+        db.delete(tmpl)
+        db.commit()
+        return {"ok": True}
+    finally:
+        db.close()
+
+# ─────────────────────────────────────────────── notifications
+
+@app.get("/api/notifications")
+def list_notifications(request: Request):
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "Not authenticated")
+    db = SessionLocal()
+    try:
+        notifs = db.query(Notification).filter(
+            Notification.user_id == sess["user_id"]
+        ).order_by(Notification.created_at.desc()).limit(50).all()
+        unread = sum(1 for n in notifs if not n.is_read)
+        return {"notifications": [
+            {"id": n.id, "event": n.event, "title": n.title, "body": n.body,
+             "agent_id": n.agent_id or "", "is_read": n.is_read or False,
+             "created_at": n.created_at.isoformat() if n.created_at else None}
+            for n in notifs
+        ], "unread": unread}
+    finally:
+        db.close()
+
+@app.post("/api/notifications/read")
+def mark_notifications_read(request: Request):
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "Not authenticated")
+    db = SessionLocal()
+    try:
+        db.query(Notification).filter(
+            Notification.user_id == sess["user_id"], Notification.is_read == False
+        ).update({"is_read": True})
+        db.commit()
+        return {"ok": True}
+    finally:
+        db.close()
+
+@app.delete("/api/notifications/{notif_id}")
+def dismiss_notification(notif_id: str, request: Request):
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "Not authenticated")
+    db = SessionLocal()
+    try:
+        notif = db.query(Notification).filter(
+            Notification.id == notif_id, Notification.user_id == sess["user_id"]
+        ).first()
+        if notif:
+            db.delete(notif)
+            db.commit()
+        return {"ok": True}
+    finally:
+        db.close()
+
+
+# ─────────────────────────────────────────────── AI assistant chat
+
+class ChatBody(BaseModel):
+    message: str
+    history: list = []
+
+@app.post("/api/assistant/chat")
+def assistant_chat(body: ChatBody, request: Request):
+    """Embedded AI assistant — answers questions about the user's agents using live data as context."""
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "Not authenticated")
+    db = SessionLocal()
+    try:
+        # Gather context about the user's agents
+        agents = db.query(AgentModel).all()
+        recent_runs = db.query(RunModel).order_by(RunModel.started_at.desc()).limit(20).all()
+        agent_summary = []
+        for a in agents:
+            runs = [r for r in recent_runs if r.agent_id == a.id]
+            errors = sum(1 for r in runs if r.outcome == "ERROR")
+            completed = sum(1 for r in runs if r.outcome == "COMPLETED")
+            agent_summary.append(
+                f"- {a.name} (id:{a.id}, status:{a.status}, live:{a.live}, type:{a.agent_type}, "
+                f"success_rate:{a.containment}%, recent_runs:{len(runs)}, errors:{errors}, completed:{completed})"
+            )
+        context = f"""You are Cortex Assistant, an AI helper embedded in the Cortex agent operations platform.
+You help users understand and manage their agents. Answer concisely and specifically.
+
+Current agent fleet ({len(agents)} agents):
+{chr(10).join(agent_summary) if agent_summary else 'No agents registered.'}
+
+Recent run activity ({len(recent_runs)} recent runs):
+{chr(10).join(f'- Agent {r.agent_id}: {r.outcome}, {r.total_tokens} tokens, {r.started_at}' for r in recent_runs[:10])}
+"""
+    finally:
+        db.close()
+
+    # Use the active provider to generate a response
+    try:
+        settings = _load_settings()
+        active = settings.get("active", "anthropic")
+        api_key = settings.get("keys", {}).get(active, "") or os.environ.get(_ENV_KEYS.get(active, ""), "")
+        if not api_key:
+            return {"reply": "No LLM provider configured. Go to Settings to add an API key, then I can help you here."}
+
+        models_cfg = settings.get("models", {})
+        model = models_cfg.get(active, "")
+
+        # Build messages
+        messages = [{"role": "user", "content": body.message}]
+
+        result = providers_mod.run_tool_loop(
+            provider=active, api_key=api_key, model=model,
+            system=context, user_message=body.message,
+            tools=[], max_steps=1
+        )
+        return {"reply": result.get("final_text", "I couldn't generate a response.")}
+    except Exception as e:
+        return {"reply": f"Assistant error: {str(e)[:200]}"}
+
+
 # ─────────────────────────────────────────────── provider settings (Settings tab)
 import providers as providers_mod
 import automation as automation_mod
+from car import CAR as CAREngine
+import daemon as daemon_mod
 
-SETTINGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
+# ── Enterprise modules (observability, usage, teams, integrations, comms, plugins, streaming) ──
+from observability import obs
+from usage import usage_tracker
+from teams import team_manager, ROLES as TEAM_ROLES, role_can
+from integrations import integration_manager
+from agent_comm import message_bus
+from ws_streaming import stream_manager
+from plugins import plugin_manager
+import phase2
+from phase2 import discovery as p2_discovery, recorder as p2_recorder, patterns as p2_patterns
+import db as _db_recovery  # recovery helpers live on the db module
+from db import (
+    AgentVersion, snapshot_agent_version, list_agent_versions, verify_version_chain,
+    soft_delete_agent, restore_agent, restore_agent_version, list_recycle_bin,
+    purge_expired_agents, RECYCLE_BIN_RETENTION_DAYS,
+)
 
-# ─────────────────────────────────────────────── agent runs (Runs tab)
-RUNS = {}  # agent_id -> list of execution records with trace, output, metrics
+# ─────────────────────────────────────────────── CAR engine (singleton)
+_car_engine = CAREngine()
 
-# ─────────────────────────────────────────────── event log & diagnosis
+# ─────────────────────────────────────────────── event log (in-memory rolling buffer)
 EVENT_LOG = []  # list of {timestamp, agent_id, event_type, data}
-MAX_EVENTS = 500  # rolling buffer size
+MAX_EVENTS = 500
 
 def log_event(agent_id: str, event_type: str, data: dict = None):
-    """Log an event to the event log (newest first)."""
+    """Log an event to the in-memory event log AND the database audit trail."""
     global EVENT_LOG
     EVENT_LOG.insert(0, {
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -135,83 +1273,79 @@ def log_event(agent_id: str, event_type: str, data: dict = None):
     })
     if len(EVENT_LOG) > MAX_EVENTS:
         EVENT_LOG = EVENT_LOG[:MAX_EVENTS]
-
-def diagnose_agent(agent_id: str):
-    """Analyze agent runs to classify as build vs training problem."""
-    if agent_id not in RUNS or not RUNS[agent_id]:
-        return {
-            "type": "unknown",
-            "confidence": 0,
-            "checklist": [],
-            "evidence": "No runs yet"
-        }
-
-    runs = RUNS[agent_id][:10]  # last 10 runs
-    escalations = sum(1 for r in runs if r.get("escalated"))
-    errors = sum(1 for r in runs if not r.get("ok"))
-    avg_confidence = sum(r.get("confidence_threshold", 0.75) for r in runs) / len(runs) if runs else 0
-
-    escalation_rate = escalations / len(runs) if runs else 0
-    error_rate = errors / len(runs) if runs else 0
-
-    if error_rate > 0.3:
-        # BUILD PROBLEM
-        return {
-            "type": "build",
-            "confidence": min(0.95, 0.6 + error_rate),
-            "evidence": f"{error_rate*100:.0f}% error rate across runs",
-            "checklist": [
-                "Check agent timeout and retry settings",
-                "Verify API connections and rate limits",
-                "Review error logs for infrastructure issues",
-                "Test with minimal config to isolate problem",
-                "Check model availability and fallbacks"
-            ]
-        }
-    elif escalation_rate > 0.4:
-        # TRAINING PROBLEM
-        return {
-            "type": "training",
-            "confidence": min(0.95, 0.5 + escalation_rate),
-            "evidence": f"{escalation_rate*100:.0f}% escalation rate, avg confidence {avg_confidence:.2f}",
-            "checklist": [
-                "Review escalated cases for decision patterns",
-                "Adjust confidence threshold if too conservative",
-                "Enhance agent prompt with better context/examples",
-                "Fine-tune model selection or parameters",
-                "Add more tool context or clarifying instructions"
-            ]
-        }
-    else:
-        # HEALTHY
-        return {
-            "type": "healthy",
-            "confidence": 0.9,
-            "evidence": f"Low error rate ({error_rate*100:.0f}%), low escalation ({escalation_rate*100:.0f}%)",
-            "checklist": []
-        }
-
-def _load_settings():
+    # Also persist to the audit_log table
     try:
-        with open(SETTINGS_PATH) as f:
-            return json.load(f)
-    except Exception:
-        return {"active": "anthropic", "keys": {}, "models": dict(providers_mod.DEFAULT_MODELS)}
-
-def _save_settings(s):
-    with open(SETTINGS_PATH, "w") as f:
-        json.dump(s, f, indent=2)
-    try:
-        os.chmod(SETTINGS_PATH, 0o600)
+        _db = SessionLocal()
+        log_audit(_db, agent_id=agent_id, event=event_type, data=data or {})
+        _db.close()
     except Exception:
         pass
 
-SETTINGS = _load_settings()
-SETTINGS.setdefault("active", "anthropic")
-SETTINGS.setdefault("keys", {})
-SETTINGS.setdefault("models", {})
-for p, m in providers_mod.DEFAULT_MODELS.items():
-    SETTINGS["models"].setdefault(p, m)
+def diagnose_agent(agent_id: str):
+    """Analyze agent runs to classify as build vs training problem."""
+    db = SessionLocal()
+    try:
+        runs_q = db.query(RunModel).filter(RunModel.agent_id == agent_id).order_by(RunModel.started_at.desc()).limit(10).all()
+        if not runs_q:
+            return {"type": "unknown", "confidence": 0, "checklist": [], "evidence": "No runs yet"}
+        runs = runs_q
+        escalations = sum(1 for r in runs if r.outcome == "ESCALATED")
+        errors = sum(1 for r in runs if r.outcome == "ERROR")
+        escalation_rate = escalations / len(runs)
+        error_rate = errors / len(runs)
+        if error_rate > 0.3:
+            return {
+                "type": "build", "confidence": min(0.95, 0.6 + error_rate),
+                "evidence": f"{error_rate*100:.0f}% error rate across runs",
+                "checklist": ["Check agent timeout and retry settings", "Verify API connections and rate limits",
+                              "Review error logs for infrastructure issues", "Test with minimal config to isolate problem",
+                              "Check model availability and fallbacks"]
+            }
+        elif escalation_rate > 0.4:
+            return {
+                "type": "training", "confidence": min(0.95, 0.5 + escalation_rate),
+                "evidence": f"{escalation_rate*100:.0f}% escalation rate",
+                "checklist": ["Review escalated cases for decision patterns", "Adjust confidence threshold if too conservative",
+                              "Enhance agent prompt with better context/examples", "Fine-tune model selection or parameters",
+                              "Add more tool context or clarifying instructions"]
+            }
+        else:
+            return {
+                "type": "healthy", "confidence": 0.9,
+                "evidence": f"Low error rate ({error_rate*100:.0f}%), low escalation ({escalation_rate*100:.0f}%)",
+                "checklist": []
+            }
+    finally:
+        db.close()
+
+# ─────────────────────────────────────────────── settings helpers (DB-backed)
+
+def _load_settings():
+    """Load settings from the database, falling back to defaults."""
+    db = SessionLocal()
+    try:
+        keys = get_or_create_setting(db, "provider_keys", {})
+        models = get_or_create_setting(db, "provider_models", dict(providers_mod.DEFAULT_MODELS))
+        active_row = get_or_create_setting(db, "active_provider", {"active": "anthropic"})
+        active = active_row.get("active", "anthropic") if isinstance(active_row, dict) else "anthropic"
+        return {"active": active, "keys": keys, "models": models}
+    except Exception:
+        return {"active": "anthropic", "keys": {}, "models": dict(providers_mod.DEFAULT_MODELS)}
+    finally:
+        db.close()
+
+def _save_settings(s):
+    """Persist settings to the database."""
+    db = SessionLocal()
+    try:
+        set_setting(db, "provider_keys", s.get("keys", {}))
+        set_setting(db, "provider_models", s.get("models", {}))
+        set_setting(db, "active_provider", {"active": s.get("active", "anthropic")})
+    finally:
+        db.close()
+
+# Settings loaded once at startup, refreshed on writes
+SETTINGS = {"active": "anthropic", "keys": {}, "models": dict(providers_mod.DEFAULT_MODELS)}
 
 _ENV_KEYS = {
     "anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY", "gemini": "GEMINI_API_KEY",
@@ -229,96 +1363,7 @@ def _mask(k):
     return (k[:7] + "…" + k[-4:]) if k and len(k) > 14 else ("set" if k else "")
 
 
-# ---------------------------------------------------------------- agent configs
-# Each agent carries a structured config the control panel can edit.
-# Types: sample (built-in examples) | custom (user-created) | imported (from integration)
-
-AGENTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agents.json")
-
-_DEFAULT_AGENTS = {
-    "sample-research": {
-        "name": "Research Agent",
-        "description": "General-purpose research agent that searches and summarizes information",
-        "account": "Sample",
-        "status": "running", "version": 1,
-        "containment": 0, "resolution": 0, "escalation": 0, "clinical_flags": 0,
-        "live": True,
-        "type": "sample",
-        "endpoint": {"type": "embedded", "url": ""},
-        "config": {
-            "model": {"provider": "anthropic", "model_name": "claude-sonnet-5", "temperature": 0.7, "max_tokens": 4096},
-            "execution": {"timeout_seconds": 300, "max_retries": 3, "retry_delay_seconds": 60},
-            "behavior": {"confidence_threshold": 0.75, "escalation_threshold": "high", "auto_escalate_on_error": True, "confirm_before_action": True},
-            "data_sources": [],
-            "tools": [
-                {"name": "web_search", "description": "Search the web", "parameters": ["query"], "rate_limit": 100},
-                {"name": "fetch_url", "description": "Fetch and read a URL", "parameters": ["url"], "rate_limit": 50},
-                {"name": "summarize", "description": "Summarize text content", "parameters": ["text"], "rate_limit": 100}
-            ],
-            "audit": {"log_all_calls": True, "log_data_access": True, "track_modifications": True}
-        },
-    },
-    "sample-router": {
-        "name": "Router Agent",
-        "description": "Routes incoming requests to the appropriate handler based on intent",
-        "account": "Sample",
-        "status": "stopped", "version": 1,
-        "containment": 0, "resolution": 0, "escalation": 0, "clinical_flags": 0,
-        "live": True,
-        "type": "sample",
-        "endpoint": {"type": "embedded", "url": ""},
-        "config": {
-            "model": {"provider": "anthropic", "model_name": "claude-sonnet-5", "temperature": 0.3, "max_tokens": 1024},
-            "execution": {"timeout_seconds": 30, "max_retries": 2, "retry_delay_seconds": 5},
-            "behavior": {"confidence_threshold": 0.8, "escalation_threshold": "moderate", "auto_escalate_on_error": True, "confirm_before_action": False},
-            "data_sources": [],
-            "tools": [
-                {"name": "classify_intent", "description": "Classify the intent of a message", "parameters": ["message", "categories"], "rate_limit": 200},
-                {"name": "route_request", "description": "Route to appropriate handler", "parameters": ["intent", "payload"], "rate_limit": 200}
-            ],
-            "audit": {"log_all_calls": True, "log_data_access": True, "track_modifications": False}
-        },
-    },
-    "sample-action": {
-        "name": "Action Agent",
-        "description": "Executes actions in external systems based on instructions",
-        "account": "Sample",
-        "status": "stopped", "version": 1,
-        "containment": 0, "resolution": 0, "escalation": 0, "clinical_flags": 0,
-        "live": True,
-        "type": "sample",
-        "endpoint": {"type": "rest", "url": "https://your-api.example.com/agent"},
-        "config": {
-            "model": {"provider": "openai", "model_name": "gpt-5.6-terra", "temperature": 0.5, "max_tokens": 2048},
-            "execution": {"timeout_seconds": 120, "max_retries": 3, "retry_delay_seconds": 30},
-            "behavior": {"confidence_threshold": 0.85, "escalation_threshold": "low", "auto_escalate_on_error": True, "confirm_before_action": True},
-            "data_sources": [
-                {"name": "example_crm", "type": "api", "endpoint": "https://crm.example.com/api", "auth_type": "api_key", "auth_value": ""}
-            ],
-            "tools": [
-                {"name": "create_record", "description": "Create a new record", "parameters": ["type", "data"], "rate_limit": 50},
-                {"name": "update_record", "description": "Update an existing record", "parameters": ["id", "data"], "rate_limit": 50},
-                {"name": "send_notification", "description": "Send a notification", "parameters": ["recipient", "message"], "rate_limit": 100}
-            ],
-            "audit": {"log_all_calls": True, "log_data_access": True, "track_modifications": True}
-        },
-    },
-}
-
-def _load_agents():
-    try:
-        with open(AGENTS_PATH) as f:
-            return json.load(f)
-    except Exception:
-        return copy.deepcopy(_DEFAULT_AGENTS)
-
-def _save_agents():
-    with open(AGENTS_PATH, "w") as f:
-        json.dump(AGENTS, f, indent=2)
-    try:
-        os.chmod(AGENTS_PATH, 0o600)
-    except Exception:
-        pass
+# ---------------------------------------------------------------- agent helpers
 
 def _slugify(name: str) -> str:
     """Convert a name to a URL-safe slug."""
@@ -336,12 +1381,73 @@ def _default_config():
         "audit": {"log_all_calls": True, "log_data_access": True, "track_modifications": True}
     }
 
-AGENTS = _load_agents()
+def _agent_to_dict(a):
+    """Convert a DB AgentModel row to the dict format the frontend expects."""
+    cfg = a.config or {}
+    return {
+        "name": a.name, "description": a.description or "", "account": a.account or "",
+        "status": a.status or "stopped", "version": a.version or 1,
+        "live": a.live if a.live is not None else False,
+        "type": a.agent_type or "custom",
+        "endpoint": a.endpoint or {},
+        "config": cfg,
+        "containment": a.containment or 0, "resolution": a.resolution or 0,
+        "escalation": a.escalation or 0, "clinical_flags": 0,
+        "owner_id": a.owner_id or "",
+    }
 
-# version history: agent_id -> list of {version, at, by, note, config}
-HISTORY = {aid: [] for aid in AGENTS}
-# pending proposals: token -> {agent_id, request, diff, before, after}
-PENDING = {}
+def _seed_sample_agents(db):
+    """Insert sample agents into a fresh database."""
+    samples = [
+        ("sample-research", "Research Agent", "General-purpose research agent that searches and summarizes information",
+         "Sample", "running", "sample", {"type": "embedded", "url": ""},
+         {"model": {"provider": "anthropic", "model_name": "claude-sonnet-5", "temperature": 0.7, "max_tokens": 4096},
+          "execution": {"timeout_seconds": 300, "max_retries": 3, "retry_delay_seconds": 60},
+          "behavior": {"confidence_threshold": 0.75, "escalation_threshold": "high", "auto_escalate_on_error": True, "confirm_before_action": True},
+          "standing_instruction": "Search for the latest developments in AI agent frameworks and orchestration platforms. Summarize key trends, new releases, and competitive landscape changes. Report findings concisely.",
+          "run_interval_seconds": 300,
+          "data_sources": [],
+          "tools": [{"name": "web_search", "description": "Search the web", "parameters": ["query"], "rate_limit": 100},
+                    {"name": "fetch_url", "description": "Fetch and read a URL", "parameters": ["url"], "rate_limit": 50},
+                    {"name": "summarize", "description": "Summarize text content", "parameters": ["text"], "rate_limit": 100}],
+          "integrations": [],
+          "audit": {"log_all_calls": True, "log_data_access": True, "track_modifications": True}}),
+        ("sample-router", "Router Agent", "Routes incoming requests to the appropriate handler based on intent",
+         "Sample", "stopped", "sample", {"type": "embedded", "url": ""},
+         {"model": {"provider": "anthropic", "model_name": "claude-sonnet-5", "temperature": 0.3, "max_tokens": 1024},
+          "execution": {"timeout_seconds": 30, "max_retries": 2, "retry_delay_seconds": 5},
+          "behavior": {"confidence_threshold": 0.8, "escalation_threshold": "moderate", "auto_escalate_on_error": True, "confirm_before_action": False},
+          "standing_instruction": "Monitor incoming message queue. Classify each message by intent (support, billing, technical, feedback, spam) and route to the appropriate handler agent. Log classification confidence scores.",
+          "run_interval_seconds": 30,
+          "data_sources": [],
+          "tools": [{"name": "classify_intent", "description": "Classify the intent of a message", "parameters": ["message", "categories"], "rate_limit": 200},
+                    {"name": "route_request", "description": "Route to appropriate handler", "parameters": ["intent", "payload"], "rate_limit": 200}],
+          "integrations": [],
+          "audit": {"log_all_calls": True, "log_data_access": True, "track_modifications": False}}),
+        ("sample-action", "Action Agent", "Executes actions in external systems based on instructions",
+         "Sample", "stopped", "sample", {"type": "rest", "url": "https://your-api.example.com/agent"},
+         {"model": {"provider": "openai", "model_name": "gpt-5.6-terra", "temperature": 0.5, "max_tokens": 2048},
+          "execution": {"timeout_seconds": 120, "max_retries": 3, "retry_delay_seconds": 30},
+          "behavior": {"confidence_threshold": 0.85, "escalation_threshold": "low", "auto_escalate_on_error": True, "confirm_before_action": True},
+          "standing_instruction": "Check for pending action items in the task queue. Execute approved actions in external systems (CRM updates, notifications, record creation). Report results and any failures requiring human review.",
+          "run_interval_seconds": 120,
+          "data_sources": [{"name": "example_crm", "type": "api", "endpoint": "https://crm.example.com/api", "auth_type": "api_key", "auth_value": ""}],
+          "tools": [{"name": "create_record", "description": "Create a new record", "parameters": ["type", "data"], "rate_limit": 50},
+                    {"name": "update_record", "description": "Update an existing record", "parameters": ["id", "data"], "rate_limit": 50},
+                    {"name": "send_notification", "description": "Send a notification", "parameters": ["recipient", "message"], "rate_limit": 100}],
+          "integrations": [],
+          "audit": {"log_all_calls": True, "log_data_access": True, "track_modifications": True}}),
+    ]
+    for slug, name, desc, acct, status, atype, endpoint, config in samples:
+        agent = AgentModel(id=slug, slug=slug, name=name, description=desc, account=acct,
+                           status=status, agent_type=atype, live=True, version=1,
+                           endpoint=endpoint, config=config)
+        db.add(agent)
+    db.commit()
+
+# In-memory caches for transient state (version history + pending proposals)
+HISTORY = {}  # agent_id -> list of {version, at, by, note, config}
+PENDING = {}  # token -> {agent_id, request, diff, before, after}
 
 def _ensure_history(agent_id: str):
     """Ensure HISTORY has an entry for this agent."""
@@ -609,128 +1715,253 @@ class ApplyIn(BaseModel):
 # ---------------------------------------------------------------------- endpoints
 
 @app.get("/api/agents")
-def list_agents():
-    running = [a for a in AGENTS.values() if a["status"] == "running"]
-    return {
-        "agents": [
-            {"id": k,
-             "name": v.get("name", k),
-             "description": v.get("description", ""),
-             "account": v.get("account", ""),
-             "status": v.get("status", "stopped"),
-             "version": v.get("version", 1),
-             "live": v.get("live", False),
-             "type": v.get("type", "custom"),
-             "endpoint": v.get("endpoint", {}),
-             "containment": v.get("containment", 0),
-             "resolution": v.get("resolution", 0),
-             "escalation": v.get("escalation", 0),
-             "clinical_flags": v.get("clinical_flags", 0),
-             "data_sources_count": len(v.get("config", {}).get("data_sources", [])),
-             "tools_count": len(v.get("config", {}).get("tools", [])),
-             # Legacy field for backward compatibility with frontend
-             "posture": v.get("config", {}).get("posture", v.get("type", "custom")),
-             }
-            for k, v in AGENTS.items()
-        ],
-        "total": len(AGENTS),
-        "running": len(running),
-        "error": sum(1 for a in AGENTS.values() if a["status"] == "error"),
-        "stopped": sum(1 for a in AGENTS.values() if a["status"] == "stopped"),
-        "avg_containment": round(sum(a["containment"] for a in running) / len(running), 1) if running else 0,
-        "llm": bool(get_key(SETTINGS["active"])),
-    }
+def list_agents(request: Request):
+    db = SessionLocal()
+    try:
+        # Exclude soft-deleted agents (they live in the recycle bin)
+        agents = db.query(AgentModel).filter(
+            (AgentModel.is_deleted == False) | (AgentModel.is_deleted == None)  # noqa: E711,E712
+        ).all()
+        # Build owner name lookup
+        owner_ids = {a.owner_id for a in agents if a.owner_id}
+        owner_names = {}
+        if owner_ids:
+            owners = db.query(User).filter(User.id.in_(owner_ids)).all()
+            owner_names = {u.id: u.name or u.email for u in owners}
+        running = [a for a in agents if a.status == "running"]
+        return {
+            "agents": [
+                {"id": a.id,
+                 "name": a.name,
+                 "description": a.description or "",
+                 "account": a.account or "",
+                 "status": a.status or "stopped",
+                 "version": a.version or 1,
+                 "live": a.live if a.live is not None else False,
+                 "type": a.agent_type or "custom",
+                 "endpoint": a.endpoint or {},
+                 "containment": a.containment or 0,
+                 "resolution": a.resolution or 0,
+                 "escalation": a.escalation or 0,
+                 "clinical_flags": 0,
+                 "data_sources_count": len((a.config or {}).get("data_sources", [])),
+                 "tools_count": len((a.config or {}).get("tools", [])),
+                 "posture": (a.config or {}).get("posture", a.agent_type or "custom"),
+                 "owner_id": a.owner_id or "",
+                 "owner_name": owner_names.get(a.owner_id, "") if a.owner_id else "",
+                 }
+                for a in agents
+            ],
+            "total": len(agents),
+            "running": len(running),
+            "error": sum(1 for a in agents if a.status == "error"),
+            "stopped": sum(1 for a in agents if a.status == "stopped"),
+            "avg_containment": round(sum(a.containment or 0 for a in running) / len(running), 1) if running else 0,
+            "llm": bool(get_key(SETTINGS["active"])),
+        }
+    finally:
+        db.close()
 
 @app.get("/api/agents/{agent_id}")
 def get_agent(agent_id: str):
-    a = AGENTS.get(agent_id)
-    if not a:
-        raise HTTPException(404, "agent not found")
-    _ensure_history(agent_id)
-    return {"id": agent_id, **a, "history_count": len(HISTORY[agent_id])}
+    db = SessionLocal()
+    try:
+        a = db.query(AgentModel).filter(AgentModel.id == agent_id).first()
+        if not a:
+            raise HTTPException(404, "agent not found")
+        _ensure_history(agent_id)
+        return {"id": agent_id, **_agent_to_dict(a), "history_count": len(HISTORY.get(agent_id, []))}
+    finally:
+        db.close()
 
 @app.post("/api/agents/{agent_id}/propose")
 def propose(agent_id: str, body: ProposeIn):
-    a = AGENTS.get(agent_id)
-    if not a:
-        raise HTTPException(404, "agent not found")
-    _ensure_history(agent_id)
-    before = a["config"]
+    db = SessionLocal()
     try:
-        if get_key("anthropic"):
-            after, notes = llm_translate(before, body.request)
-        else:
+        a = db.query(AgentModel).filter(AgentModel.id == agent_id).first()
+        if not a:
+            raise HTTPException(404, "agent not found")
+        _ensure_history(agent_id)
+        before = a.config or {}
+        try:
+            if get_key("anthropic"):
+                after, notes = llm_translate(before, body.request)
+            else:
+                after, notes = deterministic_translate(before, body.request)
+        except Exception:
             after, notes = deterministic_translate(before, body.request)
-    except Exception as e:
-        # fall back to deterministic if the model call fails
-        after, notes = deterministic_translate(before, body.request)
-        notes.append(f"(model unavailable, used rule-based parse)")
+            notes.append("(model unavailable, used rule-based parse)")
 
-    changes = _diff(before, after)
-    if not changes:
-        return {"ok": False, "message": "No change detected. Try naming a specific field — timing, retries, channel, call window, confidence threshold, escalation severity, or routing."}
+        changes = _diff(before, after)
+        if not changes:
+            return {"ok": False, "message": "No change detected. Try naming a specific field — timing, retries, channel, call window, confidence threshold, escalation severity, or routing."}
 
-    token = hashlib.sha256(f"{agent_id}{body.request}{datetime.now()}".encode()).hexdigest()[:12]
-    PENDING[token] = {"agent_id": agent_id, "request": body.request, "changes": changes,
-                      "before": copy.deepcopy(before), "after": after, "notes": notes,
-                      "flags": _safety_flags(before, after)}
-    return {"ok": True, "token": token, "request": body.request, "changes": changes,
-            "notes": notes, "flags": PENDING[token]["flags"]}
+        token = hashlib.sha256(f"{agent_id}{body.request}{datetime.now()}".encode()).hexdigest()[:12]
+        PENDING[token] = {"agent_id": agent_id, "request": body.request, "changes": changes,
+                          "before": copy.deepcopy(before), "after": after, "notes": notes,
+                          "flags": _safety_flags(before, after)}
+        return {"ok": True, "token": token, "request": body.request, "changes": changes,
+                "notes": notes, "flags": PENDING[token]["flags"]}
+    finally:
+        db.close()
 
 @app.post("/api/agents/{agent_id}/apply")
-def apply(agent_id: str, body: ApplyIn):
+def apply(agent_id: str, body: ApplyIn, request: Request):
     p = PENDING.get(body.token)
     if not p or p["agent_id"] != agent_id:
         raise HTTPException(404, "proposal not found or expired")
-    a = AGENTS[agent_id]
-    _ensure_history(agent_id)
-    # snapshot current into history before applying
-    HISTORY[agent_id].append({
-        "version": a["version"], "at": datetime.now(timezone.utc).isoformat(),
-        "by": body.approved_by, "note": p["request"],
-        "config": copy.deepcopy(a["config"]), "changes": p["changes"],
-    })
-    a["config"] = p["after"]
-    a["version"] += 1
-    del PENDING[body.token]
-    _save_agents()
-    return {"ok": True, "agent_id": agent_id, "new_version": a["version"], "applied": p["changes"]}
+    sess = _get_session(request)
+    uid = sess.get("user_id") if sess else None
+    uemail = sess.get("email", "") if sess else ""
+    who = body.approved_by or uemail or "unknown"
+    db = SessionLocal()
+    try:
+        a = db.query(AgentModel).filter(AgentModel.id == agent_id).first()
+        if not a:
+            raise HTTPException(404, "agent not found")
+        _ensure_history(agent_id)
+        prev_config = copy.deepcopy(a.config or {})
+        HISTORY[agent_id].append({
+            "version": a.version, "at": datetime.now(timezone.utc).isoformat(),
+            "by": who, "note": p["request"],
+            "config": prev_config, "changes": p["changes"],
+        })
+        a.config = p["after"]
+        from sqlalchemy.orm.attributes import flag_modified
+        flag_modified(a, "config")
+        # Immutable, hash-chained version snapshot with user attribution
+        snapshot_agent_version(
+            db, a, changed_by=uid, changer_email=who, change_type="update",
+            change_summary=p["request"][:500], prev_config=prev_config,
+        )
+        db.commit()
+        del PENDING[body.token]
+        return {"ok": True, "agent_id": agent_id, "new_version": a.version,
+                "applied": p["changes"], "changed_by": who}
+    finally:
+        db.close()
 
 @app.get("/api/agents/{agent_id}/history")
 def history(agent_id: str):
-    if agent_id not in AGENTS:
-        raise HTTPException(404, "agent not found")
-    _ensure_history(agent_id)
-    return {"agent_id": agent_id, "current_version": AGENTS[agent_id]["version"],
-            "history": list(reversed(HISTORY[agent_id]))}
+    db = SessionLocal()
+    try:
+        a = db.query(AgentModel).filter(AgentModel.id == agent_id).first()
+        if not a:
+            raise HTTPException(404, "agent not found")
+        _ensure_history(agent_id)
+        return {"agent_id": agent_id, "current_version": a.version,
+                "history": list(reversed(HISTORY.get(agent_id, [])))}
+    finally:
+        db.close()
 
 @app.post("/api/agents/{agent_id}/revert/{version}")
 def revert(agent_id: str, version: int):
-    a = AGENTS.get(agent_id)
-    if not a:
-        raise HTTPException(404, "agent not found")
-    _ensure_history(agent_id)
-    entry = next((h for h in HISTORY[agent_id] if h["version"] == version), None)
-    if not entry:
-        raise HTTPException(404, "version not found in history")
-    HISTORY[agent_id].append({
-        "version": a["version"], "at": datetime.now(timezone.utc).isoformat(),
-        "by": "revert", "note": f"revert to v{version}",
-        "config": copy.deepcopy(a["config"]), "changes": [],
-    })
-    a["config"] = copy.deepcopy(entry["config"])
-    a["version"] += 1
-    _save_agents()
-    return {"ok": True, "reverted_to": version, "new_version": a["version"]}
+    db = SessionLocal()
+    try:
+        a = db.query(AgentModel).filter(AgentModel.id == agent_id).first()
+        if not a:
+            raise HTTPException(404, "agent not found")
+        _ensure_history(agent_id)
+        entry = next((h for h in HISTORY.get(agent_id, []) if h["version"] == version), None)
+        if not entry:
+            raise HTTPException(404, "version not found in history")
+        HISTORY[agent_id].append({
+            "version": a.version, "at": datetime.now(timezone.utc).isoformat(),
+            "by": "revert", "note": f"revert to v{version}",
+            "config": copy.deepcopy(a.config or {}), "changes": [],
+        })
+        a.config = copy.deepcopy(entry["config"])
+        a.version = (a.version or 1) + 1
+        db.commit()
+        return {"ok": True, "reverted_to": version, "new_version": a.version}
+    finally:
+        db.close()
 
 @app.post("/api/agents/{agent_id}/control")
 def control(agent_id: str, action: str = "start"):
-    a = AGENTS.get(agent_id)
-    if not a:
-        raise HTTPException(404, "agent not found")
-    a["status"] = {"start": "running", "restart": "running", "stop": "stopped"}.get(action, a["status"])
-    _save_agents()
-    return {"ok": True, "status": a["status"]}
+    db = SessionLocal()
+    try:
+        a = db.query(AgentModel).filter(AgentModel.id == agent_id).first()
+        if not a:
+            raise HTTPException(404, "agent not found")
+        a.status = {"start": "running", "restart": "running", "stop": "stopped",
+                     "pause": a.status, "resume": a.status}.get(action, a.status)
+        db.commit()
+        # Daemon-level pause/resume (keeps agent "running" in DB but halts cycles)
+        if action == "pause":
+            daemon_mod.pause_agent(agent_id)
+        elif action == "resume":
+            daemon_mod.resume_agent(agent_id)
+        return {"ok": True, "status": a.status}
+    finally:
+        db.close()
+
+
+class StandingInstructionBody(BaseModel):
+    standing_instruction: str = ""
+    run_interval_seconds: int = 60
+
+
+@app.post("/api/agents/{agent_id}/standing-instruction")
+def update_standing_instruction(agent_id: str, body: StandingInstructionBody, request: Request):
+    """Update an agent's standing instruction and run interval for continuous mode."""
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "not authenticated")
+    db = SessionLocal()
+    try:
+        a = db.query(AgentModel).filter(AgentModel.id == agent_id).first()
+        if not a:
+            raise HTTPException(404, "agent not found")
+        cfg = dict(a.config or {})
+        cfg["standing_instruction"] = body.standing_instruction
+        cfg["run_interval_seconds"] = max(30, body.run_interval_seconds)
+        a.config = cfg
+        from sqlalchemy.orm.attributes import flag_modified
+        flag_modified(a, "config")
+        db.commit()
+        return {"ok": True, "config": cfg}
+    finally:
+        db.close()
+
+
+@app.get("/api/daemon/status")
+def daemon_status():
+    """Get daemon status and all agent daemon states."""
+    return {
+        "running": daemon_mod.is_running(),
+        "agents": daemon_mod.get_all_daemon_states(),
+    }
+
+
+@app.get("/api/agents/{agent_id}/daemon")
+def agent_daemon_state(agent_id: str):
+    """Get daemon state for a specific agent."""
+    return daemon_mod.get_agent_daemon_state(agent_id)
+
+
+class UpdateConfigBody(BaseModel):
+    config: dict
+
+
+@app.put("/api/agents/{agent_id}/config")
+def update_agent_config(agent_id: str, body: UpdateConfigBody, request: Request):
+    """Directly update an agent's config JSON (for integrations, etc)."""
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "not authenticated")
+    db = SessionLocal()
+    try:
+        a = db.query(AgentModel).filter(AgentModel.id == agent_id).first()
+        if not a:
+            raise HTTPException(404, "agent not found")
+        a.config = body.config
+        from sqlalchemy.orm.attributes import flag_modified
+        flag_modified(a, "config")
+        db.commit()
+        return {"ok": True}
+    finally:
+        db.close()
 
 
 # ──────────────────────────────────────────────── agent registration & management
@@ -744,46 +1975,47 @@ class RegisterAgentIn(BaseModel):
     config: dict = {}
 
 @app.post("/api/agents/register")
-def register_agent(body: RegisterAgentIn):
+def register_agent(body: RegisterAgentIn, request: Request):
     """Register a new agent."""
+    sess = _get_session(request)
     agent_id = _slugify(body.name)
     if not agent_id:
         raise HTTPException(400, "name must produce a valid slug")
-    # Ensure unique ID
-    base_id = agent_id
-    counter = 2
-    while agent_id in AGENTS:
-        agent_id = f"{base_id}-{counter}"
-        counter += 1
+    db = SessionLocal()
+    try:
+        # Ensure unique slug
+        base_id = agent_id
+        counter = 2
+        while db.query(AgentModel).filter(AgentModel.id == agent_id).first():
+            agent_id = f"{base_id}-{counter}"
+            counter += 1
 
-    # Merge user config onto defaults
-    cfg = _default_config()
-    if body.config:
-        for section in ("model", "execution", "behavior", "audit"):
-            if section in body.config:
-                cfg[section].update(body.config[section])
-        if "data_sources" in body.config:
-            cfg["data_sources"] = body.config["data_sources"]
-        if "tools" in body.config:
-            cfg["tools"] = body.config["tools"]
+        cfg = _default_config()
+        if body.config:
+            for section in ("model", "execution", "behavior", "audit"):
+                if section in body.config:
+                    cfg[section].update(body.config[section])
+            if "data_sources" in body.config:
+                cfg["data_sources"] = body.config["data_sources"]
+            if "tools" in body.config:
+                cfg["tools"] = body.config["tools"]
 
-    agent = {
-        "name": body.name,
-        "description": body.description,
-        "account": body.account or "Custom",
-        "status": "stopped",
-        "version": 1,
-        "containment": 0, "resolution": 0, "escalation": 0, "clinical_flags": 0,
-        "live": True,
-        "type": "custom",
-        "endpoint": {"type": body.endpoint_type, "url": body.endpoint_url},
-        "config": cfg,
-    }
-    AGENTS[agent_id] = agent
-    _ensure_history(agent_id)
-    _save_agents()
-    log_event(agent_id, "agent.registered", {"name": body.name})
-    return {"ok": True, "agent_id": agent_id, "agent": {"id": agent_id, **agent}}
+        agent = AgentModel(
+            id=agent_id, slug=agent_id, name=body.name,
+            description=body.description, account=body.account or "Custom",
+            status="stopped", agent_type="custom", live=True, version=1,
+            endpoint={"type": body.endpoint_type, "url": body.endpoint_url},
+            config=cfg,
+            owner_id=sess["user_id"] if sess else None,
+        )
+        db.add(agent)
+        db.commit()
+        db.refresh(agent)
+        _ensure_history(agent_id)
+        log_event(agent_id, "agent.registered", {"name": body.name})
+        return {"ok": True, "agent_id": agent_id, "agent": {"id": agent_id, **_agent_to_dict(agent)}}
+    finally:
+        db.close()
 
 class ImportAgentIn(BaseModel):
     config_json: str  # raw JSON or YAML string
@@ -940,53 +2172,74 @@ def import_agent(body: ImportAgentIn):
     agent_id = _slugify(normalized["name"])
     if not agent_id:
         agent_id = "imported-agent"
-    base_id = agent_id
-    counter = 2
-    while agent_id in AGENTS:
-        agent_id = f"{base_id}-{counter}"
-        counter += 1
+    db = SessionLocal()
+    try:
+        base_id = agent_id
+        counter = 2
+        while db.query(AgentModel).filter(AgentModel.id == agent_id).first():
+            agent_id = f"{base_id}-{counter}"
+            counter += 1
 
-    cfg = _default_config()
-    imp_cfg = normalized.get("config", {})
-    for section in ("model", "execution", "behavior", "audit"):
-        if section in imp_cfg:
-            cfg[section].update(imp_cfg[section])
-    if "data_sources" in imp_cfg:
-        cfg["data_sources"] = imp_cfg["data_sources"]
-    if "tools" in imp_cfg:
-        cfg["tools"] = imp_cfg["tools"]
+        cfg = _default_config()
+        imp_cfg = normalized.get("config", {})
+        for section in ("model", "execution", "behavior", "audit"):
+            if section in imp_cfg:
+                cfg[section].update(imp_cfg[section])
+        if "data_sources" in imp_cfg:
+            cfg["data_sources"] = imp_cfg["data_sources"]
+        if "tools" in imp_cfg:
+            cfg["tools"] = imp_cfg["tools"]
 
-    agent = {
-        "name": normalized["name"],
-        "description": normalized["description"],
-        "account": f"Imported ({normalized.get('source_format', 'auto')})",
-        "status": "stopped",
-        "version": 1,
-        "containment": 0, "resolution": 0, "escalation": 0, "clinical_flags": 0,
-        "live": True,
-        "type": "custom",
-        "endpoint": {"type": normalized.get("endpoint_type", "embedded"), "url": normalized.get("endpoint_url", "")},
-        "config": cfg,
-    }
-    AGENTS[agent_id] = agent
-    _ensure_history(agent_id)
-    _save_agents()
-    log_event(agent_id, "agent.imported", {"name": normalized["name"], "source_format": normalized.get("source_format")})
-    return {"ok": True, "agent_id": agent_id, "detected_format": normalized.get("source_format", "raw"),
-            "agent": {"id": agent_id, **agent}}
+        agent = AgentModel(
+            id=agent_id, slug=agent_id, name=normalized["name"],
+            description=normalized["description"],
+            account=f"Imported ({normalized.get('source_format', 'auto')})",
+            status="stopped", agent_type="imported", live=True, version=1,
+            endpoint={"type": normalized.get("endpoint_type", "embedded"), "url": normalized.get("endpoint_url", "")},
+            config=cfg,
+        )
+        db.add(agent)
+        db.commit()
+        db.refresh(agent)
+        _ensure_history(agent_id)
+        log_event(agent_id, "agent.imported", {"name": normalized["name"], "source_format": normalized.get("source_format")})
+        return {"ok": True, "agent_id": agent_id, "detected_format": normalized.get("source_format", "raw"),
+                "agent": {"id": agent_id, **_agent_to_dict(agent)}}
+    finally:
+        db.close()
 
 @app.delete("/api/agents/{agent_id}")
-def delete_agent(agent_id: str):
-    """Remove an agent."""
-    if agent_id not in AGENTS:
-        raise HTTPException(404, "agent not found")
-    name = AGENTS[agent_id].get("name", agent_id)
-    del AGENTS[agent_id]
-    HISTORY.pop(agent_id, None)
-    RUNS.pop(agent_id, None)
-    _save_agents()
-    log_event(agent_id, "agent.deleted", {"name": name})
-    return {"ok": True, "deleted": agent_id}
+def delete_agent(agent_id: str, request: Request, purge: bool = False):
+    """Move an agent to the recycle bin (recoverable). ?purge=true hard-deletes (admin only)."""
+    sess = _get_session(request)
+    uid = sess.get("user_id") if sess else None
+    db = SessionLocal()
+    try:
+        a = db.query(AgentModel).filter(AgentModel.id == agent_id).first()
+        if not a:
+            raise HTTPException(404, "agent not found")
+        name = a.name
+        if purge:
+            # Permanent deletion — restricted to admins
+            if not (sess and sess.get("is_admin")):
+                raise HTTPException(403, "permanent deletion requires admin")
+            db.delete(a)
+            db.commit()
+            HISTORY.pop(agent_id, None)
+            log_event(agent_id, "agent.purged", {"name": name})
+            return {"ok": True, "purged": agent_id}
+        # Soft-delete → recycle bin, fully recoverable
+        result = soft_delete_agent(db, a, deleted_by=uid)
+        try:
+            daemon_mod.pause_agent(agent_id)
+        except Exception:
+            pass
+        log_event(agent_id, "agent.deleted", {"name": name, "recoverable": True})
+        return {"ok": True, "deleted": agent_id, "recoverable": True,
+                "recoverable_until": result.get("recoverable_until"),
+                "retention_days": RECYCLE_BIN_RETENTION_DAYS}
+    finally:
+        db.close()
 
 
 # ──────────────────────────────────────────────── data sources
@@ -1002,30 +2255,42 @@ class DataSourceIn(BaseModel):
 @app.post("/api/agents/{agent_id}/data-sources")
 def add_data_source(agent_id: str, body: DataSourceIn):
     """Add a data source to an agent's config."""
-    a = AGENTS.get(agent_id)
-    if not a:
-        raise HTTPException(404, "agent not found")
-    ds = {"name": body.name, "type": body.type, "endpoint": body.endpoint,
-          "auth_type": body.auth_type, "auth_value": body.auth_value, "refresh": body.refresh}
-    a["config"].setdefault("data_sources", []).append(ds)
-    _save_agents()
-    log_event(agent_id, "datasource.added", {"name": body.name})
-    return {"ok": True, "data_source": ds, "total": len(a["config"]["data_sources"])}
+    db = SessionLocal()
+    try:
+        a = db.query(AgentModel).filter(AgentModel.id == agent_id).first()
+        if not a:
+            raise HTTPException(404, "agent not found")
+        ds = {"name": body.name, "type": body.type, "endpoint": body.endpoint,
+              "auth_type": body.auth_type, "auth_value": body.auth_value, "refresh": body.refresh}
+        cfg = copy.deepcopy(a.config or {})
+        cfg.setdefault("data_sources", []).append(ds)
+        a.config = cfg
+        db.commit()
+        log_event(agent_id, "datasource.added", {"name": body.name})
+        return {"ok": True, "data_source": ds, "total": len(cfg["data_sources"])}
+    finally:
+        db.close()
 
 @app.delete("/api/agents/{agent_id}/data-sources/{source_name}")
 def remove_data_source(agent_id: str, source_name: str):
     """Remove a data source from an agent's config."""
-    a = AGENTS.get(agent_id)
-    if not a:
-        raise HTTPException(404, "agent not found")
-    sources = a["config"].get("data_sources", [])
-    before_len = len(sources)
-    a["config"]["data_sources"] = [s for s in sources if s.get("name") != source_name]
-    if len(a["config"]["data_sources"]) == before_len:
-        raise HTTPException(404, "data source not found")
-    _save_agents()
-    log_event(agent_id, "datasource.removed", {"name": source_name})
-    return {"ok": True, "removed": source_name, "remaining": len(a["config"]["data_sources"])}
+    db = SessionLocal()
+    try:
+        a = db.query(AgentModel).filter(AgentModel.id == agent_id).first()
+        if not a:
+            raise HTTPException(404, "agent not found")
+        cfg = copy.deepcopy(a.config or {})
+        sources = cfg.get("data_sources", [])
+        before_len = len(sources)
+        cfg["data_sources"] = [s for s in sources if s.get("name") != source_name]
+        if len(cfg["data_sources"]) == before_len:
+            raise HTTPException(404, "data source not found")
+        a.config = cfg
+        db.commit()
+        log_event(agent_id, "datasource.removed", {"name": source_name})
+        return {"ok": True, "removed": source_name, "remaining": len(cfg["data_sources"])}
+    finally:
+        db.close()
 
 
 # ──────────────────────────────────────────────── integration code generation
@@ -1033,9 +2298,14 @@ def remove_data_source(agent_id: str, source_name: str):
 @app.get("/api/agents/{agent_id}/integration/{fmt}")
 def generate_integration(agent_id: str, fmt: str):
     """Generate client integration code for an agent."""
-    a = AGENTS.get(agent_id)
-    if not a:
-        raise HTTPException(404, "agent not found")
+    db = SessionLocal()
+    try:
+        a_row = db.query(AgentModel).filter(AgentModel.id == agent_id).first()
+        if not a_row:
+            raise HTTPException(404, "agent not found")
+        a = _agent_to_dict(a_row)
+    finally:
+        db.close()
 
     endpoint = a.get("endpoint", {})
     ep_url = endpoint.get("url") or "http://localhost:3000/api/agents/{agent_id}/run"
@@ -1129,12 +2399,130 @@ class RunIn(BaseModel):
     claim: str
 
 
-# Log of real agent runs, per agent id.
-RUNS: dict[str, list] = {}
+def _save_run_to_db(agent_id: str, rec: dict):
+    """Persist a run record to the database, fire webhooks, and create notifications."""
+    try:
+        db = SessionLocal()
+        run = RunModel(
+            id=gen_id(), agent_id=agent_id,
+            claim=rec.get("claim", ""),
+            outcome=rec.get("outcome", ""),
+            published=rec.get("published", False),
+            steps_used=rec.get("steps_used", 0),
+            config_version=rec.get("config_version", 1),
+            provider=rec.get("provider", ""),
+            model=rec.get("model", ""),
+            trace=rec.get("trace", []),
+            detail=rec.get("detail", {}),
+            input_tokens=rec.get("input_tokens", 0),
+            output_tokens=rec.get("output_tokens", 0),
+            total_tokens=rec.get("total_tokens", 0),
+            user_id=rec.get("user_id"),
+            started_at=datetime.fromisoformat(rec["started_at"]) if rec.get("started_at") else utcnow(),
+            finished_at=datetime.fromisoformat(rec["finished_at"]) if rec.get("finished_at") else utcnow(),
+        )
+        db.add(run)
+        db.commit()
+        # Look up agent name for notifications
+        agent_name = agent_id
+        agent_row = db.query(AgentModel).filter(AgentModel.id == agent_id).first()
+        if agent_row:
+            agent_name = agent_row.name or agent_id
+        db.close()
+    except Exception:
+        agent_name = agent_id
+
+    # Feed run data into the Adaptive Runtime engine
+    try:
+        started = datetime.fromisoformat(rec["started_at"]) if rec.get("started_at") else utcnow()
+        finished = datetime.fromisoformat(rec["finished_at"]) if rec.get("finished_at") else utcnow()
+        latency_ms = (finished - started).total_seconds() * 1000 if started and finished else 0
+        _car_engine.record_run(agent_id, {
+            "provider": rec.get("provider", "unknown"),
+            "model": rec.get("model", "unknown"),
+            "task_type": rec.get("task_type", "general"),
+            "tokens": rec.get("total_tokens", 0),
+            "latency_ms": latency_ms,
+            "cost": rec.get("cost", 0.0),
+            "success": rec.get("outcome", "") == "COMPLETED",
+        })
+    except Exception:
+        pass  # CAR is best-effort; never block the run pipeline
+
+    # Feed the observability engine (metrics, SLOs, logs, traces) — best-effort
+    try:
+        started = datetime.fromisoformat(rec["started_at"]) if rec.get("started_at") else utcnow()
+        finished = datetime.fromisoformat(rec["finished_at"]) if rec.get("finished_at") else utcnow()
+        duration_s = (finished - started).total_seconds() if started and finished else 0.0
+        outcome_norm = "success" if rec.get("outcome", "") == "COMPLETED" else rec.get("outcome", "error").lower()
+        obs.record_run(
+            agent_id=agent_id, run_id=rec.get("run_id", ""),
+            duration_seconds=duration_s, outcome=outcome_norm,
+            tokens_used=rec.get("total_tokens", 0), user_id=rec.get("user_id"),
+        )
+    except Exception:
+        pass
+
+    # Meter usage and attribute cost — best-effort
+    try:
+        usage_tracker.record(
+            agent_id=agent_id, user_id=rec.get("user_id") or "system",
+            provider=rec.get("provider", ""), model=rec.get("model", ""),
+            input_tokens=rec.get("input_tokens", 0),
+            output_tokens=rec.get("output_tokens", 0),
+            run_id=rec.get("run_id"),
+        )
+    except Exception:
+        pass
+
+    # Stream the run completion to any live WebSocket subscribers — best-effort
+    try:
+        stream_manager.emit_run_complete(
+            agent_id, rec.get("run_id", ""), rec.get("outcome", ""),
+            (rec.get("detail") or {}).get("summary", ""),
+        )
+    except Exception:
+        pass
+
+    # Fire webhooks based on outcome
+    outcome = rec.get("outcome", "")
+    event_map = {"COMPLETED": "run.completed", "ESCALATED": "run.escalated", "ERROR": "run.error"}
+    event = event_map.get(outcome)
+    if event:
+        _fire_webhooks(agent_id, event, {
+            "outcome": outcome, "claim": rec.get("claim", "")[:200],
+            "steps_used": rec.get("steps_used", 0),
+            "total_tokens": rec.get("total_tokens", 0),
+            "summary": (rec.get("detail") or {}).get("summary", "")[:300],
+        })
+
+    # Create in-app notification for the agent owner
+    user_id = rec.get("user_id")
+    if user_id:
+        if outcome == "ERROR":
+            _create_notification(user_id, agent_id, "run.error",
+                                 f"Agent '{agent_name}' encountered an error",
+                                 (rec.get("detail") or {}).get("reason", "")[:200])
+        elif outcome == "ESCALATED":
+            _create_notification(user_id, agent_id, "run.escalated",
+                                 f"Agent '{agent_name}' escalated a case",
+                                 rec.get("claim", "")[:200])
+
+    # Create attestation record
+    _create_attestation(
+        agent_id=agent_id, run_id=rec.get("run_id"),
+        sess={"user_id": rec.get("user_id", ""), "email": rec.get("user_email", "")},
+        action="run.execute", action_input=rec.get("claim", ""),
+        action_result=outcome,
+        action_summary=(rec.get("detail") or {}).get("summary", ""),
+        provider=rec.get("provider", ""), model=rec.get("model", ""),
+        input_tokens=rec.get("input_tokens", 0),
+        output_tokens=rec.get("output_tokens", 0),
+    )
 
 
 @app.post("/api/agents/{agent_id}/run")
-def run_live_agent(agent_id: str, body: RunIn):
+def run_live_agent(agent_id: str, body: RunIn, request: Request):
     """
     Execute an agent using its CURRENT Cortex config.
     Behavior depends on the agent's endpoint type:
@@ -1142,14 +2530,23 @@ def run_live_agent(agent_id: str, body: RunIn):
     - rest: POST to the agent's configured endpoint URL
     - webhook: Return instructions for the client to send data
     """
-    a = AGENTS.get(agent_id)
-    if not a:
-        raise HTTPException(404, "agent not found")
-    if not a.get("live"):
-        raise HTTPException(400, "this agent is not marked as live")
+    sess = _get_session(request)
+    if sess and not _check_scope(sess, "agents:run"):
+        raise HTTPException(403, "API key missing required scope: agents:run")
+    db = SessionLocal()
+    try:
+        a_row = db.query(AgentModel).filter(AgentModel.id == agent_id).first()
+        if not a_row:
+            raise HTTPException(404, "agent not found")
+        if not a_row.live:
+            raise HTTPException(400, "this agent is not marked as live")
+        a = _agent_to_dict(a_row)
+        a_version = a_row.version or 1
+    finally:
+        db.close()
 
     run_start = datetime.now(timezone.utc).isoformat()
-    log_event(agent_id, "run.start", {"input": body.claim[:200], "config_version": a["version"]})
+    log_event(agent_id, "run.start", {"input": body.claim[:200], "config_version": a_version})
 
     cfg = a["config"]
     endpoint = a.get("endpoint", {})
@@ -1160,23 +2557,14 @@ def run_live_agent(agent_id: str, body: RunIn):
         log_event(agent_id, "run.webhook_info", {"endpoint": endpoint.get("url", "")})
         webhook_now = datetime.now(timezone.utc).isoformat()
         rec = {
-            "claim": body.claim,
-            "outcome": "WEBHOOK_PENDING",
-            "published": False,
-            "steps_used": 0,
-            "config_version": a["version"],
-            "provider": "webhook",
-            "model": "",
+            "claim": body.claim, "outcome": "WEBHOOK_PENDING", "published": False,
+            "steps_used": 0, "config_version": a_version,
+            "provider": "webhook", "model": "",
             "trace": [{"kind": "info", "text": f"Send data to webhook: {endpoint.get('url', 'not configured')}"}],
-            "started_at": run_start,
-            "finished_at": webhook_now,
-            "detail": {
-                "summary": f"Webhook agent — POST your data to the configured endpoint or use /webhooks/{agent_id}/{{event_type}}",
-                "reason": "", "citations": [], "route_to": None
-            }
+            "started_at": run_start, "finished_at": webhook_now,
+            "detail": {"summary": f"Webhook agent — POST your data to the configured endpoint or use /webhooks/{agent_id}/{{event_type}}", "reason": "", "citations": [], "route_to": None}
         }
-        RUNS.setdefault(agent_id, []).insert(0, rec)
-        del RUNS[agent_id][12:]
+        _save_run_to_db(agent_id, rec)
         return {"ok": True, "run": rec}
 
     # ── REST endpoint: proxy to external URL ──
@@ -1192,27 +2580,25 @@ def run_live_agent(agent_id: str, body: RunIn):
             rest_err_end = datetime.now(timezone.utc).isoformat()
             rec = {
                 "claim": body.claim, "outcome": "ERROR", "published": False,
-                "steps_used": 0, "config_version": a["version"],
+                "steps_used": 0, "config_version": a_version,
                 "provider": "rest", "model": "",
                 "trace": [{"kind": "error", "text": str(e)}],
                 "started_at": run_start, "finished_at": rest_err_end,
                 "detail": {"summary": "", "reason": str(e), "citations": [], "route_to": None}
             }
-            RUNS.setdefault(agent_id, []).insert(0, rec)
-            del RUNS[agent_id][12:]
+            _save_run_to_db(agent_id, rec)
             return {"ok": False, "error": str(e), "run": rec}
 
         rest_end = datetime.now(timezone.utc).isoformat()
         rec = {
             "claim": body.claim, "outcome": "COMPLETED", "published": True,
-            "steps_used": 1, "config_version": a["version"],
+            "steps_used": 1, "config_version": a_version,
             "provider": "rest", "model": "",
             "trace": [{"kind": "rest_call", "url": endpoint["url"], "status": "ok"}],
             "started_at": run_start, "finished_at": rest_end,
             "detail": {"summary": json.dumps(result)[:1200], "reason": "", "citations": [], "route_to": None}
         }
-        RUNS.setdefault(agent_id, []).insert(0, rec)
-        del RUNS[agent_id][12:]
+        _save_run_to_db(agent_id, rec)
         log_event(agent_id, "run.complete", {"steps": 1, "published": True})
         return {"ok": True, "run": rec}
 
@@ -1227,7 +2613,6 @@ def run_live_agent(agent_id: str, body: RunIn):
     tools_cfg = cfg.get("tools", [])
     execution = cfg.get("execution", {})
 
-    # Build system prompt from agent config
     system_parts = [f"You are {a.get('name', agent_id)}."]
     if a.get("description"):
         system_parts.append(a["description"])
@@ -1242,20 +2627,14 @@ def run_live_agent(agent_id: str, body: RunIn):
         system_parts.append(f"- available tools: {', '.join(t['name'] for t in tools_cfg)}")
     system = "\n".join(system_parts)
 
-    # Build tool definitions for the provider
     tools = []
     for t in tools_cfg:
         tools.append({
-            "name": t["name"],
-            "description": t.get("description", ""),
-            "input_schema": {
-                "type": "object",
-                "properties": {p: {"type": "string"} for p in t.get("parameters", [])},
-            }
+            "name": t["name"], "description": t.get("description", ""),
+            "input_schema": {"type": "object", "properties": {p: {"type": "string"} for p in t.get("parameters", [])}}
         })
 
     def _default_tool_handler(name, input_data):
-        """Default tool handler that returns a placeholder response."""
         return f"[Tool '{name}' called with {json.dumps(input_data)}. No handler registered — returning placeholder.]"
 
     res = providers_mod.run_tool_loop(
@@ -1279,30 +2658,35 @@ def run_live_agent(agent_id: str, body: RunIn):
         log_event(agent_id, "run.error", {"message": res.get("error", "unknown error")})
 
     run_end = datetime.now(timezone.utc).isoformat()
+    sess = _get_session(body._request) if hasattr(body, '_request') else None
     rec = {
         "claim": body.claim, "outcome": outcome, "published": published,
-        "steps_used": res["steps_used"], "config_version": a["version"],
+        "steps_used": res["steps_used"], "config_version": a_version,
         "provider": provider,
         "model": model_cfg.get("model_name") or get_model(provider),
-        "trace": trace,
-        "started_at": run_start,
-        "finished_at": run_end,
-        "detail": {
-            "summary": (res.get("final_text") or "")[:1200],
-            "reason": res.get("error", ""),
-            "citations": [],
-            "route_to": None
-        }
+        "trace": trace, "started_at": run_start, "finished_at": run_end,
+        "input_tokens": res.get("input_tokens", 0),
+        "output_tokens": res.get("output_tokens", 0),
+        "total_tokens": res.get("total_tokens", 0),
+        "detail": {"summary": (res.get("final_text") or "")[:1200], "reason": res.get("error", ""), "citations": [], "route_to": None}
     }
-    RUNS.setdefault(agent_id, []).insert(0, rec)
-    del RUNS[agent_id][12:]
+    _save_run_to_db(agent_id, rec)
 
-    hist = RUNS[agent_id]
-    done = [r for r in hist if r["outcome"] != "ERROR"]
-    if done:
-        a["containment"] = round(100 * sum(1 for r in done if r["published"]) / len(done))
-        a["escalation"] = round(100 * sum(1 for r in done if r["outcome"] == "ESCALATED") / len(done))
-        a["resolution"] = round(100 * len(done) / len(hist))
+    # Update agent metrics
+    db = SessionLocal()
+    try:
+        a_row = db.query(AgentModel).filter(AgentModel.id == agent_id).first()
+        if a_row:
+            all_runs = db.query(RunModel).filter(RunModel.agent_id == agent_id).order_by(RunModel.started_at.desc()).limit(12).all()
+            done = [r for r in all_runs if r.outcome != "ERROR"]
+            if done:
+                a_row.containment = round(100 * sum(1 for r in done if r.published) / len(done))
+                a_row.escalation = round(100 * sum(1 for r in done if r.outcome == "ESCALATED") / len(done))
+                a_row.resolution = round(100 * len(done) / len(all_runs)) if all_runs else 0
+            db.commit()
+    finally:
+        db.close()
+
     if res["ok"]:
         return {"ok": True, "run": rec}
     return {"ok": False, "error": res.get("error", "run failed"), "run": rec}
@@ -1310,7 +2694,20 @@ def run_live_agent(agent_id: str, body: RunIn):
 
 @app.get("/api/agents/{agent_id}/runs")
 def agent_runs(agent_id: str):
-    return {"agent_id": agent_id, "runs": RUNS.get(agent_id, [])}
+    db = SessionLocal()
+    try:
+        runs = db.query(RunModel).filter(RunModel.agent_id == agent_id).order_by(RunModel.started_at.desc()).limit(20).all()
+        return {"agent_id": agent_id, "runs": [
+            {"claim": r.claim, "outcome": r.outcome, "published": r.published,
+             "steps_used": r.steps_used, "config_version": r.config_version,
+             "provider": r.provider, "model": r.model,
+             "trace": r.trace or [], "started_at": r.started_at.isoformat() if r.started_at else "",
+             "finished_at": r.finished_at.isoformat() if r.finished_at else "",
+             "detail": r.detail or {}}
+            for r in runs
+        ]}
+    finally:
+        db.close()
 
 
 @app.get("/api/events")
@@ -1325,26 +2722,36 @@ def get_events(agent_id: str = None, limit: int = 100):
 @app.get("/api/agents/{agent_id}/diagnosis")
 def get_agent_diagnosis(agent_id: str):
     """Get diagnostic analysis for an agent."""
-    if agent_id not in AGENTS:
-        raise HTTPException(404, "agent not found")
+    db = SessionLocal()
+    try:
+        a = db.query(AgentModel).filter(AgentModel.id == agent_id).first()
+        if not a:
+            raise HTTPException(404, "agent not found")
+    finally:
+        db.close()
     return diagnose_agent(agent_id)
 
 
 @app.get("/api/metrics/portfolio")
 def portfolio_metrics():
-    running = [a for a in AGENTS.values() if a["status"] == "running"]
-    n = len(running) or 1
-    return {
-        "agents_active": len(running),
-        "avg_containment": round(sum(a["containment"] for a in running) / n, 1),
-        "avg_resolution": round(sum(a["resolution"] for a in running) / n, 1),
-        "avg_escalation": round(sum(a["escalation"] for a in running) / n, 1),
-        "total_clinical_flags": sum(a["clinical_flags"] for a in running),
-        "health_score": round(
-            sum(a["containment"] for a in running) / n * 0.4
-            + sum(a["resolution"] for a in running) / n * 0.4
-            + (100 - sum(a["escalation"] for a in running) / n) * 0.2, 0),
-    }
+    db = SessionLocal()
+    try:
+        agents = db.query(AgentModel).all()
+        running = [a for a in agents if a.status == "running"]
+        n = len(running) or 1
+        return {
+            "agents_active": len(running),
+            "avg_containment": round(sum(a.containment or 0 for a in running) / n, 1),
+            "avg_resolution": round(sum(a.resolution or 0 for a in running) / n, 1),
+            "avg_escalation": round(sum(a.escalation or 0 for a in running) / n, 1),
+            "total_clinical_flags": 0,
+            "health_score": round(
+                sum(a.containment or 0 for a in running) / n * 0.4
+                + sum(a.resolution or 0 for a in running) / n * 0.4
+                + (100 - sum(a.escalation or 0 for a in running) / n) * 0.2, 0),
+        }
+    finally:
+        db.close()
 
 # Diagnostics: two worked examples — one config issue, one platform bug.
 DIAGNOSTICS = [
@@ -1372,12 +2779,15 @@ DIAGNOSTICS = [
 
 @app.get("/api/diagnostics")
 def diagnostics():
-    # attach current status so the view stays in sync with the store
-    out = []
-    for d in DIAGNOSTICS:
-        a = AGENTS.get(d["agent_id"], {})
-        out.append({**d, "status": a.get("status"), "clinical_flags": a.get("clinical_flags")})
-    return {"cases": out}
+    db = SessionLocal()
+    try:
+        out = []
+        for d in DIAGNOSTICS:
+            a = db.query(AgentModel).filter(AgentModel.id == d["agent_id"]).first()
+            out.append({**d, "status": a.status if a else None, "clinical_flags": 0})
+        return {"cases": out}
+    finally:
+        db.close()
 
 class SettingsIn(BaseModel):
     active: str | None = None
@@ -1411,17 +2821,20 @@ def set_settings(body: SettingsIn):
                     SETTINGS["keys"][p] = k.strip()
     if body.models:
         for p, m in body.models.items():
-            if p in ("anthropic", "openai", "gemini") and m:
+            if p in providers_mod.ALL_PROVIDERS and m:
                 SETTINGS["models"][p] = m.strip()
     _save_settings(SETTINGS)
     return get_settings()
 
 
 @app.post("/api/settings/test/{provider}")
-def test_provider(provider: str):
+def test_provider(provider: str, request: Request, body: dict = None):
     if provider not in providers_mod.ALL_PROVIDERS:
         raise HTTPException(400, "unknown provider")
-    key = get_key(provider)
+    # Use key from request body if provided (for testing before saving), else fall back to stored
+    key = (body or {}).get("api_key", "").strip() if body else ""
+    if not key:
+        key = get_key(provider)
     if not key:
         return {"ok": False, "message": "No key set for this provider."}
     return providers_mod.test_connection(provider, key, get_model(provider))
@@ -1430,24 +2843,254 @@ def test_provider(provider: str):
 # ──────────────────────────────────────────────── automation endpoints
 @app.get("/api/agents/{agent_id}/automation")
 def get_automation(agent_id: str):
-    if agent_id not in AGENTS:
-        raise HTTPException(404, "agent not found")
+    db = SessionLocal()
+    try:
+        if not db.query(AgentModel).filter(AgentModel.id == agent_id).first():
+            raise HTTPException(404, "agent not found")
+    finally:
+        db.close()
     return automation_mod.get_agent_automation(agent_id)
 
 
 @app.post("/api/agents/{agent_id}/automation")
 def update_automation(agent_id: str, updates: dict):
-    if agent_id not in AGENTS:
-        raise HTTPException(404, "agent not found")
+    db = SessionLocal()
+    try:
+        if not db.query(AgentModel).filter(AgentModel.id == agent_id).first():
+            raise HTTPException(404, "agent not found")
+    finally:
+        db.close()
     result = automation_mod.update_agent_automation(agent_id, updates)
     return {"ok": True, "automation": result}
+
+
+# ── Analytics API ───────────────────────────────────────────────────
+
+@app.get("/api/analytics")
+def analytics_dashboard(request: Request, days: int = 30):
+    """Aggregated usage analytics: runs over time, token usage, success rates, top agents."""
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "not authenticated")
+    from datetime import timedelta
+    db = SessionLocal()
+    try:
+        cutoff = utcnow() - timedelta(days=days)
+        runs = db.query(RunModel).filter(RunModel.started_at >= cutoff).all()
+        agents = db.query(AgentModel).all()
+
+        # ── Runs per day ────────────────────────────────
+        runs_by_day = {}
+        tokens_by_day = {}
+        for r in runs:
+            day = r.started_at.strftime("%Y-%m-%d") if r.started_at else "unknown"
+            runs_by_day[day] = runs_by_day.get(day, 0) + 1
+            tokens_by_day[day] = tokens_by_day.get(day, 0) + (r.total_tokens or 0)
+
+        # Sort by date
+        sorted_days = sorted(runs_by_day.keys())
+        runs_series = [{"date": d, "count": runs_by_day[d]} for d in sorted_days]
+        tokens_series = [{"date": d, "tokens": tokens_by_day[d]} for d in sorted_days]
+
+        # ── Outcome breakdown ───────────────────────────
+        outcomes = {}
+        for r in runs:
+            o = r.outcome or "UNKNOWN"
+            outcomes[o] = outcomes.get(o, 0) + 1
+
+        # ── Top agents by run count ─────────────────────
+        agent_runs = {}
+        agent_tokens = {}
+        agent_names = {a.id: a.name for a in agents}
+        for r in runs:
+            aid = r.agent_id
+            agent_runs[aid] = agent_runs.get(aid, 0) + 1
+            agent_tokens[aid] = agent_tokens.get(aid, 0) + (r.total_tokens or 0)
+
+        top_agents = sorted(agent_runs.items(), key=lambda x: x[1], reverse=True)[:10]
+        top_agents_list = [
+            {"id": aid, "name": agent_names.get(aid, aid), "runs": cnt,
+             "tokens": agent_tokens.get(aid, 0)}
+            for aid, cnt in top_agents
+        ]
+
+        # ── Provider breakdown ──────────────────────────
+        providers = {}
+        models = {}
+        for r in runs:
+            p = r.provider or "unknown"
+            m = r.model or "unknown"
+            providers[p] = providers.get(p, 0) + 1
+            models[m] = models.get(m, 0) + 1
+
+        # ── Summary stats ───────────────────────────────
+        total_runs = len(runs)
+        total_tokens = sum(r.total_tokens or 0 for r in runs)
+        total_input = sum(r.input_tokens or 0 for r in runs)
+        total_output = sum(r.output_tokens or 0 for r in runs)
+        avg_tokens = round(total_tokens / total_runs) if total_runs else 0
+        completed = sum(1 for r in runs if r.outcome == "COMPLETED")
+        escalated = sum(1 for r in runs if r.outcome == "ESCALATED")
+        errored = sum(1 for r in runs if r.outcome == "ERROR")
+        success_rate = round(completed / total_runs * 100, 1) if total_runs else 0
+
+        # ── Avg latency (runs with both timestamps) ────
+        latencies = []
+        for r in runs:
+            if r.started_at and r.finished_at:
+                dt = (r.finished_at - r.started_at).total_seconds()
+                if dt >= 0:
+                    latencies.append(dt)
+        avg_latency = round(sum(latencies) / len(latencies), 2) if latencies else 0
+        p95_latency = round(sorted(latencies)[int(len(latencies) * 0.95)] if latencies else 0, 2)
+
+        return {
+            "period_days": days,
+            "summary": {
+                "total_runs": total_runs,
+                "total_tokens": total_tokens,
+                "input_tokens": total_input,
+                "output_tokens": total_output,
+                "avg_tokens_per_run": avg_tokens,
+                "success_rate": success_rate,
+                "completed": completed,
+                "escalated": escalated,
+                "errored": errored,
+                "avg_latency_s": avg_latency,
+                "p95_latency_s": p95_latency,
+                "active_agents": len([a for a in agents if a.status == "running"]),
+                "total_agents": len(agents),
+            },
+            "runs_by_day": runs_series,
+            "tokens_by_day": tokens_series,
+            "outcomes": outcomes,
+            "top_agents": top_agents_list,
+            "providers": providers,
+            "models": models,
+        }
+    finally:
+        db.close()
+
+
+# ── CAR (Cortex Adaptive Runtime) API ──────────────────────────────
+
+@app.get("/api/car/health")
+def car_health(request: Request):
+    """Platform-wide health from the Adaptive Runtime."""
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "not authenticated")
+    return _car_engine.health()
+
+
+@app.get("/api/car/fingerprint/{agent_id}")
+def car_fingerprint(agent_id: str, request: Request):
+    """Behavioral fingerprint for one agent."""
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "not authenticated")
+    return _car_engine.fingerprint(agent_id)
+
+
+@app.get("/api/car/fingerprints")
+def car_fingerprints_all(request: Request):
+    """All agent fingerprints."""
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "not authenticated")
+    return {aid: fp.snapshot() for aid, fp in _car_engine.fingerprints.items()}
+
+
+@app.post("/api/car/route")
+def car_route(request: Request, body: dict):
+    """Adaptive routing: pick optimal provider/model for a task."""
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "not authenticated")
+    agent_id = body.get("agent_id", "unknown")
+    task_type = body.get("task_type", "general")
+    providers = body.get("providers", [])
+    optimize = body.get("optimize_for", "balanced")
+    if not providers:
+        raise HTTPException(400, "providers list required")
+    return _car_engine.route(agent_id, task_type, providers, optimize)
+
+
+@app.post("/api/car/predict")
+def car_predict(request: Request, body: dict):
+    """Pre-execution run prediction."""
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "not authenticated")
+    return _car_engine.predict(
+        agent_id=body.get("agent_id", "unknown"),
+        provider=body.get("provider", "unknown"),
+        model=body.get("model", "unknown"),
+        prompt_tokens=body.get("prompt_tokens", 500),
+        tool_count=body.get("tool_count", 0),
+        system_tokens=body.get("system_tokens", 0),
+        task_type=body.get("task_type", "general"),
+    )
+
+
+@app.get("/api/car/leaderboard/{task_type}")
+def car_leaderboard(task_type: str, request: Request):
+    """Provider/model leaderboard for a task type."""
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "not authenticated")
+    return _car_engine.routing_leaderboard(task_type)
+
+
+@app.get("/api/car/pressure")
+def car_pressure(request: Request):
+    """Which metric dimension drives the most drift fleet-wide."""
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "not authenticated")
+    return _car_engine.pressure()
+
+
+@app.get("/api/car/audit")
+def car_audit(request: Request, limit: int = 50, agent_id: str = None):
+    """Recent CAR audit trail."""
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "not authenticated")
+    return _car_engine.get_audit_log(limit=limit, agent_id=agent_id)
+
+
+@app.get("/api/car/state")
+def car_state(request: Request):
+    """Full CAR engine state snapshot."""
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "not authenticated")
+    return _car_engine.state_snapshot()
+
+
+@app.post("/api/car/policy")
+def car_update_policy(request: Request, body: dict):
+    """Update CAR prediction policy (governed, versioned)."""
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "not authenticated")
+    return _car_engine.update_prediction_policy(
+        weights=body.get("weights"),
+        thresholds=body.get("thresholds"),
+        by=sess.get("email", "admin"),
+    )
 
 
 @app.post("/webhooks/{agent_id}/{event_type}")
 def webhook_trigger(agent_id: str, event_type: str):
     """Webhook endpoint for event-triggered agent execution."""
-    if agent_id not in AGENTS:
-        raise HTTPException(404, "agent not found")
+    db = SessionLocal()
+    try:
+        if not db.query(AgentModel).filter(AgentModel.id == agent_id).first():
+            raise HTTPException(404, "agent not found")
+    finally:
+        db.close()
 
     should_run, reason = automation_mod.check_event_trigger(agent_id, event_type)
     if not should_run:
@@ -1457,6 +3100,788 @@ def webhook_trigger(agent_id: str, event_type: str):
     # For now, just record that the event was received
     automation_mod.record_run(agent_id, success=True)
     return {"ok": True, "executed": True, "agent_id": agent_id, "event": event_type}
+
+
+# ═══════════════════════════════════════════════════════════════
+#  OBSERVABILITY  (metrics · traces · logs · alerts · SLOs · health)
+# ═══════════════════════════════════════════════════════════════
+
+@app.get("/api/observability/summary")
+def obs_summary(request: Request):
+    if not _get_session(request):
+        raise HTTPException(401, "not authenticated")
+    return obs.dashboard_summary()
+
+@app.get("/api/observability/metrics")
+def obs_metrics(request: Request, name: str = None, window: int = 300, last_n: int = 24):
+    if not _get_session(request):
+        raise HTTPException(401, "not authenticated")
+    return {"series": obs.metrics.query(name=name, window=window, last_n=last_n),
+            "current_gauges": obs.metrics.current_gauges()}
+
+@app.get("/api/observability/traces")
+def obs_traces(request: Request, has_errors: bool = None, limit: int = 50):
+    if not _get_session(request):
+        raise HTTPException(401, "not authenticated")
+    return {"traces": obs.traces.list_traces(has_errors=has_errors, limit=limit),
+            "stats": obs.traces.stats()}
+
+@app.get("/api/observability/traces/{trace_id}")
+def obs_trace_detail(trace_id: str, request: Request):
+    if not _get_session(request):
+        raise HTTPException(401, "not authenticated")
+    trace = obs.traces.get_trace(trace_id)
+    if not trace:
+        raise HTTPException(404, "trace not found")
+    return trace
+
+@app.get("/api/observability/service-map")
+def obs_service_map(request: Request):
+    if not _get_session(request):
+        raise HTTPException(401, "not authenticated")
+    return obs.traces.service_map()
+
+@app.get("/api/observability/logs")
+def obs_logs(request: Request, q: str = None, level: str = None, source: str = None,
+             trace_id: str = None, limit: int = 100, offset: int = 0):
+    if not _get_session(request):
+        raise HTTPException(401, "not authenticated")
+    return obs.logs.search(query=q, level=level, source=source, trace_id=trace_id,
+                           limit=limit, offset=offset)
+
+@app.get("/api/observability/logs/errors")
+def obs_error_groups(request: Request):
+    if not _get_session(request):
+        raise HTTPException(401, "not authenticated")
+    return {"error_groups": obs.logs.error_groups(),
+            "throughput": obs.logs.throughput()}
+
+@app.get("/api/observability/alerts")
+def obs_alerts(request: Request, status: str = None, severity: str = None):
+    if not _get_session(request):
+        raise HTTPException(401, "not authenticated")
+    return {"alerts": obs.alerts.list_alerts(status=status, severity=severity),
+            "rules": obs.alerts.list_rules(), "stats": obs.alerts.stats()}
+
+class AlertRuleIn(BaseModel):
+    name: str
+    metric: str
+    condition: str = "gt"
+    threshold: float = 0.0
+    window_seconds: int = 300
+    severity: str = "warning"
+    description: str = ""
+    notification_channels: list = []
+    min_breaches: int = 1
+
+@app.post("/api/observability/alerts/rules")
+def obs_create_rule(body: AlertRuleIn, request: Request):
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "not authenticated")
+    return obs.alerts.create_rule(
+        name=body.name, metric=body.metric, condition=body.condition,
+        threshold=body.threshold, window_seconds=body.window_seconds,
+        severity=body.severity, description=body.description,
+        notification_channels=body.notification_channels,
+        min_breaches=body.min_breaches, created_by=sess.get("user_id"))
+
+@app.delete("/api/observability/alerts/rules/{rule_id}")
+def obs_delete_rule(rule_id: str, request: Request):
+    if not _get_session(request):
+        raise HTTPException(401, "not authenticated")
+    return obs.alerts.delete_rule(rule_id)
+
+@app.post("/api/observability/alerts/{alert_id}/acknowledge")
+def obs_ack_alert(alert_id: str, request: Request):
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "not authenticated")
+    return obs.alerts.acknowledge(alert_id, sess.get("user_id", "unknown"))
+
+@app.post("/api/observability/alerts/{alert_id}/resolve")
+def obs_resolve_alert(alert_id: str, request: Request):
+    if not _get_session(request):
+        raise HTTPException(401, "not authenticated")
+    return obs.alerts.resolve(alert_id)
+
+@app.post("/api/observability/alerts/evaluate")
+def obs_evaluate(request: Request):
+    if not _get_session(request):
+        raise HTTPException(401, "not authenticated")
+    return {"fired": obs.check_alerts()}
+
+@app.get("/api/observability/slos")
+def obs_slos(request: Request):
+    if not _get_session(request):
+        raise HTTPException(401, "not authenticated")
+    return {"slos": obs.slos.list_slos(), "stats": obs.slos.stats(),
+            "burn_rate_alerts": obs.slos.burn_rate_alerts()}
+
+@app.get("/api/observability/health")
+def obs_health(request: Request):
+    if not _get_session(request):
+        raise HTTPException(401, "not authenticated")
+    # Score every active agent from its recent run stats
+    db = SessionLocal()
+    try:
+        agents = db.query(AgentModel).filter(
+            (AgentModel.is_deleted == False) | (AgentModel.is_deleted == None)  # noqa: E711,E712
+        ).all()
+        for a in agents:
+            runs = db.query(RunModel).filter(RunModel.agent_id == a.id).order_by(
+                RunModel.started_at.desc()).limit(50).all()
+            total = len(runs)
+            success = sum(1 for r in runs if r.outcome == "COMPLETED")
+            latencies = []
+            for r in runs:
+                if r.started_at and r.finished_at:
+                    latencies.append((r.finished_at - r.started_at).total_seconds())
+            latencies.sort()
+            p95 = latencies[int(len(latencies) * 0.95)] if latencies else 0
+            recent_errors = sum(1 for r in runs[:10] if r.outcome == "ERROR")
+            past_errors = sum(1 for r in runs[10:30] if r.outcome == "ERROR")
+            obs.health.score(a.id, {
+                "total_runs": total, "success_runs": success, "p95_latency": p95,
+                "recent_errors": recent_errors, "past_errors": past_errors,
+                "runs_per_hour": 1, "expected_runs_per_hour": 1, "uptime_pct": 100,
+            })
+    finally:
+        db.close()
+    return obs.health.fleet_health()
+
+
+# ═══════════════════════════════════════════════════════════════
+#  USAGE & COST
+# ═══════════════════════════════════════════════════════════════
+
+@app.get("/api/usage/dashboard")
+def usage_dashboard(request: Request):
+    if not _get_session(request):
+        raise HTTPException(401, "not authenticated")
+    return usage_tracker.dashboard()
+
+@app.get("/api/usage/agent/{agent_id}")
+def usage_agent(agent_id: str, request: Request):
+    if not _get_session(request):
+        raise HTTPException(401, "not authenticated")
+    return {"agent_id": agent_id, "usage": usage_tracker.agent_cost(agent_id),
+            "budget": usage_tracker.budget_status(agent_id),
+            "recent": usage_tracker.recent_records(agent_id=agent_id, limit=50)}
+
+@app.get("/api/usage/pricing")
+def usage_pricing(request: Request):
+    if not _get_session(request):
+        raise HTTPException(401, "not authenticated")
+    return {"pricing": usage_tracker.calculator.all_prices()}
+
+class BudgetIn(BaseModel):
+    scope: str = "_fleet"
+    daily_limit: float = None
+    monthly_limit: float = None
+
+@app.post("/api/usage/budget")
+def usage_set_budget(body: BudgetIn, request: Request):
+    if not _get_session(request):
+        raise HTTPException(401, "not authenticated")
+    return usage_tracker.set_budget(body.scope, body.daily_limit, body.monthly_limit)
+
+class PriceIn(BaseModel):
+    model: str
+    input_price: float
+    output_price: float
+
+@app.post("/api/usage/pricing")
+def usage_set_price(body: PriceIn, request: Request):
+    if not _get_session(request):
+        raise HTTPException(401, "not authenticated")
+    usage_tracker.calculator.set_price(body.model, body.input_price, body.output_price)
+    return {"ok": True, "model": body.model}
+
+
+# ═══════════════════════════════════════════════════════════════
+#  TEAMS / WORKSPACES  (multi-tenant)
+# ═══════════════════════════════════════════════════════════════
+
+@app.get("/api/teams/roles")
+def teams_roles(request: Request):
+    if not _get_session(request):
+        raise HTTPException(401, "not authenticated")
+    return {"roles": team_manager.roles_catalog()}
+
+@app.get("/api/teams")
+def teams_list(request: Request):
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "not authenticated")
+    db = SessionLocal()
+    try:
+        return {"workspaces": team_manager.list_workspaces_for_user(db, sess["user_id"])}
+    finally:
+        db.close()
+
+class WorkspaceIn(BaseModel):
+    name: str
+    plan: str = "free"
+
+@app.post("/api/teams")
+def teams_create(body: WorkspaceIn, request: Request):
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "not authenticated")
+    db = SessionLocal()
+    try:
+        return team_manager.create_workspace(db, body.name, sess["user_id"], body.plan)
+    finally:
+        db.close()
+
+@app.get("/api/teams/{workspace_id}/members")
+def teams_members(workspace_id: str, request: Request):
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "not authenticated")
+    db = SessionLocal()
+    try:
+        if not team_manager.get_member_role(db, workspace_id, sess["user_id"]):
+            raise HTTPException(403, "not a member of this workspace")
+        return {"members": team_manager.list_members(db, workspace_id),
+                "invites": team_manager.list_invites(db, workspace_id)}
+    finally:
+        db.close()
+
+class InviteIn(BaseModel):
+    email: str
+    role: str = "operator"
+
+@app.post("/api/teams/{workspace_id}/invite")
+def teams_invite(workspace_id: str, body: InviteIn, request: Request):
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "not authenticated")
+    db = SessionLocal()
+    try:
+        if not team_manager.can(db, workspace_id, sess["user_id"], "members:invite"):
+            raise HTTPException(403, "insufficient permissions")
+        return team_manager.invite(db, workspace_id, body.email, body.role, sess["user_id"])
+    finally:
+        db.close()
+
+class RoleUpdateIn(BaseModel):
+    role: str
+
+@app.post("/api/teams/{workspace_id}/members/{user_id}/role")
+def teams_update_role(workspace_id: str, user_id: str, body: RoleUpdateIn, request: Request):
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "not authenticated")
+    db = SessionLocal()
+    try:
+        if not team_manager.can(db, workspace_id, sess["user_id"], "members:invite"):
+            raise HTTPException(403, "insufficient permissions")
+        return team_manager.update_member_role(db, workspace_id, user_id, body.role, sess["user_id"])
+    finally:
+        db.close()
+
+@app.delete("/api/teams/{workspace_id}/members/{user_id}")
+def teams_remove_member(workspace_id: str, user_id: str, request: Request):
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "not authenticated")
+    db = SessionLocal()
+    try:
+        if not team_manager.can(db, workspace_id, sess["user_id"], "members:remove"):
+            raise HTTPException(403, "insufficient permissions")
+        return team_manager.remove_member(db, workspace_id, user_id)
+    finally:
+        db.close()
+
+class AcceptInviteIn(BaseModel):
+    token: str
+
+@app.post("/api/teams/accept-invite")
+def teams_accept(body: AcceptInviteIn, request: Request):
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "not authenticated")
+    db = SessionLocal()
+    try:
+        return team_manager.accept_invite(db, body.token, sess["user_id"])
+    finally:
+        db.close()
+
+
+# ═══════════════════════════════════════════════════════════════
+#  VERSIONS & RECOVERY  (recycle bin, rollback, rebuild)
+# ═══════════════════════════════════════════════════════════════
+
+@app.get("/api/agents/{agent_id}/versions")
+def agent_versions(agent_id: str, request: Request):
+    if not _get_session(request):
+        raise HTTPException(401, "not authenticated")
+    db = SessionLocal()
+    try:
+        rows = list_agent_versions(db, agent_id)
+        return {"agent_id": agent_id,
+                "versions": [{
+                    "version": r.version, "name": r.name,
+                    "change_type": r.change_type, "change_summary": r.change_summary,
+                    "changed_by": r.changed_by, "changer_email": r.changer_email,
+                    "diff": r.diff, "record_hash": r.record_hash[:12],
+                    "created_at": r.created_at.isoformat() if r.created_at else None,
+                } for r in rows],
+                "integrity": verify_version_chain(db, agent_id)}
+    finally:
+        db.close()
+
+@app.post("/api/agents/{agent_id}/versions/{version}/restore")
+def agent_restore_version(agent_id: str, version: int, request: Request):
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "not authenticated")
+    db = SessionLocal()
+    try:
+        a = db.query(AgentModel).filter(AgentModel.id == agent_id).first()
+        if not a:
+            raise HTTPException(404, "agent not found")
+        result = restore_agent_version(db, a, version,
+                                       restored_by=sess.get("user_id"),
+                                       changer_email=sess.get("email", ""))
+        if not result.get("ok"):
+            raise HTTPException(400, result.get("error", "restore failed"))
+        log_event(agent_id, "agent.version_restored",
+                  {"from_version": version, "by": sess.get("email", "")})
+        return result
+    finally:
+        db.close()
+
+@app.get("/api/recycle-bin")
+def recycle_bin(request: Request):
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "not authenticated")
+    db = SessionLocal()
+    try:
+        owner = None if sess.get("is_admin") else sess.get("user_id")
+        agents = list_recycle_bin(db, owner_id=owner)
+        return {"deleted_agents": [{
+            "id": a.id, "name": a.name, "description": a.description or "",
+            "deleted_at": a.deleted_at.isoformat() if a.deleted_at else None,
+            "deleted_by": a.deleted_by,
+            "purge_after": a.purge_after.isoformat() if a.purge_after else None,
+            "version": a.version,
+        } for a in agents], "retention_days": RECYCLE_BIN_RETENTION_DAYS}
+    finally:
+        db.close()
+
+@app.post("/api/recycle-bin/{agent_id}/restore")
+def recycle_restore(agent_id: str, request: Request):
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "not authenticated")
+    db = SessionLocal()
+    try:
+        a = db.query(AgentModel).filter(AgentModel.id == agent_id).first()
+        if not a:
+            raise HTTPException(404, "agent not found")
+        result = restore_agent(db, a, restored_by=sess.get("user_id"))
+        if not result.get("ok"):
+            raise HTTPException(400, result.get("error", "restore failed"))
+        return result
+    finally:
+        db.close()
+
+
+# ═══════════════════════════════════════════════════════════════
+#  INTEGRATIONS  (live control panel)
+# ═══════════════════════════════════════════════════════════════
+
+@app.get("/api/integrations")
+def integrations_list(request: Request):
+    if not _get_session(request):
+        raise HTTPException(401, "not authenticated")
+    return {"integrations": integration_manager.list_integrations(),
+            "available_types": integration_manager.available_types()}
+
+class IntegrationIn(BaseModel):
+    type: str
+    name: str = ""
+    config: dict = {}
+    agent_id: str = None
+
+@app.post("/api/integrations")
+def integrations_register(body: IntegrationIn, request: Request):
+    if not _get_session(request):
+        raise HTTPException(401, "not authenticated")
+    if body.agent_id:
+        return integration_manager.register_for_agent(body.agent_id, body.type, body.config, body.name)
+    return integration_manager.register_global(body.type, body.config, body.name)
+
+class IntegrationActionIn(BaseModel):
+    integration: str
+    action: str
+    params: dict = {}
+    agent_id: str = None
+
+@app.post("/api/integrations/execute")
+def integrations_execute(body: IntegrationActionIn, request: Request):
+    if not _get_session(request):
+        raise HTTPException(401, "not authenticated")
+    return integration_manager.execute(body.integration, body.action, body.params, body.agent_id)
+
+@app.delete("/api/integrations/{name}")
+def integrations_remove(name: str, request: Request, agent_id: str = None):
+    if not _get_session(request):
+        raise HTTPException(401, "not authenticated")
+    return integration_manager.remove(name, agent_id)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  AGENT-TO-AGENT  (message bus + workflows)
+# ═══════════════════════════════════════════════════════════════
+
+@app.get("/api/comms/stats")
+def comms_stats(request: Request):
+    if not _get_session(request):
+        raise HTTPException(401, "not authenticated")
+    return message_bus.stats()
+
+@app.get("/api/comms/history")
+def comms_history(request: Request, agent_id: str = None, limit: int = 50):
+    if not _get_session(request):
+        raise HTTPException(401, "not authenticated")
+    return {"messages": message_bus.history(agent_id=agent_id, limit=limit)}
+
+class MessageIn(BaseModel):
+    from_agent: str
+    to_agent: str
+    payload: dict
+    msg_type: str = "task"
+
+@app.post("/api/comms/send")
+def comms_send(body: MessageIn, request: Request):
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "not authenticated")
+    return message_bus.send(body.from_agent, body.to_agent, body.payload,
+                            body.msg_type, user_id=sess.get("user_id"))
+
+class WorkflowIn(BaseModel):
+    name: str
+    steps: list
+
+@app.post("/api/comms/workflows")
+def comms_create_workflow(body: WorkflowIn, request: Request):
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "not authenticated")
+    return message_bus.create_workflow(body.name, body.steps, created_by=sess.get("user_id"))
+
+@app.get("/api/comms/workflows")
+def comms_list_workflows(request: Request):
+    if not _get_session(request):
+        raise HTTPException(401, "not authenticated")
+    return {"workflows": message_bus.list_workflows()}
+
+@app.post("/api/comms/workflows/{workflow_id}/run")
+def comms_run_workflow(workflow_id: str, request: Request):
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "not authenticated")
+
+    wf_before = message_bus.get_workflow(workflow_id)
+    if not wf_before or wf_before.get("error"):
+        raise HTTPException(404, "workflow not found")
+
+    # The bus advances one wave of ready steps per call and keeps everything in
+    # memory. Mirror each wave into workflow_runs/workflow_step_runs so the
+    # history survives a restart and Phase 2 has something to learn from.
+    db = SessionLocal()
+    wr = None
+    try:
+        try:
+            wr = p2_recorder.begin(db, wf_before, owner_id=sess.get("user_id"))
+        except Exception as e:
+            print(f"[phase2] could not open workflow record for {workflow_id}: {e}")
+
+        # Execute exactly once. Everything below is recording, and a recording
+        # failure must never re-run agents — that would double-charge and
+        # repeat side effects.
+        result = message_bus.run_workflow(workflow_id)
+
+        if wr is not None:
+            try:
+                wf_after = result.get("workflow") or wf_before
+                p2_recorder.record_wave(db, wr, result, wf_after)
+
+                # Close the record out only once the DAG has nothing left.
+                done = (result.get("remaining", 0) == 0
+                        or wf_after.get("status") == "completed")
+                if done:
+                    p2_recorder.finalize(db, wr)
+
+                result["workflow_run_id"] = wr.id
+                result["recorded"] = True
+            except Exception as e:
+                print(f"[phase2] workflow recording failed for {workflow_id}: {e}")
+                result["recorded"] = False
+        else:
+            result["recorded"] = False
+
+        return result
+    finally:
+        db.close()
+
+
+# ═══════════════════════════════════════════════════════════════
+#  PHASE 2  (relationships, workflow history, patterns)
+# ═══════════════════════════════════════════════════════════════
+
+@app.get("/api/phase2/graph")
+def p2_graph(request: Request, min_strength: int = 0):
+    """The agent relationship graph — nodes + weighted edges."""
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "not authenticated")
+    db = SessionLocal()
+    try:
+        return p2_discovery.graph(db, owner_id=sess.get("user_id"),
+                                  min_strength=min_strength)
+    finally:
+        db.close()
+
+
+@app.get("/api/phase2/agents/{agent_id}/relationships")
+def p2_agent_relationships(agent_id: str, request: Request):
+    """Edges touching one agent, split into incoming and outgoing."""
+    if not _get_session(request):
+        raise HTTPException(401, "not authenticated")
+    db = SessionLocal()
+    try:
+        return p2_discovery.for_agent(db, agent_id)
+    finally:
+        db.close()
+
+
+@app.post("/api/phase2/discover")
+def p2_discover(request: Request, source: str = "both"):
+    """Run relationship discovery. source = config | runtime | both."""
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "not authenticated")
+    if source not in ("config", "runtime", "both"):
+        raise HTTPException(400, "source must be config, runtime, or both")
+    uid = sess.get("user_id")
+    db = SessionLocal()
+    try:
+        out = {}
+        if source in ("config", "both"):
+            out["config"] = p2_discovery.discover_from_config(db, owner_id=uid)
+        if source in ("runtime", "both"):
+            out["runtime"] = p2_discovery.discover_from_runtime(db, owner_id=uid)
+        return out
+    finally:
+        db.close()
+
+
+@app.get("/api/phase2/workflow-runs")
+def p2_workflow_runs(request: Request, limit: int = 50):
+    """Persisted multi-agent workflow history, newest first."""
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "not authenticated")
+    db = SessionLocal()
+    try:
+        return {"runs": p2_recorder.history(db, owner_id=sess.get("user_id"),
+                                            limit=min(limit, 200))}
+    finally:
+        db.close()
+
+
+@app.get("/api/phase2/workflow-runs/{run_id}")
+def p2_workflow_run_detail(run_id: str, request: Request):
+    """One workflow run with its per-step breakdown."""
+    if not _get_session(request):
+        raise HTTPException(401, "not authenticated")
+    db = SessionLocal()
+    try:
+        wr = db.query(phase2.WorkflowRun).filter(
+            phase2.WorkflowRun.id == run_id).first()
+        if not wr:
+            raise HTTPException(404, "workflow run not found")
+        d = wr.to_dict()
+        d["step_detail"] = [s.to_dict() for s in wr.steps]
+        return d
+    finally:
+        db.close()
+
+
+@app.post("/api/phase2/patterns/analyze")
+def p2_analyze_patterns(request: Request, lookback_days: int = 30,
+                        min_executions: int = 2):
+    """Score recurring agent sequences from persisted workflow history."""
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "not authenticated")
+    db = SessionLocal()
+    try:
+        return p2_patterns.analyze(db, owner_id=sess.get("user_id"),
+                                   lookback_days=lookback_days,
+                                   min_executions=min_executions)
+    finally:
+        db.close()
+
+
+@app.get("/api/phase2/patterns")
+def p2_list_patterns(request: Request, limit: int = 10,
+                     min_success_rate: float = 0.0, agents: str = None):
+    """Top patterns, or patterns containing every agent in ?agents=a,b,c"""
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "not authenticated")
+    uid = sess.get("user_id")
+    db = SessionLocal()
+    try:
+        if agents:
+            ids = [a.strip() for a in agents.split(",") if a.strip()]
+            return {"patterns": p2_patterns.for_agents(db, ids, owner_id=uid)}
+        return {"patterns": p2_patterns.top(db, owner_id=uid, limit=limit,
+                                            min_success_rate=min_success_rate)}
+    finally:
+        db.close()
+
+
+class Phase2FeedbackIn(BaseModel):
+    verdict: str                      # correct | incorrect | partial
+    run_id: str | None = None
+    workflow_run_id: str | None = None
+    rating: int | None = None
+    comment: str = ""
+
+
+@app.post("/api/phase2/feedback")
+def p2_feedback(body: Phase2FeedbackIn, request: Request):
+    """Record a human verdict on a run or workflow run.
+
+    Metrics say a workflow completed; only a person says it was right.
+    """
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "not authenticated")
+    if body.verdict not in ("correct", "incorrect", "partial"):
+        raise HTTPException(400, "verdict must be correct, incorrect, or partial")
+    if not body.run_id and not body.workflow_run_id:
+        raise HTTPException(400, "provide run_id or workflow_run_id")
+    db = SessionLocal()
+    try:
+        fb = phase2.RunFeedback(
+            owner_id=sess.get("user_id"),
+            run_id=body.run_id,
+            workflow_run_id=body.workflow_run_id,
+            verdict=body.verdict,
+            rating=body.rating,
+            comment=(body.comment or "")[:4000],
+            created_by=sess.get("user_id"),
+        )
+        db.add(fb)
+        db.commit()
+        return {"ok": True, "feedback": fb.to_dict()}
+    finally:
+        db.close()
+
+
+# ═══════════════════════════════════════════════════════════════
+#  PLUGINS
+# ═══════════════════════════════════════════════════════════════
+
+@app.get("/api/plugins")
+def plugins_list(request: Request, category: str = None):
+    if not _get_session(request):
+        raise HTTPException(401, "not authenticated")
+    return {"plugins": plugin_manager.list_plugins(category=category),
+            "categories": plugin_manager.categories(),
+            "stats": plugin_manager.stats()}
+
+@app.post("/api/plugins/{name}/enable")
+def plugins_enable(name: str, request: Request):
+    if not _get_session(request):
+        raise HTTPException(401, "not authenticated")
+    return plugin_manager.enable(name)
+
+@app.post("/api/plugins/{name}/disable")
+def plugins_disable(name: str, request: Request):
+    if not _get_session(request):
+        raise HTTPException(401, "not authenticated")
+    return plugin_manager.disable(name)
+
+class PluginConfigIn(BaseModel):
+    config: dict
+
+@app.post("/api/plugins/{name}/configure")
+def plugins_configure(name: str, body: PluginConfigIn, request: Request):
+    if not _get_session(request):
+        raise HTTPException(401, "not authenticated")
+    return plugin_manager.configure(name, body.config)
+
+class PluginInstallIn(BaseModel):
+    manifest: dict = None
+    url: str = None
+
+@app.post("/api/plugins/install")
+def plugins_install(body: PluginInstallIn, request: Request):
+    if not _get_session(request):
+        raise HTTPException(401, "not authenticated")
+    if body.url:
+        return plugin_manager.install_from_url(body.url)
+    if body.manifest:
+        return plugin_manager.install(body.manifest)
+    raise HTTPException(400, "provide a manifest or url")
+
+@app.post("/api/plugins/{name}/assign/{agent_id}")
+def plugins_assign(name: str, agent_id: str, request: Request):
+    if not _get_session(request):
+        raise HTTPException(401, "not authenticated")
+    return plugin_manager.assign_to_agent(agent_id, name)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  WEBSOCKET LIVE STREAMING
+# ═══════════════════════════════════════════════════════════════
+
+from fastapi import WebSocket, WebSocketDisconnect
+
+@app.websocket("/ws/stream")
+async def ws_stream(websocket: WebSocket, channel: str = "global"):
+    """Live event stream. Connect with ?channel=global or ?channel=agent:<id>."""
+    await websocket.accept()
+    stream_manager.register(channel, websocket)
+    try:
+        # Send recent buffered events on connect
+        for event in stream_manager.recent_events(limit=20):
+            await websocket.send_text(json.dumps(event))
+        while True:
+            # Keep the connection alive; ignore inbound client messages
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        stream_manager.unregister(channel, websocket)
+    except Exception:
+        stream_manager.unregister(channel, websocket)
+
+@app.get("/api/stream/channels")
+def stream_channels(request: Request):
+    if not _get_session(request):
+        raise HTTPException(401, "not authenticated")
+    return {"active_channels": stream_manager.active_channels(),
+            "recent_events": stream_manager.recent_events(limit=50)}
+
+
+@app.get("/landing")
+def landing_page():
+    """Marketing / product landing page."""
+    try:
+        with open(os.path.join(os.path.dirname(__file__), "landing.html")) as f:
+            return HTMLResponse(f.read())
+    except FileNotFoundError:
+        raise HTTPException(404, "landing page not found")
 
 
 @app.get("/")
@@ -1561,13 +3986,13 @@ body{background:linear-gradient(135deg,#1a1008 0%,#2d1810 40%,#1a1008 100%);disp
 
   <div class="divider">or continue with</div>
 
-  <button class="sso-btn" onclick="ssoPlaceholder('Google')">
+  <button class="sso-btn" id="btn-google" onclick="window.location.href='/api/auth/login/google'" style="display:none">
     <svg viewBox="0 0 24 24"><path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 01-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z" fill="#4285F4"/><path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853"/><path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" fill="#FBBC05"/><path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335"/></svg>
-    Sign in with Google SSO
+    Sign in with Google
   </button>
-  <button class="sso-btn" onclick="ssoPlaceholder('SAML')">
-    <svg viewBox="0 0 24 24" fill="none" stroke="#5a6472" stroke-width="2"><rect x="3" y="11" width="18" height="10" rx="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg>
-    Sign in with SAML / Okta
+  <button class="sso-btn" id="btn-github" onclick="window.location.href='/api/auth/login/github'" style="display:none">
+    <svg viewBox="0 0 24 24"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z" fill="#333"/></svg>
+    Sign in with GitHub
   </button>
 
   <div class="footer">CORTEX v0.2 · Secure single-session auth</div>
@@ -1612,9 +4037,24 @@ async function doSignup(e){
   }catch(ex){err.textContent='Network error';}
 }
 
-function ssoPlaceholder(provider){
-  document.getElementById('err').textContent=provider+' SSO coming soon — use email sign-in for now';
-}
+// Check which OAuth providers are configured and show buttons
+(async function(){
+  try{
+    const r=await fetch('/api/auth/providers');
+    if(r.ok){
+      const d=await r.json();
+      if(d.providers && d.providers.includes('google'))
+        document.getElementById('btn-google').style.display='';
+      if(d.providers && d.providers.includes('github'))
+        document.getElementById('btn-github').style.display='';
+      // Hide the divider if no OAuth providers are available
+      if(!d.providers || d.providers.length===0){
+        const div=document.querySelector('.divider');
+        if(div) div.style.display='none';
+      }
+    }
+  }catch(e){}
+})();
 </script>
 </body></html>"""
 
@@ -1628,15 +4068,42 @@ HTML = r"""<!DOCTYPE html>
 *{margin:0;padding:0;box-sizing:border-box}
 :root{--ink:#14181f;--paper:#f5f0eb;--card:#fffcf8;--muted:#5a6472;--faint:#8a93a0;--line:#e6ddd3;--line2:#d9cfc3;--accent:#c4632a;--accentsoft:#fbe8dc;--seal:#0e5b54;--sealsoft:#e2efec;--ochre:#9a6614;--ochresoft:#f3ead6;--brick:#9c3327;--bricksoft:#f4e2df;--sunset1:#f97316;--sunset2:#ea580c;--sunset3:#dc2626;--warm:#d97706;--warmsoft:#fef3c7;--terra:#92400e;--terrasoft:#fde68a}
 html{font-family:'IBM Plex Sans',system-ui,sans-serif;background:var(--paper);color:var(--ink)}
+:root{--fg:#14181f;--panel:#fffcf8;--bg:#f5f0eb}
+/* ── Enterprise module styles (observability, usage, teams, plugins, mesh, recovery) ── */
+.card-title{font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);margin-bottom:10px}
+.data-table{width:100%;border-collapse:collapse;font-size:13px}
+.data-table th{text-align:left;padding:7px 8px;border-bottom:2px solid var(--line);font-size:11px;text-transform:uppercase;letter-spacing:.4px;color:var(--faint)}
+.data-table td{padding:7px 8px;border-bottom:1px solid var(--line)}
+.data-table tbody tr:hover{background:var(--accentsoft)}
+.chip{display:inline-block;padding:2px 8px;border-radius:10px;font-size:10px;background:var(--accentsoft);color:var(--terra);text-transform:uppercase;letter-spacing:.3px}
+.btn-sm{padding:4px 10px;font-size:11px;border-radius:5px;border:1px solid var(--accent);background:var(--card);color:var(--accent);cursor:pointer}
+.btn-sm:hover{background:var(--accent);color:#fff}
+.switch{position:relative;display:inline-block;width:36px;height:20px}
+.switch input{opacity:0;width:0;height:0}
+.slider{position:absolute;cursor:pointer;inset:0;background:var(--line2);border-radius:20px;transition:.2s}
+.slider:before{position:absolute;content:"";height:14px;width:14px;left:3px;bottom:3px;background:#fff;border-radius:50%;transition:.2s}
+.switch input:checked+.slider{background:var(--sunset1)}
+.switch input:checked+.slider:before{transform:translateX(16px)}
+.spinner{width:28px;height:28px;border:3px solid var(--line);border-top-color:var(--accent);border-radius:50%;animation:spin 1s linear infinite;margin:0 auto}
+@keyframes spin{to{transform:rotate(360deg)}}
 .mono{font-family:'IBM Plex Mono',monospace}
 .header{background:linear-gradient(135deg,#1a1008 0%,#2d1810 50%,#1a1008 100%);color:#fff;padding:14px 22px;display:flex;align-items:center;justify-content:space-between;border-bottom:2px solid var(--accent)}
 .brand{display:flex;align-items:baseline;gap:12px}
 .logo{font-family:'Archivo';font-weight:800;font-size:20px;letter-spacing:.14em;padding-left:.14em;background:linear-gradient(135deg,#f97316,#fbbf24);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
 .sub{font-size:11px;letter-spacing:.08em;color:#c4956a}
-.nav{display:flex;gap:4px;flex-wrap:wrap}
+.nav{display:flex;gap:4px;align-items:center}
 .navbtn{background:none;border:1px solid #3d2a1a;color:#c4956a;padding:5px 10px;font-size:10.5px;cursor:pointer;border-radius:3px;font-family:'IBM Plex Mono';letter-spacing:.04em;transition:all .15s}
 .navbtn:hover{border-color:#c4632a;color:#f97316}
 .navbtn.active{background:linear-gradient(135deg,#c4632a,#ea580c);border-color:#c4632a;color:#fff}
+.more-wrap{position:relative}
+.more-btn{background:none;border:1px solid #3d2a1a;color:#c4956a;padding:5px 10px;font-size:10.5px;cursor:pointer;border-radius:3px;font-family:'IBM Plex Mono';letter-spacing:.04em;transition:all .15s}
+.more-btn:hover{border-color:#c4632a;color:#f97316}
+.more-btn.has-active{border-color:#c4632a;color:#f97316}
+.more-menu{display:none;position:absolute;top:calc(100% + 6px);left:0;background:#1a1208;border:1px solid #3d2a1a;border-radius:6px;padding:6px 0;min-width:180px;z-index:999;box-shadow:0 8px 24px rgba(0,0,0,.5)}
+.more-menu.open{display:block}
+.more-menu .navbtn{display:block;width:100%;text-align:left;border:none;border-radius:0;padding:8px 14px;font-size:11px}
+.more-menu .navbtn:hover{background:rgba(249,115,22,.1)}
+.more-menu .navbtn.active{background:linear-gradient(135deg,#c4632a,#ea580c);border:none;color:#fff}
 .hmeta{font-size:11px;color:#c4956a;font-family:'IBM Plex Mono'}
 .view{max-width:1340px;margin:0 auto;padding:18px 22px 70px}
 .wrap{display:grid;grid-template-columns:minmax(260px,320px) 1fr;gap:20px;align-items:start}
@@ -1798,14 +4265,32 @@ h4{font-size:10.5px;font-weight:600;letter-spacing:.1em;text-transform:uppercase
   <div class="nav">
     <button class="navbtn active" id="nav-monitor" onclick="setView('monitor')">Monitor</button>
     <button class="navbtn" id="nav-agents" onclick="setView('agents')">Agents</button>
-    <button class="navbtn" id="nav-control" onclick="setView('control')">Control</button>
+    <button class="navbtn" id="nav-observability" onclick="setView('observability')">Observability</button>
     <button class="navbtn" id="nav-runs" onclick="setView('runs')">Runs</button>
-    <button class="navbtn" id="nav-integrations" onclick="setView('integrations')">Integrations</button>
-    <button class="navbtn" id="nav-deploy" onclick="setView('deploy')">Deploy</button>
-    <button class="navbtn" id="nav-events" onclick="setView('events')">Event Log</button>
-    <button class="navbtn" id="nav-history" onclick="setView('history')">History</button>
-    <button class="navbtn" id="nav-automation" onclick="setView('automation')">Automation</button>
+    <button class="navbtn" id="nav-usage" onclick="setView('usage')">Usage</button>
+    <button class="navbtn" id="nav-analytics" onclick="setView('analytics')">Analytics</button>
+    <button class="navbtn" id="nav-runtime" onclick="setView('runtime')">Runtime</button>
     <button class="navbtn" id="nav-settings" onclick="setView('settings')">Settings</button>
+    <div class="more-wrap">
+      <button class="more-btn" id="more-toggle" onclick="toggleMoreMenu(event)">More ▾</button>
+      <div class="more-menu" id="more-menu">
+        <button class="navbtn" id="nav-control" onclick="setView('control');closeMore()">Control</button>
+        <button class="navbtn" id="nav-integrations" onclick="setView('integrations');closeMore()">Integrations</button>
+        <button class="navbtn" id="nav-deploy" onclick="setView('deploy');closeMore()">Deploy</button>
+        <button class="navbtn" id="nav-events" onclick="setView('events');closeMore()">Event Log</button>
+        <button class="navbtn" id="nav-history" onclick="setView('history');closeMore()">History</button>
+        <button class="navbtn" id="nav-automation" onclick="setView('automation');closeMore()">Automation</button>
+        <button class="navbtn" id="nav-templates" onclick="setView('templates');closeMore()">Templates</button>
+        <button class="navbtn" id="nav-teams" onclick="setView('teams');closeMore()">Teams</button>
+        <button class="navbtn" id="nav-plugins" onclick="setView('plugins');closeMore()">Plugins</button>
+        <button class="navbtn" id="nav-comms" onclick="setView('comms');closeMore()">Agent Mesh</button>
+        <button class="navbtn" id="nav-workflows" onclick="setView('workflows');closeMore()">Workflows</button>
+        <button class="navbtn" id="nav-recovery" onclick="setView('recovery');closeMore()">Recovery</button>
+        <button class="navbtn" id="nav-attestations" onclick="setView('attestations');closeMore()">Attestations</button>
+        <button class="navbtn" id="nav-approvals" onclick="setView('approvals');closeMore()">Approvals</button>
+        <button class="navbtn" id="nav-admin" onclick="setView('admin');closeMore()" style="display:none">Admin</button>
+      </div>
+    </div>
   </div>
   <div class="hmeta" style="display:flex;align-items:center;gap:12px">
     <span><span id="llm-state">rule-based</span> · <span id="count">0</span> agents</span>
@@ -1813,6 +4298,8 @@ h4{font-size:10.5px;font-weight:600;letter-spacing:.1em;text-transform:uppercase
       <span style="width:22px;height:22px;border-radius:50%;background:linear-gradient(135deg,#f97316,#fbbf24);display:flex;align-items:center;justify-content:center;font-family:Archivo;font-weight:700;font-size:10px;color:#1a1008" id="user-avatar"></span>
       <span id="user-name" style="color:#fbbf24"></span>
     </span>
+    <button id="notif-bell" onclick="toggleNotifPanel()" style="background:none;border:none;cursor:pointer;position:relative;padding:4px 6px;font-size:16px;color:#c4956a" title="Notifications">🔔<span id="notif-badge" style="display:none;position:absolute;top:0;right:0;background:#ef4444;color:#fff;font-size:9px;font-weight:700;border-radius:50%;width:16px;height:16px;line-height:16px;text-align:center">0</span></button>
+    <div id="notif-panel" style="display:none;position:absolute;top:48px;right:80px;width:340px;max-height:400px;overflow-y:auto;background:#1e1408;border:1px solid #3d2a1a;border-radius:6px;box-shadow:0 8px 24px rgba(0,0,0,.5);z-index:999;font-size:12px"></div>
     <button onclick="doLogout()" style="background:none;border:1px solid #3d2a1a;color:#c4956a;padding:3px 10px;font-size:10px;cursor:pointer;border-radius:3px;font-family:'IBM Plex Mono';letter-spacing:.04em;transition:all .15s" onmouseover="this.style.borderColor='#c4632a';this.style.color='#f97316'" onmouseout="this.style.borderColor='#3d2a1a';this.style.color='#c4956a'">Sign Out</button>
   </div>
 </div>
@@ -1821,22 +4308,28 @@ h4{font-size:10.5px;font-weight:600;letter-spacing:.1em;text-transform:uppercase
 
 <script>
 let AGENTS=[], sel=null, pending=null, view='monitor', META={}, USER=null, advancedMode=false;
-const TABS=['monitor','agents','control','runs','integrations','deploy','events','history','automation','settings'];
+const TABS=['monitor','agents','observability','control','runs','usage','integrations','deploy','events','history','automation','templates','teams','plugins','comms','recovery','attestations','approvals','analytics','runtime','settings'];
 
 async function boot(){
   // Load user session
   try{
     const ur=await fetch('/api/auth/me');
-    if(ur.ok){const ud=await ur.json(); USER=ud.user;
-      document.getElementById('user-name').textContent=USER.name;
-      document.getElementById('user-avatar').textContent=USER.name.split(' ').map(w=>w[0]).join('').toUpperCase().slice(0,2);
-    }
-  }catch(e){}
-  const r=await fetch('/api/agents'); const d=await r.json();
-  AGENTS=d.agents; META=d;
-  document.getElementById('count').textContent=d.total;
-  document.getElementById('llm-state').textContent = d.llm ? 'model-assisted' : 'rule-based';
-  if(!sel && AGENTS.length) sel=AGENTS[0].id;
+    if(!ur.ok){doLogout();return;}
+    const ud=await ur.json();
+    USER=ud.user||{};
+    const uname=USER.name||USER.email||'User';
+    document.getElementById('user-name').textContent=uname;
+    document.getElementById('user-avatar').textContent=uname.split(' ').map(w=>(w||'')[0]||'').join('').toUpperCase().slice(0,2)||'U';
+    if(USER.is_admin){document.getElementById('nav-admin').style.display='';}
+  }catch(e){console.error('boot auth:',e);}
+  try{
+    const r=await fetch('/api/agents'); const d=await r.json();
+    AGENTS=d.agents||[]; META=d;
+    document.getElementById('count').textContent=d.total||0;
+    document.getElementById('llm-state').textContent = d.llm ? 'model-assisted' : 'rule-based';
+    if(!sel && AGENTS.length) sel=AGENTS[0].id;
+  }catch(e){console.error('boot agents:',e);}
+  try{pollNotifications();}catch(e){}
   await render();
 }
 
@@ -1846,18 +4339,31 @@ async function doLogout(){
   window.location.reload();
 }
 
+const PRIMARY_TABS=['monitor','agents','observability','runs','usage','analytics','runtime','settings'];
+const MORE_TABS=['control','integrations','deploy','events','history','automation','templates','teams','plugins','comms','recovery','attestations','approvals','admin'];
 function setActiveNav(){
   TABS.forEach(v=>{
     const el=document.getElementById('nav-'+v);
     if(el) el.classList.toggle('active', v===view);
   });
+  // Highlight "More" button if current view is in the dropdown
+  const mb=document.getElementById('more-toggle');
+  if(mb) mb.classList.toggle('has-active', MORE_TABS.includes(view));
 }
+function toggleMoreMenu(e){e.stopPropagation();document.getElementById('more-menu').classList.toggle('open');}
+function closeMore(){document.getElementById('more-menu').classList.remove('open');}
+document.addEventListener('click',function(e){if(!e.target.closest('.more-wrap'))closeMore();});
 
 async function render(){
   setActiveNav();
   const fn={monitor:renderMonitor,agents:renderAgents,control:renderControl,runs:renderRuns,
     integrations:renderIntegrations,deploy:renderDeploy,events:renderEventLog,
-    history:renderHistory,automation:renderAutomation,settings:renderSettings}[view];
+    history:renderHistory,automation:renderAutomation,templates:renderTemplates,
+    attestations:renderAttestations,approvals:renderApprovals,analytics:renderAnalytics,
+    runtime:renderRuntime,settings:renderSettings,admin:renderAdmin,
+    observability:renderObservability,usage:renderUsage,teams:renderTeams,
+    plugins:renderPlugins,comms:renderComms,recovery:renderRecovery,
+    workflows:renderWorkflows}[view];
   if(fn) await fn();
 }
 
@@ -1958,10 +4464,62 @@ async function renderMonitor(){
           </div>
         </div>
       </div>
+    </div>
+
+    <div id="ai-chat" style="margin-top:24px;border:1px solid var(--line);border-radius:8px;overflow:hidden">
+      <div style="padding:12px 16px;background:var(--bg2);border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center;cursor:pointer" onclick="toggleChat()">
+        <div style="display:flex;align-items:center;gap:8px">
+          <span style="font-size:18px">💬</span>
+          <span style="font-weight:600;font-family:'Archivo',sans-serif;font-size:13px">Cortex Assistant</span>
+          <span style="font-size:10px;color:var(--muted)">Ask anything about your agents</span>
+        </div>
+        <span id="chat-toggle" style="font-size:12px;color:var(--muted)">▼</span>
+      </div>
+      <div id="chat-body" style="display:none">
+        <div id="chat-messages" style="height:260px;overflow-y:auto;padding:12px 16px;font-size:13px"></div>
+        <div style="padding:8px 12px;border-top:1px solid var(--line);display:flex;gap:8px">
+          <input type="text" id="chat-input" placeholder="e.g. Which agents have errors? What was the last run result?" style="flex:1;padding:8px 10px;border:1px solid var(--line);border-radius:4px;font-size:12px;background:var(--bg2);color:inherit" onkeydown="if(event.key==='Enter')sendChat()">
+          <button class="btn accent" style="padding:6px 16px;font-size:12px" onclick="sendChat()">Send</button>
+        </div>
+      </div>
     </div>`;
 }
 
 async function jumpToControl(id){ sel=id; view='control'; await render(); }
+
+/* ═══════════════ AI ASSISTANT ═══════════════ */
+let _chatOpen=false, _chatHistory=[];
+function toggleChat(){
+  _chatOpen=!_chatOpen;
+  document.getElementById('chat-body').style.display=_chatOpen?'block':'none';
+  document.getElementById('chat-toggle').textContent=_chatOpen?'▲':'▼';
+  if(_chatOpen&&!_chatHistory.length){
+    document.getElementById('chat-messages').innerHTML='<div style="color:var(--muted);padding:8px;text-align:center;font-size:12px">Ask me about your agents — status, errors, performance, configuration, or anything else.</div>';
+  }
+}
+async function sendChat(){
+  const input=document.getElementById('chat-input');
+  const msg=input.value.trim();
+  if(!msg)return;
+  input.value='';
+  _chatHistory.push({role:'user',content:msg});
+  const box=document.getElementById('chat-messages');
+  box.innerHTML+=`<div style="margin:8px 0;display:flex;justify-content:flex-end"><div style="background:var(--accent);color:#fff;padding:8px 12px;border-radius:12px 12px 2px 12px;max-width:80%;font-size:12px">${esc(msg)}</div></div>`;
+  box.innerHTML+=`<div id="chat-loading" style="margin:8px 0;color:var(--muted);font-size:11px">Thinking...</div>`;
+  box.scrollTop=box.scrollHeight;
+  try{
+    const r=await fetch('/api/assistant/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:msg,history:_chatHistory.slice(-10)})});
+    const d=await r.json();
+    document.getElementById('chat-loading')?.remove();
+    const reply=d.reply||'Sorry, I could not process that.';
+    _chatHistory.push({role:'assistant',content:reply});
+    box.innerHTML+=`<div style="margin:8px 0;display:flex"><div style="background:var(--bg2);border:1px solid var(--line);padding:8px 12px;border-radius:12px 12px 12px 2px;max-width:80%;font-size:12px;white-space:pre-wrap">${esc(reply)}</div></div>`;
+  }catch(e){
+    document.getElementById('chat-loading')?.remove();
+    box.innerHTML+=`<div style="margin:8px 0;color:var(--brick);font-size:11px">Error connecting to assistant</div>`;
+  }
+  box.scrollTop=box.scrollHeight;
+}
 
 /* ═══════════════ AGENTS — Registration & Management ═══════════════ */
 async function renderAgents(){
@@ -2430,16 +4988,16 @@ async function renderControl(){
         <div style="display:flex;flex-direction:column;align-items:flex-end;gap:8px">
           ${modeToggle}
           <div class="ctrls">
-            <button class="btn ghost" onclick="ctl('start')">Start</button>
-            <button class="btn ghost" onclick="ctl('restart')">Restart</button>
+            <button class="btn ${a.status!=='running'?'accent':'ghost'}" onclick="ctl('start')">${a.status==='running'?'Running':'Start'}</button>
             <button class="btn ghost" onclick="ctl('stop')">Stop</button>
-            ${a.live?'<button class="btn ghost" style="color:var(--brick)" onclick="ctl(\'pause\')">Pause</button>':'<button class="btn accent" onclick="ctl(\'golive\')">Go Live</button>'}
+            <button class="btn ghost" onclick="ctl('pause')">Pause</button>
+            <button class="btn ghost" onclick="ctl('resume')">Resume</button>
           </div>
         </div>
       </div>
       ${advancedMode ? advancedConfig : `<div class="sect"><h4>Overview</h4>${simpleConfig}</div>`}
 
-      ${a.live ? liveRunPanel(a) : ''}
+      ${liveRunPanel(a)}
       <div class="sect">
         <h4>Change Config — Plain English</h4>
         <textarea class="ask" id="ask" placeholder="e.g. Set temperature to 0.5, increase timeout to 10 minutes, escalate at moderate severity"></textarea>
@@ -2448,20 +5006,89 @@ async function renderControl(){
         <div id="result"></div>
       </div>
     </div></div>`;
+  startDaemonPoll();
 }
 
 function liveRunPanel(a){
   const cfg=a.config||{};
   const beh=cfg.behavior||{};
   const exec=cfg.execution||{};
+  const standing=cfg.standing_instruction||'';
+  const interval=cfg.run_interval_seconds||60;
+  const intgr=cfg.integrations||[];
   return `<div class="sect livebox">
-    <h4>Run Agent</h4>
-    <div class="hint" style="margin:0 0 10px">This agent runs live using ${(cfg.model||{}).provider||'the configured'} provider. Governed by: <b>max ${exec.max_retries||3} retries</b>, <b>confidence threshold ${beh.confidence_threshold||0.75}</b>, <b>confirm ${beh.confirm_before_action?'ON':'OFF'}</b>.</div>
-    <textarea class="ask" id="claim" placeholder="Enter input for this agent..."></textarea>
-    <div class="ctrls" style="margin-top:10px">
-      <button class="btn accent" id="runbtn" onclick="runAgent()">Run Agent</button>
+    <h4>Continuous Mode</h4>
+    <div id="daemon-status" style="margin-bottom:12px;padding:12px;border-radius:6px;background:#faf8f5;border:1px solid var(--line)">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+        <span style="width:8px;height:8px;border-radius:50%;background:${a.status==='running'?'var(--seal)':'var(--faint)'};display:inline-block"></span>
+        <span style="font-weight:600;font-size:13px">${a.status==='running'?'Running Continuously':'Stopped'}</span>
+        <span id="daemon-cycle" style="font-size:11px;color:var(--muted);margin-left:auto"></span>
+      </div>
+      <div id="daemon-detail" style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px">
+        <div style="text-align:center;padding:6px;background:white;border-radius:4px;border:1px solid var(--line)"><div id="d-cycles" style="font-size:16px;font-weight:600">—</div><div style="font-size:9px;color:var(--muted);text-transform:uppercase">Cycles</div></div>
+        <div style="text-align:center;padding:6px;background:white;border-radius:4px;border:1px solid var(--line)"><div id="d-next" style="font-size:16px;font-weight:600">—</div><div style="font-size:9px;color:var(--muted);text-transform:uppercase">Next In</div></div>
+        <div style="text-align:center;padding:6px;background:white;border-radius:4px;border:1px solid var(--line)"><div id="d-errors" style="font-size:16px;font-weight:600">0</div><div style="font-size:9px;color:var(--muted);text-transform:uppercase">Errors</div></div>
+        <div style="text-align:center;padding:6px;background:white;border-radius:4px;border:1px solid var(--line)"><div id="d-interval" style="font-size:16px;font-weight:600">${interval}s</div><div style="font-size:9px;color:var(--muted);text-transform:uppercase">Interval</div></div>
+      </div>
+      <div id="d-error-msg" style="display:none;margin-top:8px;padding:8px;background:#fdf2f0;border:1px solid #e8c5bf;border-radius:4px;font-size:11px;color:var(--brick)"></div>
     </div>
-    <div id="runout"></div>
+
+    <div style="margin-bottom:12px">
+      <label style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:var(--accent);display:block;margin-bottom:6px">Standing Instruction</label>
+      <textarea class="ask" id="standing" placeholder="What should this agent do on each cycle? e.g. Monitor support queue, classify new tickets, summarize findings..." style="min-height:80px">${esc(standing)}</textarea>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr auto;gap:8px;margin-bottom:12px;align-items:end">
+      <div>
+        <label style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:var(--accent);display:block;margin-bottom:6px">Run Interval</label>
+        <select id="interval-sel" style="width:100%;padding:8px;border:1px solid var(--line);border-radius:4px;font-size:12px;background:white">
+          <option value="30" ${interval===30?'selected':''}>Every 30 seconds</option>
+          <option value="60" ${interval===60?'selected':''}>Every 1 minute</option>
+          <option value="120" ${interval===120?'selected':''}>Every 2 minutes</option>
+          <option value="300" ${interval===300?'selected':''}>Every 5 minutes</option>
+          <option value="600" ${interval===600?'selected':''}>Every 10 minutes</option>
+          <option value="1800" ${interval===1800?'selected':''}>Every 30 minutes</option>
+          <option value="3600" ${interval===3600?'selected':''}>Every 1 hour</option>
+        </select>
+      </div>
+      <button class="btn accent" onclick="saveStanding()" style="padding:8px 16px">Save</button>
+    </div>
+    <div class="hint" style="margin:0 0 12px">The agent runs this instruction on every cycle while status is <b>running</b>. Pause/resume controls the loop without changing the instruction.</div>
+
+    <div style="margin-bottom:12px;padding:12px;border-radius:6px;border:1px solid var(--line);background:#faf8f5">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+        <div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:var(--accent)">Integrations (${intgr.length})</div>
+        <button class="btn ghost" style="padding:2px 10px;font-size:10px" onclick="document.getElementById('add-intg').style.display=document.getElementById('add-intg').style.display==='none'?'block':'none'">+ Add</button>
+      </div>
+      <div id="intg-list">
+        ${intgr.length?intgr.map(ig=>`<div style="display:flex;justify-content:space-between;align-items:center;padding:6px 8px;margin-bottom:4px;background:white;border-radius:4px;border:1px solid var(--line)">
+          <div>
+            <span style="font-weight:500;font-size:12px">${esc(ig.name)}</span>
+            <span style="font-size:10px;padding:1px 6px;border-radius:3px;background:#d4dce0;color:var(--ink);margin-left:4px">${esc(ig.type)}</span>
+            <span style="font-size:10px;color:${ig.status==='connected'?'var(--seal)':'var(--faint)'};margin-left:4px">${ig.status||'pending'}</span>
+          </div>
+          <button class="btn ghost" style="padding:2px 8px;font-size:10px" onclick="removeIntegration('${esc(ig.name)}')">×</button>
+        </div>`).join(''):'<div style="font-size:11px;color:var(--faint)">No integrations. Connect Slack, GitHub, webhooks, or APIs to let agents interact with real systems.</div>'}
+      </div>
+      <div id="add-intg" style="display:none;margin-top:8px;padding:10px;background:white;border-radius:4px;border:1px dashed var(--line)">
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:8px">
+          <div><label style="font-size:10px;font-weight:500;color:var(--muted)">Name</label><input id="intg-name" placeholder="e.g. team-slack" style="font-size:11px;padding:6px 8px;width:100%;box-sizing:border-box;border:1px solid var(--line);border-radius:4px"></div>
+          <div><label style="font-size:10px;font-weight:500;color:var(--muted)">Type</label><select id="intg-type" style="font-size:11px;padding:6px 8px;width:100%;box-sizing:border-box;border:1px solid var(--line);border-radius:4px">
+            <option value="slack">Slack</option><option value="github">GitHub</option><option value="webhook">Webhook</option>
+            <option value="rest_api">REST API</option><option value="database">Database</option><option value="email">Email/SMTP</option>
+            <option value="s3">S3/Storage</option><option value="custom">Custom</option></select></div>
+        </div>
+        <div style="margin-bottom:8px"><label style="font-size:10px;font-weight:500;color:var(--muted)">Endpoint / Config</label><input id="intg-endpoint" placeholder="https://hooks.slack.com/... or connection string" style="font-size:11px;padding:6px 8px;width:100%;box-sizing:border-box;border:1px solid var(--line);border-radius:4px"></div>
+        <button class="btn accent" style="font-size:11px;padding:6px 14px" onclick="addIntegration()">Connect</button>
+      </div>
+    </div>
+
+    <div class="sect" style="margin-top:0;padding-top:12px;border-top:1px solid var(--line)">
+      <h4>Manual Run</h4>
+      <div class="hint" style="margin:0 0 8px">Run a one-off task outside the continuous loop.</div>
+      <textarea class="ask" id="claim" placeholder="Enter a one-off input for this agent..."></textarea>
+      <div class="ctrls" style="margin-top:8px"><button class="btn accent" id="runbtn" onclick="runAgent()">Run Once</button></div>
+      <div id="runout"></div>
+    </div>
   </div>`;
 }
 
@@ -2553,6 +5180,59 @@ async function apply(){
     document.getElementById('result').innerHTML=`<div class="applied">Applied. Now v${d.new_version}. Logged and reversible.</div>`; }
 }
 async function ctl(action){ await fetch('/api/agents/'+sel+'/control?action='+action,{method:'POST'}); await boot(); renderControl(); }
+
+async function saveStanding(){
+  const si=document.getElementById('standing').value;
+  const iv=parseInt(document.getElementById('interval-sel').value);
+  await fetch('/api/agents/'+sel+'/standing-instruction',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({standing_instruction:si,run_interval_seconds:iv})});
+  await boot(); renderControl();
+}
+
+async function addIntegration(){
+  const name=document.getElementById('intg-name').value.trim();
+  if(!name) return;
+  const type=document.getElementById('intg-type').value;
+  const endpoint=document.getElementById('intg-endpoint').value.trim();
+  const a=await (await fetch('/api/agents/'+sel)).json();
+  const cfg=a.config||{};
+  const intgr=cfg.integrations||[];
+  intgr.push({name,type,endpoint,status:'connected',added_at:new Date().toISOString()});
+  cfg.integrations=intgr;
+  await fetch('/api/agents/'+sel+'/config',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:cfg})});
+  await boot(); renderControl();
+}
+
+async function removeIntegration(name){
+  const a=await (await fetch('/api/agents/'+sel)).json();
+  const cfg=a.config||{};
+  cfg.integrations=(cfg.integrations||[]).filter(i=>i.name!==name);
+  await fetch('/api/agents/'+sel+'/config',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:cfg})});
+  await boot(); renderControl();
+}
+
+let _daemonPoll=null;
+function startDaemonPoll(){
+  if(_daemonPoll) clearInterval(_daemonPoll);
+  _daemonPoll=setInterval(async()=>{
+    if(!sel) return;
+    try{
+      const d=await (await fetch('/api/agents/'+sel+'/daemon')).json();
+      const ce=document.getElementById('d-cycles');
+      if(!ce) return;
+      document.getElementById('d-cycles').textContent=d.cycle_count||0;
+      const nextIn=d.next_run_in_seconds;
+      document.getElementById('d-next').textContent=nextIn!=null?(nextIn>60?Math.floor(nextIn/60)+'m':nextIn+'s'):'—';
+      document.getElementById('d-errors').textContent=d.consecutive_errors||0;
+      document.getElementById('d-errors').style.color=(d.consecutive_errors>0)?'var(--brick)':'inherit';
+      const cyc=document.getElementById('daemon-cycle');
+      if(cyc) cyc.textContent=d.active?(d.paused?'PAUSED':'cycle #'+(d.cycle_count||0)):'not tracked';
+      const errEl=document.getElementById('d-error-msg');
+      if(d.last_error && errEl){errEl.style.display='block';errEl.textContent=d.last_error;}
+      else if(errEl){errEl.style.display='none';}
+    }catch(e){}
+  },5000);
+}
 
 /* ═══════════════ RUNS — Execution History + Audit ═══════════════ */
 let runsFilter='ALL';
@@ -2982,6 +5662,88 @@ async function renderSettings(){
     </div>`;
   }).join('');
 
+  // Fetch API keys
+  let apiKeysHtml='';
+  try{
+    const keysR=await fetch('/api/keys');
+    const keysD=await keysR.json();
+    const keys=keysD.keys||[];
+    const keyRows=keys.map(k=>`<tr>
+      <td style="padding:8px 10px;font-weight:500">${esc(k.name)}</td>
+      <td style="padding:8px 10px;font-family:'IBM Plex Mono';font-size:11px">${esc(k.prefix)}...</td>
+      <td style="padding:8px 10px;font-size:11px">${(k.scopes||[]).join(', ')}</td>
+      <td style="padding:8px 10px;font-size:11px;color:var(--muted)">${k.last_used_at?new Date(k.last_used_at).toLocaleDateString():'never'}</td>
+      <td style="padding:8px 10px"><button class="btn ghost" style="font-size:11px;padding:2px 8px;color:var(--brick)" onclick="revokeApiKey('${k.id}')">Revoke</button></td>
+    </tr>`).join('');
+    apiKeysHtml=`<div style="margin-top:32px;border-top:1px solid var(--line);padding-top:24px">
+      <h3 style="font-family:'Archivo',sans-serif;margin-bottom:4px">API Keys</h3>
+      <div class="hint" style="margin-bottom:12px">Create keys for external systems to call your agents programmatically via the REST API.</div>
+      <div style="display:flex;gap:8px;margin-bottom:16px;align-items:end">
+        <div style="flex:1"><label style="font-size:11px;display:block;margin-bottom:4px">Key Name</label>
+          <input type="text" id="new_key_name" placeholder="e.g. CI Pipeline" style="width:100%;padding:6px 8px;border:1px solid var(--line);border-radius:3px;font-size:12px">
+        </div>
+        <div><label style="font-size:11px;display:block;margin-bottom:4px">Scopes</label>
+          <select id="new_key_scopes" multiple style="padding:4px 6px;border:1px solid var(--line);border-radius:3px;font-size:11px;min-width:160px" size="3">
+            <option value="agents:read" selected>agents:read</option>
+            <option value="agents:run" selected>agents:run</option>
+            <option value="agents:write">agents:write</option>
+          </select>
+        </div>
+        <button class="btn accent" style="padding:6px 14px" onclick="createApiKey()">Create Key</button>
+      </div>
+      <div id="new_key_result" style="display:none;margin-bottom:16px;padding:12px;background:#f0fdf4;border:1px solid #86efac;border-radius:4px;font-family:'IBM Plex Mono';font-size:12px;word-break:break-all"></div>
+      ${keys.length?`<table style="width:100%;border-collapse:collapse;font-size:13px">
+        <thead><tr style="background:var(--bg2);text-align:left">
+          <th style="padding:8px 10px">Name</th><th style="padding:8px 10px">Prefix</th><th style="padding:8px 10px">Scopes</th><th style="padding:8px 10px">Last Used</th><th style="padding:8px 10px"></th>
+        </tr></thead>
+        <tbody>${keyRows}</tbody>
+      </table>`:'<div class="hint">No API keys yet.</div>'}
+    </div>`;
+  }catch(e){apiKeysHtml='';}
+
+  // Fetch webhooks
+  let webhooksHtml='';
+  try{
+    const whR=await fetch('/api/webhooks');
+    const whD=await whR.json();
+    const hooks=whD.webhooks||[];
+    const hookRows=hooks.map(h=>`<tr>
+      <td style="padding:8px 10px;font-family:'IBM Plex Mono';font-size:11px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(h.url)}</td>
+      <td style="padding:8px 10px;font-size:11px">${(h.events||[]).join(', ')}</td>
+      <td style="padding:8px 10px;font-size:11px">${h.is_active?'<span style="color:var(--seal)">active</span>':`<span style="color:var(--brick)">disabled (${h.failure_count} failures)</span>`}</td>
+      <td style="padding:8px 10px;font-size:11px;color:var(--muted)">${h.last_triggered_at?new Date(h.last_triggered_at).toLocaleDateString():'never'}</td>
+      <td style="padding:8px 10px">
+        <button class="btn ghost" style="font-size:11px;padding:2px 8px" onclick="testWebhook('${h.id}')">Test</button>
+        <button class="btn ghost" style="font-size:11px;padding:2px 8px;color:var(--brick)" onclick="deleteWebhook('${h.id}')">Delete</button>
+      </td>
+    </tr>`).join('');
+    webhooksHtml=`<div style="margin-top:32px;border-top:1px solid var(--line);padding-top:24px">
+      <h3 style="font-family:'Archivo',sans-serif;margin-bottom:4px">Webhooks</h3>
+      <div class="hint" style="margin-bottom:12px">Get notified via HTTP POST when agent events occur. Payloads are signed with HMAC-SHA256.</div>
+      <div style="display:flex;gap:8px;margin-bottom:16px;align-items:end;flex-wrap:wrap">
+        <div style="flex:1;min-width:200px"><label style="font-size:11px;display:block;margin-bottom:4px">Endpoint URL</label>
+          <input type="url" id="new_wh_url" placeholder="https://your-server.com/webhook" style="width:100%;padding:6px 8px;border:1px solid var(--line);border-radius:3px;font-size:12px">
+        </div>
+        <div><label style="font-size:11px;display:block;margin-bottom:4px">Events</label>
+          <select id="new_wh_events" multiple style="padding:4px 6px;border:1px solid var(--line);border-radius:3px;font-size:11px;min-width:140px" size="4">
+            <option value="run.completed" selected>run.completed</option>
+            <option value="run.escalated" selected>run.escalated</option>
+            <option value="run.error" selected>run.error</option>
+            <option value="agent.status_changed">agent.status_changed</option>
+          </select>
+        </div>
+        <button class="btn accent" style="padding:6px 14px" onclick="createWebhook()">Add Webhook</button>
+      </div>
+      <div id="wh_result" style="display:none;margin-bottom:16px;padding:12px;background:#f0fdf4;border:1px solid #86efac;border-radius:4px;font-family:'IBM Plex Mono';font-size:12px;word-break:break-all"></div>
+      ${hooks.length?`<table style="width:100%;border-collapse:collapse;font-size:13px">
+        <thead><tr style="background:var(--bg2);text-align:left">
+          <th style="padding:8px 10px">URL</th><th style="padding:8px 10px">Events</th><th style="padding:8px 10px">Status</th><th style="padding:8px 10px">Last Fired</th><th style="padding:8px 10px"></th>
+        </tr></thead>
+        <tbody>${hookRows}</tbody>
+      </table>`:'<div class="hint">No webhooks configured.</div>'}
+    </div>`;
+  }catch(e){webhooksHtml='';}
+
   document.getElementById('root').innerHTML=`<div style="max-width:620px">
     <h2>Settings</h2>
     <div class="hint" style="margin-bottom:16px">Configure LLM providers and models. Keys are stored locally and never leave your instance.</div>
@@ -2990,6 +5752,8 @@ async function renderSettings(){
       <button class="btn accent" onclick="saveSettings()">Save Settings</button>
       <span id="settings_msg" style="margin-left:12px;font-size:11px"></span>
     </div>
+    ${apiKeysHtml}
+    ${webhooksHtml}
   </div>`;
 }
 
@@ -2999,6 +5763,8 @@ async function selectProvider(p){
 async function testProvider(p){
   const key=document.getElementById('key_'+p).value;
   if(!key){document.getElementById('test_'+p).textContent='no key';document.getElementById('test_'+p).style.color='var(--brick)';return;}
+  // Save the key first so the status updates
+  await saveSettings();
   const span=document.getElementById('test_'+p);
   span.textContent='testing...';span.style.color='var(--muted)';
   const d=await(await fetch('/api/settings/test/'+p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({api_key:key})})).json();
@@ -3017,6 +5783,1236 @@ async function saveSettings(){
   const msg=document.getElementById('settings_msg');
   msg.textContent='Saved';msg.style.color='var(--seal)';
   await boot();
+}
+
+async function createApiKey(){
+  const name=document.getElementById('new_key_name').value.trim();
+  if(!name){alert('Enter a key name');return;}
+  const sel=document.getElementById('new_key_scopes');
+  const scopes=Array.from(sel.selectedOptions).map(o=>o.value);
+  const r=await fetch('/api/keys',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,scopes})});
+  const d=await r.json();
+  if(d.ok){
+    const box=document.getElementById('new_key_result');
+    box.style.display='block';
+    box.innerHTML='<strong style="color:#16a34a">Copy this key now — it will not be shown again:</strong><br><br>'+esc(d.key);
+    document.getElementById('new_key_name').value='';
+    setTimeout(()=>renderSettings(),8000);
+  }
+}
+async function revokeApiKey(id){
+  if(!confirm('Revoke this API key? Any systems using it will stop working.'))return;
+  await fetch('/api/keys/'+id,{method:'DELETE'});
+  await renderSettings();
+}
+
+/* ═══════════════ ADMIN PANEL ═══════════════ */
+async function renderAdmin(){
+  if(!USER||!USER.is_admin){document.getElementById('root').innerHTML='<div style="padding:40px;color:var(--brick)">Admin access required.</div>';return;}
+  const [usersR, statsR]=await Promise.all([fetch('/api/admin/users'),fetch('/api/admin/stats')]);
+  const usersD=await usersR.json(), statsD=await statsR.json();
+  const users=usersD.users||[];
+  document.getElementById('root').innerHTML=`
+    <div style="padding:24px">
+      <h2 style="font-family:'Archivo',sans-serif;font-weight:700;margin-bottom:16px">Admin Panel</h2>
+      <div style="display:flex;gap:16px;margin-bottom:24px;flex-wrap:wrap">
+        <div class="card" style="padding:16px;text-align:center;min-width:120px">
+          <div style="font-size:28px;font-weight:700;color:var(--accent)">${statsD.total_users}</div>
+          <div style="font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--muted)">Total Users</div>
+        </div>
+        <div class="card" style="padding:16px;text-align:center;min-width:120px">
+          <div style="font-size:28px;font-weight:700;color:var(--seal)">${statsD.active_users}</div>
+          <div style="font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--muted)">Active Users</div>
+        </div>
+        <div class="card" style="padding:16px;text-align:center;min-width:120px">
+          <div style="font-size:28px;font-weight:700;color:var(--ochre)">${statsD.admin_users}</div>
+          <div style="font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--muted)">Admins</div>
+        </div>
+        <div class="card" style="padding:16px;text-align:center;min-width:120px">
+          <div style="font-size:28px;font-weight:700;color:var(--accent)">${statsD.total_agents}</div>
+          <div style="font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--muted)">Total Agents</div>
+        </div>
+        <div class="card" style="padding:16px;text-align:center;min-width:120px">
+          <div style="font-size:28px;font-weight:700;color:var(--seal)">${statsD.total_runs}</div>
+          <div style="font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--muted)">Total Runs</div>
+        </div>
+      </div>
+      <div class="card" style="padding:20px">
+        <h3 style="font-family:'Archivo',sans-serif;font-weight:600;margin-bottom:12px">User Management</h3>
+        <table style="width:100%;border-collapse:collapse;font-size:13px">
+          <thead>
+            <tr style="border-bottom:2px solid var(--line);text-align:left">
+              <th style="padding:8px 12px">Name</th>
+              <th style="padding:8px 12px">Email</th>
+              <th style="padding:8px 12px">Role</th>
+              <th style="padding:8px 12px">Org</th>
+              <th style="padding:8px 12px">Status</th>
+              <th style="padding:8px 12px">Admin</th>
+              <th style="padding:8px 12px">Last Login</th>
+              <th style="padding:8px 12px">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${users.map(u=>`<tr style="border-bottom:1px solid var(--line)">
+              <td style="padding:8px 12px;font-weight:500">${esc(u.name)}</td>
+              <td style="padding:8px 12px;font-family:'IBM Plex Mono',monospace;font-size:12px">${esc(u.email)}</td>
+              <td style="padding:8px 12px">${esc(u.role)}</td>
+              <td style="padding:8px 12px">${esc(u.org||'—')}</td>
+              <td style="padding:8px 12px">
+                <span style="display:inline-block;padding:2px 8px;border-radius:3px;font-size:11px;font-weight:600;
+                  background:${u.is_active?'var(--sealsoft)':'var(--bricksoft)'};color:${u.is_active?'var(--seal)':'var(--brick)'}">
+                  ${u.is_active?'Active':'Disabled'}</span>
+              </td>
+              <td style="padding:8px 12px">
+                <span style="display:inline-block;padding:2px 8px;border-radius:3px;font-size:11px;font-weight:600;
+                  background:${u.is_admin?'var(--ochresoft)':'var(--card)'};color:${u.is_admin?'var(--ochre)':'var(--muted)'}">
+                  ${u.is_admin?'Admin':'User'}</span>
+              </td>
+              <td style="padding:8px 12px;font-size:12px;color:var(--muted)">${u.last_login?new Date(u.last_login).toLocaleDateString():'Never'}</td>
+              <td style="padding:8px 12px">
+                ${u.id===USER.user_id?'<span style="color:var(--muted);font-size:11px">You</span>':`
+                  <button class="btn ghost" style="font-size:11px;padding:3px 8px;margin-right:4px" onclick="adminToggleAdmin('${u.id}',${!u.is_admin})">${u.is_admin?'Remove Admin':'Make Admin'}</button>
+                  <button class="btn ghost" style="font-size:11px;padding:3px 8px;margin-right:4px" onclick="adminToggleActive('${u.id}',${!u.is_active})">${u.is_active?'Disable':'Enable'}</button>
+                  ${!u.is_admin?`<button class="btn ghost" style="font-size:11px;padding:3px 8px;color:var(--brick)" onclick="adminDeleteUser('${u.id}','${esc(u.email)}')">Delete</button>`:''}`}
+              </td>
+            </tr>`).join('')}
+          </tbody>
+        </table>
+      </div>
+    </div>`;
+}
+
+async function adminToggleAdmin(uid,val){
+  await fetch('/api/admin/users/'+uid,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({is_admin:val})});
+  await renderAdmin();
+}
+async function adminToggleActive(uid,val){
+  await fetch('/api/admin/users/'+uid,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({is_active:val})});
+  await renderAdmin();
+}
+async function adminDeleteUser(uid,email){
+  if(!confirm('Delete user '+email+'? This cannot be undone.')) return;
+  await fetch('/api/admin/users/'+uid,{method:'DELETE'});
+  await renderAdmin();
+}
+
+/* ═══════════════ WEBHOOKS ═══════════════ */
+async function createWebhook(){
+  const url=document.getElementById('new_wh_url').value.trim();
+  if(!url){alert('Enter a webhook URL');return;}
+  const sel=document.getElementById('new_wh_events');
+  const events=Array.from(sel.selectedOptions).map(o=>o.value);
+  const r=await fetch('/api/webhooks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url,events})});
+  const d=await r.json();
+  if(d.ok){
+    const box=document.getElementById('wh_result');
+    box.style.display='block';
+    box.innerHTML='<strong style="color:#16a34a">Webhook created.</strong> Signing secret: <code>'+esc(d.secret)+'</code>';
+    document.getElementById('new_wh_url').value='';
+    setTimeout(()=>renderSettings(),5000);
+  }
+}
+async function testWebhook(id){
+  const r=await fetch('/api/webhooks/'+id+'/test',{method:'POST'});
+  const d=await r.json();
+  alert(d.ok?'Webhook test sent successfully':'Webhook test failed: '+(d.error||'unknown error'));
+}
+async function deleteWebhook(id){
+  if(!confirm('Delete this webhook?'))return;
+  await fetch('/api/webhooks/'+id,{method:'DELETE'});
+  await renderSettings();
+}
+
+/* ═══════════════ TEMPLATES ═══════════════ */
+async function renderTemplates(){
+  const r=await fetch('/api/templates');
+  const d=await r.json();
+  const tmpls=d.templates||[];
+  const cats=[...new Set(tmpls.map(t=>t.category))];
+  const catFilter=cats.map(c=>`<button class="btn ghost" style="font-size:11px;padding:3px 10px" onclick="filterTemplates('${c}')">${c}</button>`).join(' ');
+
+  const cards=tmpls.map(t=>`<div class="card" style="padding:16px;display:flex;flex-direction:column;gap:8px">
+    <div style="display:flex;align-items:center;gap:8px">
+      <span style="font-size:24px">${esc(t.icon||'🤖')}</span>
+      <div>
+        <div style="font-weight:600;font-size:14px">${esc(t.name)}</div>
+        <div style="font-size:11px;color:var(--muted)">${esc(t.category)} · used ${t.use_count}x</div>
+      </div>
+    </div>
+    <div style="font-size:12px;color:var(--faint);flex:1">${esc(t.description||'No description')}</div>
+    <div style="display:flex;gap:6px;margin-top:4px">
+      <button class="btn accent" style="font-size:11px;padding:4px 12px" onclick="cloneTemplate('${t.id}')">Use Template</button>
+      <button class="btn ghost" style="font-size:11px;padding:4px 8px;color:var(--brick)" onclick="deleteTemplate('${t.id}')">Delete</button>
+    </div>
+  </div>`).join('');
+
+  document.getElementById('root').innerHTML=`<div style="padding:24px">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+      <h2 style="font-family:'Archivo',sans-serif;font-weight:700">Agent Templates</h2>
+      <button class="btn accent" onclick="showSaveAsTemplate()">+ Save Agent as Template</button>
+    </div>
+    <div class="hint" style="margin-bottom:16px">Reusable agent configurations. Clone a template to spin up a pre-configured agent instantly.</div>
+    ${cats.length?`<div style="margin-bottom:16px;display:flex;gap:6px">${catFilter}</div>`:''}
+    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:16px">
+      ${cards||'<div class="hint">No templates yet. Save an agent as a template to get started.</div>'}
+    </div>
+    <div id="tmpl-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:1000;display:none;align-items:center;justify-content:center"></div>
+  </div>`;
+}
+async function cloneTemplate(id){
+  const r=await fetch('/api/templates/'+id+'/clone',{method:'POST'});
+  const d=await r.json();
+  if(d.ok){alert('Agent created: '+d.slug);await boot();setView('agents');}
+}
+async function deleteTemplate(id){
+  if(!confirm('Delete this template?'))return;
+  await fetch('/api/templates/'+id,{method:'DELETE'});
+  await renderTemplates();
+}
+async function showSaveAsTemplate(){
+  const name=prompt('Template name:');
+  if(!name)return;
+  const desc=prompt('Description (optional):');
+  const cat=prompt('Category (customer-support / data-processing / monitoring / automation / custom):','custom');
+  const icon=prompt('Emoji icon:','🤖');
+  // Pick an agent to snapshot
+  if(!AGENTS.length){alert('No agents to save as template');return;}
+  const agentNames=AGENTS.map((a,i)=>`${i+1}. ${a.name}`).join('\\n');
+  const pick=prompt('Which agent to save?\\n'+agentNames);
+  const idx=parseInt(pick)-1;
+  if(isNaN(idx)||idx<0||idx>=AGENTS.length)return;
+  const r=await fetch('/api/templates/from-agent',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({agent_id:AGENTS[idx].id,name,description:desc||'',category:cat||'custom',icon:icon||'🤖'})});
+  const d=await r.json();
+  if(d.ok){alert('Template saved');await renderTemplates();}
+}
+
+/* ═══════════════ ATTESTATIONS ═══════════════ */
+async function renderAttestations(){
+  const agentFilter=sel?'?agent_id='+sel:'';
+  const r=await fetch('/api/attestations'+agentFilter);
+  const d=await r.json();
+  const records=d.attestations||[];
+
+  const agentOpts=AGENTS.map(a=>`<option value="${a.id}" ${a.id===sel?'selected':''}>${esc(a.name)}</option>`).join('');
+
+  const rows=records.map(r=>`<tr style="border-bottom:1px solid var(--line)">
+    <td style="padding:8px 10px;font-size:11px;color:var(--muted)">${r.created_at?new Date(r.created_at).toLocaleString():''}</td>
+    <td style="padding:8px 10px;font-weight:500;font-size:12px">${esc(r.action)}</td>
+    <td style="padding:8px 10px;font-size:12px">${esc(r.agent_name)} <span style="font-size:10px;color:var(--muted)">v${r.agent_version}</span></td>
+    <td style="padding:8px 10px;font-size:12px">${esc(r.authorized_by||'system')}</td>
+    <td style="padding:8px 10px;font-size:11px">${esc(r.provider)}/${esc(r.model)}</td>
+    <td style="padding:8px 10px"><span style="font-size:11px;padding:2px 6px;border-radius:3px;background:${r.action_result==='COMPLETED'?'rgba(34,197,94,.15);color:#22c55e':r.action_result==='ERROR'?'rgba(239,68,68,.15);color:#ef4444':'rgba(249,115,22,.15);color:#f97316'}">${esc(r.action_result||'—')}</span></td>
+    <td style="padding:8px 10px;font-size:11px">${r.human_approval_required?(r.human_approval_granted?'✅ approved':'⏳ pending'):'—'}</td>
+    <td style="padding:8px 10px;font-family:'IBM Plex Mono';font-size:9px;color:var(--faint);max-width:80px;overflow:hidden;text-overflow:ellipsis" title="${esc(r.record_hash)}">${esc((r.record_hash||'').slice(0,12))}…</td>
+  </tr>`).join('');
+
+  document.getElementById('root').innerHTML=`<div style="padding:24px">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+      <h2 style="font-family:'Archivo',sans-serif;font-weight:700">Attestation Trail</h2>
+      <div style="display:flex;gap:8px;align-items:center">
+        <select onchange="sel=this.value;renderAttestations()" style="padding:4px 8px;border:1px solid var(--line);border-radius:3px;font-size:12px;background:var(--bg2);color:inherit">
+          <option value="">All agents</option>
+          ${agentOpts}
+        </select>
+        ${sel?`<button class="btn ghost" style="font-size:11px" onclick="verifyChain('${sel}')">Verify Chain</button>`:''}
+      </div>
+    </div>
+    <div class="hint" style="margin-bottom:16px">Immutable, hash-chained provenance records. Every agent action is logged with who authorized it, which model ran, and what happened.</div>
+    <div id="verify-result" style="display:none;margin-bottom:16px;padding:12px;border-radius:4px;font-size:12px"></div>
+    ${records.length?`<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:13px">
+      <thead><tr style="background:var(--bg2);text-align:left">
+        <th style="padding:8px 10px">Time</th><th style="padding:8px 10px">Action</th><th style="padding:8px 10px">Agent</th>
+        <th style="padding:8px 10px">Authorized By</th><th style="padding:8px 10px">Model</th><th style="padding:8px 10px">Result</th>
+        <th style="padding:8px 10px">Approval</th><th style="padding:8px 10px">Hash</th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table></div>`:'<div class="hint">No attestation records yet. Run an agent to generate provenance data.</div>'}
+  </div>`;
+}
+async function verifyChain(agentId){
+  const r=await fetch('/api/attestations/verify/'+agentId);
+  const d=await r.json();
+  const box=document.getElementById('verify-result');
+  box.style.display='block';
+  if(d.ok){
+    box.style.background='rgba(34,197,94,.1)';box.style.border='1px solid #22c55e';box.style.color='#22c55e';
+    box.textContent='✓ Chain verified — '+d.total+' records, all intact.';
+  }else{
+    box.style.background='rgba(239,68,68,.1)';box.style.border='1px solid #ef4444';box.style.color='#ef4444';
+    box.textContent='✗ Chain broken — '+d.broken_links.length+' link(s) tampered with out of '+d.total+' records.';
+  }
+}
+
+/* ═══════════════ APPROVALS ═══════════════ */
+async function renderApprovals(){
+  const [pendingR,decidedR]=await Promise.all([fetch('/api/approvals?status=pending'),fetch('/api/approvals?status=approved')]);
+  const pendingD=await pendingR.json(), decidedD=await decidedR.json();
+  const pending=pendingD.approvals||[], decided=decidedD.approvals||[];
+
+  const pendingCards=pending.map(a=>`<div class="card" style="padding:16px;margin-bottom:12px">
+    <div style="display:flex;justify-content:space-between;align-items:start">
+      <div>
+        <div style="font-weight:600;font-size:14px">${esc(a.action)}</div>
+        <div style="font-size:11px;color:var(--muted);margin-top:2px">Agent: ${esc(a.agent_id)} · ${a.created_at?new Date(a.created_at).toLocaleString():''}</div>
+        ${a.context&&a.context.claim?`<div style="font-size:12px;margin-top:8px;padding:8px;background:var(--bg2);border-radius:3px">${esc(a.context.claim)}</div>`:''}
+      </div>
+      <div style="display:flex;gap:6px">
+        <button class="btn accent" style="font-size:12px;padding:6px 16px" onclick="decideApproval('${a.id}','approved')">Approve</button>
+        <button class="btn ghost" style="font-size:12px;padding:6px 16px;color:var(--brick)" onclick="decideApproval('${a.id}','rejected')">Reject</button>
+      </div>
+    </div>
+  </div>`).join('');
+
+  document.getElementById('root').innerHTML=`<div style="padding:24px">
+    <h2 style="font-family:'Archivo',sans-serif;font-weight:700;margin-bottom:4px">Approval Queue</h2>
+    <div class="hint" style="margin-bottom:20px">Review and approve or reject pending agent actions. Agents configured to require human approval will pause here before executing.</div>
+    <h3 style="font-family:'Archivo',sans-serif;font-weight:600;margin-bottom:12px">Pending (${pending.length})</h3>
+    ${pending.length?pendingCards:'<div class="hint" style="margin-bottom:24px">No pending approvals.</div>'}
+    <h3 style="font-family:'Archivo',sans-serif;font-weight:600;margin-top:24px;margin-bottom:12px">Recent Decisions</h3>
+    ${decided.length?`<table style="width:100%;border-collapse:collapse;font-size:13px">
+      <thead><tr style="background:var(--bg2);text-align:left">
+        <th style="padding:8px 10px">Action</th><th style="padding:8px 10px">Agent</th><th style="padding:8px 10px">Status</th><th style="padding:8px 10px">Decided</th>
+      </tr></thead>
+      <tbody>${decided.map(a=>`<tr>
+        <td style="padding:8px 10px">${esc(a.action)}</td>
+        <td style="padding:8px 10px">${esc(a.agent_id)}</td>
+        <td style="padding:8px 10px"><span style="color:${a.status==='approved'?'var(--seal)':'var(--brick)'}">${esc(a.status)}</span></td>
+        <td style="padding:8px 10px;font-size:11px;color:var(--muted)">${a.created_at?new Date(a.created_at).toLocaleString():''}</td>
+      </tr>`).join('')}
+      </tbody>
+    </table>`:'<div class="hint">No decisions yet.</div>'}
+  </div>`;
+}
+async function decideApproval(id,decision){
+  const note=decision==='rejected'?prompt('Reason for rejection (optional):',''):'';
+  await fetch('/api/approvals/'+id,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({decision,note:note||''})});
+  await renderApprovals();
+}
+
+/* ═══════════════ NOTIFICATIONS ═══════════════ */
+let _notifOpen=false;
+async function pollNotifications(){
+  try{
+    const r=await fetch('/api/notifications');
+    const d=await r.json();
+    const badge=document.getElementById('notif-badge');
+    if(d.unread>0){badge.style.display='';badge.textContent=d.unread>9?'9+':d.unread;}
+    else{badge.style.display='none';}
+    window._notifData=d.notifications||[];
+  }catch(e){}
+}
+function toggleNotifPanel(){
+  const panel=document.getElementById('notif-panel');
+  _notifOpen=!_notifOpen;
+  if(!_notifOpen){panel.style.display='none';return;}
+  const notifs=window._notifData||[];
+  if(!notifs.length){
+    panel.innerHTML='<div style="padding:20px;text-align:center;color:var(--muted)">No notifications</div>';
+  }else{
+    panel.innerHTML=`<div style="padding:8px 12px;border-bottom:1px solid #3d2a1a;display:flex;justify-content:space-between;align-items:center">
+      <span style="font-weight:600;font-size:12px">Notifications</span>
+      <button class="btn ghost" style="font-size:10px;padding:2px 6px" onclick="markAllRead()">Mark all read</button>
+    </div>`+notifs.map(n=>`<div style="padding:10px 12px;border-bottom:1px solid #2a1f0f;${n.is_read?'opacity:.6':''}cursor:pointer" onclick="dismissNotif('${n.id}')">
+      <div style="font-weight:${n.is_read?'400':'600'};font-size:12px;margin-bottom:2px">${esc(n.title)}</div>
+      ${n.body?`<div style="font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(n.body)}</div>`:''}
+      <div style="font-size:10px;color:var(--faint);margin-top:2px">${n.created_at?new Date(n.created_at).toLocaleString():''}</div>
+    </div>`).join('');
+  }
+  panel.style.display='block';
+}
+async function markAllRead(){
+  await fetch('/api/notifications/read',{method:'POST'});
+  document.getElementById('notif-badge').style.display='none';
+  (window._notifData||[]).forEach(n=>n.is_read=true);
+  toggleNotifPanel();toggleNotifPanel();
+}
+async function dismissNotif(id){
+  await fetch('/api/notifications/'+id,{method:'DELETE'});
+  window._notifData=(window._notifData||[]).filter(n=>n.id!==id);
+  pollNotifications();
+  if(_notifOpen){toggleNotifPanel();toggleNotifPanel();}
+}
+setInterval(pollNotifications,15000);
+
+/* ═══════════════ ANALYTICS DASHBOARD ═══════════════ */
+async function renderAnalytics(){
+  const root=document.getElementById('root');
+  root.innerHTML='<div style="text-align:center;padding:60px;color:var(--muted)">Loading analytics...</div>';
+  let data;
+  try{
+    const r=await fetch('/api/analytics?days=30');
+    data=await r.json();
+  }catch(e){
+    root.innerHTML='<div style="padding:40px;color:#dc2626">Failed to load analytics</div>';
+    return;
+  }
+  const s=data.summary;
+
+  // ── SVG bar chart helper ──
+  function barChart(series, labelKey, valueKey, color, w, h){
+    if(!series.length) return '<div style="color:var(--muted);font-size:12px;padding:20px">No data yet</div>';
+    const max=Math.max(...series.map(d=>d[valueKey]),1);
+    const bw=Math.max(4, Math.floor((w-20)/series.length)-2);
+    const bars=series.map((d,i)=>{
+      const bh=Math.max(1, d[valueKey]/max*(h-30));
+      const x=10+i*(bw+2);
+      const y=h-25-bh;
+      const label=d[labelKey].slice(5); // trim year from date
+      return `<rect x="${x}" y="${y}" width="${bw}" height="${bh}" fill="${color}" rx="1"><title>${d[labelKey]}: ${d[valueKey].toLocaleString()}</title></rect>${i%Math.max(1,Math.floor(series.length/6))===0?`<text x="${x}" y="${h-6}" font-size="9" fill="var(--muted)" font-family="IBM Plex Mono">${label}</text>`:''}`;
+    }).join('');
+    return `<svg width="100%" viewBox="0 0 ${w} ${h}" preserveAspectRatio="xMinYMid meet">${bars}</svg>`;
+  }
+
+  // ── Donut chart helper ──
+  function donut(obj, colors, size){
+    const entries=Object.entries(obj);
+    if(!entries.length) return '<div style="color:var(--muted);font-size:12px;padding:20px">No data</div>';
+    const total=entries.reduce((s,e)=>s+e[1],0)||1;
+    const r=size/2-8, cx=size/2, cy=size/2;
+    let cum=0;
+    const arcs=entries.map(([k,v],i)=>{
+      const pct=v/total;
+      const start=cum*2*Math.PI-Math.PI/2;
+      cum+=pct;
+      const end=cum*2*Math.PI-Math.PI/2;
+      const large=pct>0.5?1:0;
+      const x1=cx+r*Math.cos(start), y1=cy+r*Math.sin(start);
+      const x2=cx+r*Math.cos(end), y2=cy+r*Math.sin(end);
+      const c=colors[i%colors.length];
+      return pct>0.001?`<path d="M ${cx} ${cy} L ${x1} ${y1} A ${r} ${r} 0 ${large} 1 ${x2} ${y2} Z" fill="${c}"><title>${k}: ${v} (${(pct*100).toFixed(1)}%)</title></path>`:'';
+    }).join('');
+    // Inner circle for donut effect
+    const inner=`<circle cx="${cx}" cy="${cy}" r="${r*0.55}" fill="var(--card)"/>`;
+    const legend=entries.map(([k,v],i)=>`<div style="display:flex;align-items:center;gap:6px;font-size:11px"><div style="width:10px;height:10px;border-radius:2px;background:${colors[i%colors.length]}"></div><span style="color:var(--muted)">${esc(k)}</span><span style="margin-left:auto;font-family:'IBM Plex Mono';color:var(--fg)">${v}</span></div>`).join('');
+    return `<div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap"><svg width="${size}" height="${size}" viewBox="0 0 ${size} ${size}">${arcs}${inner}<text x="${cx}" y="${cy+4}" text-anchor="middle" font-size="14" font-weight="600" fill="var(--fg)" font-family="IBM Plex Mono">${total}</text></svg><div style="display:flex;flex-direction:column;gap:4px;min-width:120px">${legend}</div></div>`;
+  }
+
+  const donutColors=['#f97316','#22c55e','#ef4444','#3b82f6','#a855f7','#eab308','#06b6d4','#ec4899'];
+
+  root.innerHTML=`
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:20px">
+      <div>
+        <h2 style="font-family:'Archivo';font-size:20px;font-weight:700;color:var(--fg);margin:0">Usage Analytics</h2>
+        <div style="font-size:12px;color:var(--muted);margin-top:2px">Last ${data.period_days} days</div>
+      </div>
+      <div style="display:flex;gap:6px">
+        <button class="btn ghost" onclick="window._analyticsDays=7;renderAnalytics()" style="font-size:10px;padding:4px 10px">7d</button>
+        <button class="btn ghost" onclick="window._analyticsDays=30;renderAnalytics()" style="font-size:10px;padding:4px 10px">30d</button>
+        <button class="btn ghost" onclick="window._analyticsDays=90;renderAnalytics()" style="font-size:10px;padding:4px 10px">90d</button>
+      </div>
+    </div>
+
+    <!-- KPI Row -->
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:20px">
+      <div class="card" style="padding:16px;text-align:center">
+        <div style="font-size:24px;font-weight:700;font-family:'Archivo';color:var(--accent)">${s.total_runs.toLocaleString()}</div>
+        <div style="font-size:10px;color:var(--muted);letter-spacing:.06em;margin-top:4px">TOTAL RUNS</div>
+      </div>
+      <div class="card" style="padding:16px;text-align:center">
+        <div style="font-size:24px;font-weight:700;font-family:'Archivo';color:#22c55e">${s.success_rate}%</div>
+        <div style="font-size:10px;color:var(--muted);letter-spacing:.06em;margin-top:4px">SUCCESS RATE</div>
+      </div>
+      <div class="card" style="padding:16px;text-align:center">
+        <div style="font-size:24px;font-weight:700;font-family:'Archivo';color:var(--fg)">${s.total_tokens>=1e6?(s.total_tokens/1e6).toFixed(1)+'M':s.total_tokens>=1e3?(s.total_tokens/1e3).toFixed(1)+'K':s.total_tokens}</div>
+        <div style="font-size:10px;color:var(--muted);letter-spacing:.06em;margin-top:4px">TOTAL TOKENS</div>
+      </div>
+      <div class="card" style="padding:16px;text-align:center">
+        <div style="font-size:24px;font-weight:700;font-family:'Archivo';color:var(--fg)">${s.avg_tokens_per_run.toLocaleString()}</div>
+        <div style="font-size:10px;color:var(--muted);letter-spacing:.06em;margin-top:4px">AVG TOKENS/RUN</div>
+      </div>
+      <div class="card" style="padding:16px;text-align:center">
+        <div style="font-size:24px;font-weight:700;font-family:'Archivo';color:var(--fg)">${s.avg_latency_s}s</div>
+        <div style="font-size:10px;color:var(--muted);letter-spacing:.06em;margin-top:4px">AVG LATENCY</div>
+      </div>
+      <div class="card" style="padding:16px;text-align:center">
+        <div style="font-size:24px;font-weight:700;font-family:'Archivo';color:var(--fg)">${s.p95_latency_s}s</div>
+        <div style="font-size:10px;color:var(--muted);letter-spacing:.06em;margin-top:4px">P95 LATENCY</div>
+      </div>
+    </div>
+
+    <!-- Charts Row -->
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:20px">
+      <div class="card" style="padding:16px">
+        <div style="font-size:12px;font-weight:600;color:var(--fg);margin-bottom:12px;letter-spacing:.04em">Runs per Day</div>
+        ${barChart(data.runs_by_day, 'date', 'count', '#f97316', 400, 160)}
+      </div>
+      <div class="card" style="padding:16px">
+        <div style="font-size:12px;font-weight:600;color:var(--fg);margin-bottom:12px;letter-spacing:.04em">Token Usage per Day</div>
+        ${barChart(data.tokens_by_day, 'date', 'tokens', '#3b82f6', 400, 160)}
+      </div>
+    </div>
+
+    <!-- Breakdown Row -->
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;margin-bottom:20px">
+      <div class="card" style="padding:16px">
+        <div style="font-size:12px;font-weight:600;color:var(--fg);margin-bottom:12px;letter-spacing:.04em">Outcomes</div>
+        ${donut(data.outcomes, donutColors, 120)}
+      </div>
+      <div class="card" style="padding:16px">
+        <div style="font-size:12px;font-weight:600;color:var(--fg);margin-bottom:12px;letter-spacing:.04em">Providers</div>
+        ${donut(data.providers, ['#f97316','#3b82f6','#22c55e','#a855f7','#eab308'], 120)}
+      </div>
+      <div class="card" style="padding:16px">
+        <div style="font-size:12px;font-weight:600;color:var(--fg);margin-bottom:12px;letter-spacing:.04em">Models</div>
+        ${donut(data.models, ['#06b6d4','#ec4899','#f97316','#22c55e','#a855f7'], 120)}
+      </div>
+    </div>
+
+    <!-- Top Agents Table -->
+    <div class="card" style="padding:16px">
+      <div style="font-size:12px;font-weight:600;color:var(--fg);margin-bottom:12px;letter-spacing:.04em">Top Agents by Usage</div>
+      ${data.top_agents.length?`
+      <div style="overflow-x:auto">
+      <table style="width:100%;font-size:12px;border-collapse:collapse">
+        <thead><tr style="border-bottom:1px solid var(--line)">
+          <th style="text-align:left;padding:6px 8px;color:var(--muted);font-size:10px;letter-spacing:.06em">AGENT</th>
+          <th style="text-align:right;padding:6px 8px;color:var(--muted);font-size:10px;letter-spacing:.06em">RUNS</th>
+          <th style="text-align:right;padding:6px 8px;color:var(--muted);font-size:10px;letter-spacing:.06em">TOKENS</th>
+          <th style="text-align:left;padding:6px 8px;color:var(--muted);font-size:10px;letter-spacing:.06em">USAGE BAR</th>
+        </tr></thead>
+        <tbody>
+        ${data.top_agents.map((a,i)=>{
+          const maxRuns=data.top_agents[0].runs||1;
+          const pct=Math.round(a.runs/maxRuns*100);
+          return `<tr style="border-bottom:1px solid var(--line)">
+            <td style="padding:8px;font-family:'IBM Plex Mono';color:var(--fg)">${esc(a.name)}</td>
+            <td style="padding:8px;text-align:right;font-family:'IBM Plex Mono';color:var(--accent);font-weight:600">${a.runs}</td>
+            <td style="padding:8px;text-align:right;font-family:'IBM Plex Mono';color:var(--muted)">${a.tokens>=1e6?(a.tokens/1e6).toFixed(1)+'M':a.tokens>=1e3?(a.tokens/1e3).toFixed(1)+'K':a.tokens}</td>
+            <td style="padding:8px"><div style="background:var(--line);border-radius:3px;height:8px;width:100%;overflow:hidden"><div style="height:100%;width:${pct}%;background:linear-gradient(90deg,#f97316,#fbbf24);border-radius:3px"></div></div></td>
+          </tr>`;
+        }).join('')}
+        </tbody>
+      </table></div>`:'<div style="color:var(--muted);font-size:12px;padding:20px;text-align:center">No agent data yet. Run some agents to see usage analytics.</div>'}
+    </div>
+
+    <!-- Token Breakdown -->
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:16px">
+      <div class="card" style="padding:16px">
+        <div style="font-size:12px;font-weight:600;color:var(--fg);margin-bottom:8px;letter-spacing:.04em">Token Breakdown</div>
+        <div style="display:flex;gap:20px;margin-top:12px">
+          <div><div style="font-size:18px;font-weight:700;font-family:'Archivo';color:#3b82f6">${s.input_tokens>=1e6?(s.input_tokens/1e6).toFixed(2)+'M':s.input_tokens>=1e3?(s.input_tokens/1e3).toFixed(1)+'K':s.input_tokens}</div><div style="font-size:10px;color:var(--muted);margin-top:2px">INPUT</div></div>
+          <div><div style="font-size:18px;font-weight:700;font-family:'Archivo';color:#f97316">${s.output_tokens>=1e6?(s.output_tokens/1e6).toFixed(2)+'M':s.output_tokens>=1e3?(s.output_tokens/1e3).toFixed(1)+'K':s.output_tokens}</div><div style="font-size:10px;color:var(--muted);margin-top:2px">OUTPUT</div></div>
+        </div>
+        <div style="display:flex;height:12px;border-radius:6px;overflow:hidden;margin-top:12px;background:var(--line)">
+          <div style="width:${s.total_tokens?Math.round(s.input_tokens/s.total_tokens*100):50}%;background:#3b82f6"></div>
+          <div style="width:${s.total_tokens?Math.round(s.output_tokens/s.total_tokens*100):50}%;background:#f97316"></div>
+        </div>
+      </div>
+      <div class="card" style="padding:16px">
+        <div style="font-size:12px;font-weight:600;color:var(--fg);margin-bottom:8px;letter-spacing:.04em">Run Outcomes</div>
+        <div style="display:flex;gap:20px;margin-top:12px">
+          <div><div style="font-size:18px;font-weight:700;font-family:'Archivo';color:#22c55e">${s.completed}</div><div style="font-size:10px;color:var(--muted);margin-top:2px">COMPLETED</div></div>
+          <div><div style="font-size:18px;font-weight:700;font-family:'Archivo';color:#eab308">${s.escalated}</div><div style="font-size:10px;color:var(--muted);margin-top:2px">ESCALATED</div></div>
+          <div><div style="font-size:18px;font-weight:700;font-family:'Archivo';color:#ef4444">${s.errored}</div><div style="font-size:10px;color:var(--muted);margin-top:2px">ERRORS</div></div>
+        </div>
+        <div style="display:flex;height:12px;border-radius:6px;overflow:hidden;margin-top:12px;background:var(--line)">
+          ${s.total_runs?`<div style="width:${Math.round(s.completed/s.total_runs*100)}%;background:#22c55e"></div><div style="width:${Math.round(s.escalated/s.total_runs*100)}%;background:#eab308"></div><div style="width:${Math.round(s.errored/s.total_runs*100)}%;background:#ef4444"></div>`:''}
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+/* ═══════════════ ADAPTIVE RUNTIME (CAR) ═══════════════ */
+async function renderRuntime(){
+  const root=document.getElementById('root');
+  root.innerHTML='<div style="padding:24px"><div class="stat-card" style="text-align:center;padding:32px"><div class="spinner"></div><div style="margin-top:12px;color:var(--muted);font-size:13px">Loading Adaptive Runtime...</div></div></div>';
+  let health,pressure,state,audit;
+  try{
+    [health,pressure,state,audit]=await Promise.all([
+      fetch('/api/car/health').then(r=>r.json()),
+      fetch('/api/car/pressure').then(r=>r.json()),
+      fetch('/api/car/state').then(r=>r.json()),
+      fetch('/api/car/audit?limit=25').then(r=>r.json()),
+    ]);
+  }catch(e){
+    root.innerHTML='<div style="padding:24px"><div class="stat-card" style="padding:32px;text-align:center;color:var(--muted)">Could not load runtime data.</div></div>';
+    return;
+  }
+
+  const hc=health.health||'unknown';
+  const hColor=hc==='healthy'?'#22c55e':hc==='elevated'?'#eab308':'#ef4444';
+  const hIcon=hc==='healthy'?'●':hc==='elevated'?'◐':'◉';
+
+  // Fingerprint cards
+  const fps=state.fingerprints||{};
+  const fpIds=Object.keys(fps);
+  let fpCards='';
+  if(fpIds.length===0){
+    fpCards='<div style="color:var(--muted);font-size:13px;padding:16px">No agent fingerprints yet. Run some agents to build behavioral profiles.</div>';
+  }else{
+    fpCards=fpIds.map(aid=>{
+      const f=fps[aid];
+      const d=f.drift||{};
+      const dc=d.direction==='stable'?'#22c55e':d.direction==='elevated'?'#eab308':'#ef4444';
+      const envs=f.envelopes||{};
+      const envHTML=Object.keys(envs).map(k=>{
+        const e=envs[k];
+        return '<div style="display:flex;justify-content:space-between;font-size:11px;padding:2px 0"><span style="color:var(--muted)">'+esc(k)+'</span><span>med '+Math.round(e.median)+' · p95 '+Math.round(e.p95)+' · CV '+e.cv+'</span></div>';
+      }).join('');
+      return '<div class="stat-card" style="padding:16px;margin-bottom:8px">'+
+        '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">'+
+          '<div style="font-weight:600;font-size:13px">'+esc(aid)+'</div>'+
+          '<div style="display:flex;align-items:center;gap:8px">'+
+            '<span style="font-size:10px;padding:2px 8px;border-radius:10px;background:'+dc+'22;color:'+dc+';font-weight:600">'+esc(d.direction||'--')+'</span>'+
+            '<span style="font-size:11px;color:var(--muted)">drift '+((d.score||0)*100).toFixed(0)+'%</span>'+
+          '</div>'+
+        '</div>'+
+        '<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:10px">'+
+          '<div><div style="font-size:10px;color:var(--muted)">RUNS</div><div style="font-size:15px;font-weight:600">'+(f.total_runs||0)+'</div></div>'+
+          '<div><div style="font-size:10px;color:var(--muted)">SUCCESS</div><div style="font-size:15px;font-weight:600">'+((f.success_rate||0)*100).toFixed(1)+'%</div></div>'+
+          '<div><div style="font-size:10px;color:var(--muted)">TOKENS</div><div style="font-size:15px;font-weight:600">'+(f.total_tokens||0).toLocaleString()+'</div></div>'+
+          '<div><div style="font-size:10px;color:var(--muted)">COST</div><div style="font-size:15px;font-weight:600">$'+(f.total_cost||0).toFixed(2)+'</div></div>'+
+        '</div>'+
+        '<div style="border-top:1px solid var(--border);padding-top:8px;margin-top:4px">'+
+          '<div style="font-size:10px;font-weight:600;letter-spacing:.06em;color:var(--muted);margin-bottom:4px">BEHAVIORAL ENVELOPES</div>'+
+          (envHTML||'<div style="font-size:11px;color:var(--muted)">Building... (need 5+ runs)</div>')+
+        '</div>'+
+      '</div>';
+    }).join('');
+  }
+
+  // Router leaderboards
+  const routers=state.routers||{};
+  const taskTypes=Object.keys(routers);
+  let lbHTML='';
+  if(taskTypes.length===0){
+    lbHTML='<div style="color:var(--muted);font-size:13px;padding:16px">No routing data yet.</div>';
+  }else{
+    lbHTML=taskTypes.map(tt=>{
+      const r=routers[tt];
+      const arms=Object.values(r.arms||{}).filter(a=>a.total_pulls>0).sort((a,b)=>(b.total_successes/(b.total_pulls||1))-(a.total_successes/(a.total_pulls||1)));
+      if(!arms.length)return '';
+      return '<div style="margin-bottom:16px">'+
+        '<div style="font-size:11px;font-weight:600;letter-spacing:.06em;color:var(--muted);margin-bottom:6px">TASK: '+esc(tt.toUpperCase())+'</div>'+
+        '<table style="width:100%;font-size:12px;border-collapse:collapse">'+
+        '<tr style="border-bottom:1px solid var(--border)"><th style="text-align:left;padding:4px 8px;color:var(--muted);font-size:10px">PROVIDER</th><th style="text-align:left;padding:4px 8px;color:var(--muted);font-size:10px">MODEL</th><th style="text-align:right;padding:4px 8px;color:var(--muted);font-size:10px">PULLS</th><th style="text-align:right;padding:4px 8px;color:var(--muted);font-size:10px">SUCCESS</th><th style="text-align:right;padding:4px 8px;color:var(--muted);font-size:10px">AVG LAT</th><th style="text-align:right;padding:4px 8px;color:var(--muted);font-size:10px">AVG COST</th></tr>'+
+        arms.map((a,i)=>{
+          const sr=a.total_pulls?((a.total_successes/a.total_pulls)*100).toFixed(0):'--';
+          const bg=i===0?'rgba(34,197,94,.06)':'transparent';
+          return '<tr style="background:'+bg+'"><td style="padding:4px 8px">'+esc(a.provider)+'</td><td style="padding:4px 8px;font-family:var(--mono)">'+esc(a.model)+'</td><td style="text-align:right;padding:4px 8px">'+a.total_pulls+'</td><td style="text-align:right;padding:4px 8px;font-weight:600">'+sr+'%</td><td style="text-align:right;padding:4px 8px">'+Math.round(a.avg_latency)+'ms</td><td style="text-align:right;padding:4px 8px">$'+a.avg_cost.toFixed(4)+'</td></tr>';
+        }).join('')+
+        '</table></div>';
+    }).join('');
+  }
+
+  // Audit trail
+  const auditRows=(audit||[]).slice().reverse().map(e=>
+    '<div style="display:flex;gap:12px;padding:5px 0;border-bottom:1px solid var(--border);font-size:11px">'+
+      '<span style="color:var(--muted);white-space:nowrap;font-family:var(--mono)">'+esc(e.ts||'')+'</span>'+
+      '<span style="color:#f97316;font-weight:600;min-width:120px">'+esc(e.action||'')+'</span>'+
+      '<span style="flex:1;color:var(--fg)">'+esc(e.detail||'')+'</span>'+
+      '<span style="color:var(--muted);font-family:var(--mono);font-size:10px">'+esc(e.sig||'')+'</span>'+
+    '</div>'
+  ).join('');
+
+  // Pressure
+  const pr=pressure.averages||{};
+  const pp=pressure.primary_pressure||'--';
+
+  // Policy
+  const pol=state.prediction_policy||{};
+  const pw=pol.weights||{};
+
+  root.innerHTML=`
+    <div style="padding:24px">
+      <div style="display:flex;align-items:center;gap:16px;margin-bottom:24px">
+        <div>
+          <div style="font-size:20px;font-weight:700;font-family:var(--head)">Adaptive Runtime</div>
+          <div style="font-size:12px;color:var(--muted)">Behavioral fingerprinting · Adaptive routing · Run prediction · Governed audit</div>
+        </div>
+        <div style="margin-left:auto;display:flex;align-items:center;gap:12px">
+          <span style="font-size:24px;color:${hColor}">${hIcon}</span>
+          <div>
+            <div style="font-size:14px;font-weight:700;color:${hColor}">${esc((hc||'').toUpperCase())}</div>
+            <div style="font-size:10px;color:var(--muted)">${health.total_agents||0} agents · ${health.total_runs||0} runs · $${(health.total_cost||0).toFixed(2)}</div>
+          </div>
+        </div>
+      </div>
+
+      <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:24px">
+        <div class="stat-card" style="padding:14px">
+          <div style="font-size:10px;letter-spacing:.06em;color:var(--muted);margin-bottom:4px">FLEET SUCCESS</div>
+          <div style="font-size:22px;font-weight:700">${health.fleet_success_rate!==null?((health.fleet_success_rate||0)*100).toFixed(1)+'%':'--'}</div>
+        </div>
+        <div class="stat-card" style="padding:14px">
+          <div style="font-size:10px;letter-spacing:.06em;color:var(--muted);margin-bottom:4px">FLEET CV</div>
+          <div style="font-size:22px;font-weight:700">${(health.fleet_cv||0).toFixed(3)}</div>
+          <div style="font-size:10px;color:var(--muted)">dispersion</div>
+        </div>
+        <div class="stat-card" style="padding:14px">
+          <div style="font-size:10px;letter-spacing:.06em;color:var(--muted);margin-bottom:4px">FAILURE TAIL</div>
+          <div style="font-size:22px;font-weight:700">${((health.failure_tail_share||0)*100).toFixed(1)}%</div>
+          <div style="font-size:10px;color:var(--muted)">outlier share</div>
+        </div>
+        <div class="stat-card" style="padding:14px">
+          <div style="font-size:10px;letter-spacing:.06em;color:var(--muted);margin-bottom:4px">DRIFT PRESSURE</div>
+          <div style="font-size:22px;font-weight:700">${esc(pp)}</div>
+          <div style="font-size:10px;color:var(--muted)">${Object.entries(pr).map(([k,v])=>k+': '+v).join(' · ')}</div>
+        </div>
+      </div>
+
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:24px">
+        <div>
+          <div style="font-size:13px;font-weight:700;margin-bottom:10px;font-family:var(--head)">Agent Fingerprints</div>
+          <div style="max-height:400px;overflow-y:auto">${fpCards}</div>
+        </div>
+        <div>
+          <div style="font-size:13px;font-weight:700;margin-bottom:10px;font-family:var(--head)">Routing Leaderboard</div>
+          <div class="stat-card" style="padding:16px;max-height:400px;overflow-y:auto">${lbHTML}</div>
+        </div>
+      </div>
+
+      <div style="display:grid;grid-template-columns:2fr 1fr;gap:16px">
+        <div>
+          <div style="font-size:13px;font-weight:700;margin-bottom:10px;font-family:var(--head)">Audit Trail</div>
+          <div class="stat-card" style="padding:12px;max-height:300px;overflow-y:auto;font-family:var(--mono)">
+            ${auditRows||'<div style="color:var(--muted);font-size:12px">No audit entries yet.</div>'}
+          </div>
+        </div>
+        <div>
+          <div style="font-size:13px;font-weight:700;margin-bottom:10px;font-family:var(--head)">Prediction Policy</div>
+          <div class="stat-card" style="padding:16px">
+            <div style="font-size:10px;color:var(--muted);margin-bottom:8px">VERSION ${esc(pol.version||'--')}</div>
+            <div style="font-size:11px;margin-bottom:4px"><strong>Weights</strong></div>
+            <div style="font-size:12px;margin-bottom:8px;padding-left:8px">
+              Complexity: ${((pw.prompt_complexity||0)*100).toFixed(0)}%<br/>
+              Historical Fit: ${((pw.historical_fit||0)*100).toFixed(0)}%<br/>
+              Provider Health: ${((pw.provider_health||0)*100).toFixed(0)}%
+            </div>
+            <div style="font-size:11px;margin-bottom:4px"><strong>Thresholds</strong></div>
+            <div style="font-size:12px;padding-left:8px">
+              High confidence: ≥${(pol.thresholds||{}).high_confidence||75}<br/>
+              Medium confidence: ≥${(pol.thresholds||{}).medium_confidence||50}
+            </div>
+          </div>
+          ${health.drifting_agents&&health.drifting_agents.length?
+            '<div style="margin-top:12px"><div style="font-size:13px;font-weight:700;margin-bottom:8px;font-family:var(--head);color:#ef4444">Drifting Agents</div><div class="stat-card" style="padding:12px">'+
+            health.drifting_agents.map(a=>'<div style="font-size:12px;padding:3px 0;color:#ef4444">◉ '+esc(a)+'</div>').join('')+
+            '</div></div>':''}
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+/* ═══════════════ OBSERVABILITY (metrics · traces · logs · alerts · SLOs · health) ═══════════════ */
+let obsSubTab='overview';
+async function renderObservability(){
+  const root=document.getElementById('root');
+  root.innerHTML='<div style="padding:24px"><div class="stat-card" style="text-align:center;padding:32px"><div class="spinner"></div><div style="margin-top:12px;color:var(--muted);font-size:13px">Loading observability...</div></div></div>';
+  let s;
+  try{ s=await fetch('/api/observability/summary').then(r=>r.json()); }
+  catch(e){ root.innerHTML='<div style="padding:24px"><div class="stat-card" style="padding:32px;text-align:center;color:var(--muted)">Could not load observability data.</div></div>'; return; }
+  const sub=['overview','traces','logs','alerts','slos','health'];
+  const tabRow='<div class="tab-row" style="margin-bottom:16px">'+sub.map(t=>
+    `<button class="tab-btn${obsSubTab===t?' active':''}" onclick="obsSubTab='${t}';renderObservability()">${t.toUpperCase()}</button>`).join('')+'</div>';
+  let body='';
+  if(obsSubTab==='overview'){
+    const h=s.health||{}, al=s.alerts||{}, sl=(s.slos||{}).summary||{}, lo=s.logs||{}, tr=s.traces||{};
+    const hColor=h.status==='healthy'?'#22c55e':h.status==='degraded'?'#eab308':'#ef4444';
+    body=`<div class="grid-4" style="display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:18px">
+      ${statCard('Fleet Health',(h.avg_score!=null?h.avg_score:100)+'<span style="font-size:13px;color:var(--muted)">/100</span>',h.status||'healthy',hColor)}
+      ${statCard('Firing Alerts',al.firing||0,(al.total_rules||0)+' rules',al.firing>0?'#ef4444':'#22c55e')}
+      ${statCard('SLOs At Risk',sl.at_risk||0,(sl.total_slos||0)+' tracked',sl.at_risk>0?'#eab308':'#22c55e')}
+      ${statCard('Traces',tr.total_traces||0,(tr.total_spans||0)+' spans','#f97316')}
+    </div>
+    <div class="grid-2" style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
+      <div class="stat-card"><div class="card-title">Log Volume</div>
+        ${Object.entries(lo.level_counts||{}).map(([k,v])=>`<div style="display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid var(--line)"><span style="text-transform:uppercase;font-size:11px;color:${k==='error'||k==='fatal'?'#ef4444':k==='warn'?'#eab308':'var(--muted)'}">${esc(k)}</span><span style="font-family:monospace">${v}</span></div>`).join('')||'<div style="color:var(--muted);font-size:12px">No logs yet</div>'}
+      </div>
+      <div class="stat-card"><div class="card-title">Health by Status</div>
+        ${Object.entries(h.by_status||{}).map(([k,v])=>`<div style="display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid var(--line)"><span style="text-transform:capitalize;font-size:12px">${esc(k)}</span><span style="font-family:monospace">${v}</span></div>`).join('')||'<div style="color:var(--muted);font-size:12px">No agents scored yet</div>'}
+      </div>
+    </div>`;
+  } else if(obsSubTab==='traces'){
+    const d=await fetch('/api/observability/traces?limit=40').then(r=>r.json()).catch(()=>({traces:[]}));
+    const rows=(d.traces||[]).map(t=>`<tr onclick="showTrace('${t.trace_id}')" style="cursor:pointer">
+      <td style="font-family:monospace;font-size:11px">${esc(t.trace_id.slice(0,12))}</td>
+      <td>${t.span_count}</td><td>${(t.total_duration_ms||0).toFixed(1)}ms</td>
+      <td>${(t.services||[]).join(', ')}</td>
+      <td>${t.has_errors?'<span style="color:#ef4444">● error</span>':'<span style="color:#22c55e">● ok</span>'}</td></tr>`).join('');
+    body=`<div class="stat-card"><div class="card-title">Distributed Traces</div>
+      <table class="data-table"><thead><tr><th>Trace ID</th><th>Spans</th><th>Duration</th><th>Services</th><th>Status</th></tr></thead>
+      <tbody>${rows||'<tr><td colspan=5 style="color:var(--muted);padding:16px">No traces captured yet. Run an agent to generate traces.</td></tr>'}</tbody></table>
+      <div id="trace-detail"></div></div>`;
+  } else if(obsSubTab==='logs'){
+    const d=await fetch('/api/observability/logs?limit=100').then(r=>r.json()).catch(()=>({entries:[]}));
+    const eg=await fetch('/api/observability/logs/errors').then(r=>r.json()).catch(()=>({error_groups:[]}));
+    const errRows=(eg.error_groups||[]).slice(0,8).map(g=>`<div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--line)"><span style="font-size:12px;color:#ef4444">${esc(g.message)}</span><span style="font-family:monospace;color:var(--muted)">×${g.count}</span></div>`).join('');
+    const logRows=(d.entries||[]).map(e=>{
+      const c=e.level==='error'||e.level==='fatal'?'#ef4444':e.level==='warn'?'#eab308':'var(--muted)';
+      return `<div style="padding:5px 0;border-bottom:1px solid var(--line);font-family:monospace;font-size:11px"><span style="color:${c};text-transform:uppercase">[${esc(e.level)}]</span> <span style="color:var(--muted)">${esc((e.timestamp||'').slice(11,19))}</span> ${esc(e.message)}</div>`;
+    }).join('');
+    body=`<input id="logSearch" placeholder="Search logs..." onkeydown="if(event.key==='Enter')searchLogs()" style="width:100%;padding:9px 12px;margin-bottom:14px;background:var(--panel);border:1px solid var(--line);border-radius:6px;color:var(--fg)">
+    ${errRows?`<div class="stat-card" style="margin-bottom:14px"><div class="card-title">Top Error Groups (auto-fingerprinted)</div>${errRows}</div>`:''}
+    <div class="stat-card"><div class="card-title">Live Log Stream</div><div id="logStream" style="max-height:440px;overflow-y:auto">${logRows||'<div style="color:var(--muted);font-size:12px">No logs yet</div>'}</div></div>`;
+  } else if(obsSubTab==='alerts'){
+    const d=await fetch('/api/observability/alerts').then(r=>r.json()).catch(()=>({alerts:[],rules:[]}));
+    const alertRows=(d.alerts||[]).slice(0,20).map(a=>{
+      const c=a.severity==='critical'||a.severity==='fatal'?'#ef4444':a.severity==='warning'?'#eab308':'#3b82f6';
+      const st=a.status==='firing'?`<button class="btn-sm" onclick="ackAlert('${a.id}')">Acknowledge</button>`:`<span style="color:var(--muted);font-size:11px">${esc(a.status)}</span>`;
+      return `<tr><td><span style="color:${c}">●</span> ${esc(a.rule_name)}</td><td style="font-size:12px">${esc(a.message)}</td><td>${esc(a.severity)}</td><td>${st}</td></tr>`;
+    }).join('');
+    const ruleRows=(d.rules||[]).map(r=>`<tr><td>${esc(r.name)}</td><td style="font-family:monospace;font-size:11px">${esc(r.metric)} ${esc(r.condition)} ${r.threshold}</td><td>${esc(r.severity)}</td><td>${r.enabled?'<span style="color:#22c55e">enabled</span>':'<span style="color:var(--muted)">off</span>'}</td></tr>`).join('');
+    body=`<div class="stat-card" style="margin-bottom:14px"><div class="card-title">Active Alerts</div>
+      <table class="data-table"><thead><tr><th>Rule</th><th>Message</th><th>Severity</th><th>Action</th></tr></thead>
+      <tbody>${alertRows||'<tr><td colspan=4 style="color:#22c55e;padding:16px">✓ No active alerts — all systems nominal</td></tr>'}</tbody></table></div>
+    <div class="stat-card"><div class="card-title">Alert Rules</div>
+      <table class="data-table"><thead><tr><th>Name</th><th>Condition</th><th>Severity</th><th>State</th></tr></thead>
+      <tbody>${ruleRows}</tbody></table></div>`;
+  } else if(obsSubTab==='slos'){
+    const d=await fetch('/api/observability/slos').then(r=>r.json()).catch(()=>({slos:[]}));
+    body='<div class="grid-2" style="display:grid;grid-template-columns:1fr 1fr;gap:14px">'+(d.slos||[]).map(sl=>{
+      const bp=Math.round((sl.error_budget_remaining||0)*100);
+      const bc=bp>50?'#22c55e':bp>20?'#eab308':'#ef4444';
+      return `<div class="stat-card"><div style="display:flex;justify-content:space-between"><span style="font-weight:600">${esc(sl.name)}</span><span style="font-family:monospace;color:${sl.is_healthy?'#22c55e':'#ef4444'}">${esc(sl.current_sli_pct)}</span></div>
+      <div style="font-size:11px;color:var(--muted);margin:6px 0">${esc(sl.description||'')}</div>
+      <div style="font-size:11px;margin-bottom:4px">Target ${esc(sl.target_pct)} · Burn rate ${sl.burn_rate}×</div>
+      <div style="background:var(--line);height:8px;border-radius:4px;overflow:hidden"><div style="width:${bp}%;height:100%;background:${bc}"></div></div>
+      <div style="font-size:11px;color:var(--muted);margin-top:4px">Error budget: ${esc(sl.error_budget_remaining_pct)} remaining</div></div>`;
+    }).join('')+'</div>';
+  } else if(obsSubTab==='health'){
+    const d=await fetch('/api/observability/health').then(r=>r.json()).catch(()=>({scores:[]}));
+    body=`<div class="stat-card"><div class="card-title">Agent Health Scores (composite 0-100)</div>
+      <table class="data-table"><thead><tr><th>Agent</th><th>Score</th><th>Status</th><th>Success</th><th>Latency</th><th>Uptime</th></tr></thead>
+      <tbody>${(d.scores||[]).map(sc=>{
+        const c=sc.status==='healthy'?'#22c55e':sc.status==='degraded'?'#eab308':'#ef4444';
+        const dm=sc.dimensions||{};
+        const nm=(AGENTS.find(a=>a.id===sc.agent_id)||{}).name||sc.agent_id;
+        return `<tr><td>${esc(nm)}</td><td style="font-family:monospace;color:${c};font-weight:600">${sc.score}</td><td style="color:${c}">● ${esc(sc.status)}</td><td>${dm.success_rate||0}</td><td>${dm.latency||0}</td><td>${dm.uptime||0}</td></tr>`;
+      }).join('')||'<tr><td colspan=6 style="color:var(--muted);padding:16px">No agents scored yet</td></tr>'}</tbody></table></div>`;
+  }
+  root.innerHTML='<div style="padding:24px"><h2 style="margin:0 0 4px">Observability</h2><div style="color:var(--muted);font-size:12px;margin-bottom:16px">Metrics, distributed tracing, log aggregation, alerting, and SLOs — the operational nervous system.</div>'+tabRow+body+'</div>';
+}
+function statCard(title,value,sub,color){
+  return `<div class="stat-card"><div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px">${esc(title)}</div>
+    <div style="font-size:26px;font-weight:700;margin:6px 0;color:${color||'var(--fg)'}">${value}</div>
+    <div style="font-size:11px;color:var(--muted)">${esc(sub||'')}</div></div>`;
+}
+async function showTrace(tid){
+  const t=await fetch('/api/observability/traces/'+tid).then(r=>r.json()).catch(()=>null);
+  if(!t)return;
+  const max=t.total_duration_ms||1;
+  const rows=(t.spans||[]).map(s=>{
+    const off=t.start_time?0:0;
+    const w=Math.max(2,((s.duration_ms||0)/max)*100);
+    const c=s.status==='error'?'#ef4444':'#f97316';
+    return `<div style="display:flex;align-items:center;gap:8px;padding:3px 0"><span style="width:180px;font-size:11px;font-family:monospace">${esc(s.operation)}</span><div style="flex:1;background:var(--line);border-radius:3px;height:16px"><div style="width:${w}%;height:100%;background:${c};border-radius:3px"></div></div><span style="width:70px;text-align:right;font-size:11px;font-family:monospace">${(s.duration_ms||0).toFixed(1)}ms</span></div>`;
+  }).join('');
+  document.getElementById('trace-detail').innerHTML=`<div style="margin-top:14px;padding-top:14px;border-top:1px solid var(--line)"><div class="card-title">Waterfall — ${esc(tid.slice(0,12))}</div>${rows}</div>`;
+}
+async function ackAlert(id){ await fetch('/api/observability/alerts/'+id+'/acknowledge',{method:'POST'}); renderObservability(); }
+async function searchLogs(){
+  const q=document.getElementById('logSearch').value;
+  const d=await fetch('/api/observability/logs?limit=100&q='+encodeURIComponent(q)).then(r=>r.json()).catch(()=>({entries:[]}));
+  document.getElementById('logStream').innerHTML=(d.entries||[]).map(e=>{
+    const c=e.level==='error'||e.level==='fatal'?'#ef4444':e.level==='warn'?'#eab308':'var(--muted)';
+    return `<div style="padding:5px 0;border-bottom:1px solid var(--line);font-family:monospace;font-size:11px"><span style="color:${c};text-transform:uppercase">[${esc(e.level)}]</span> <span style="color:var(--muted)">${esc((e.timestamp||'').slice(11,19))}</span> ${esc(e.message)}</div>`;
+  }).join('')||'<div style="color:var(--muted);font-size:12px">No matching logs</div>';
+}
+
+/* ═══════════════ USAGE & COST ═══════════════ */
+async function renderUsage(){
+  const root=document.getElementById('root');
+  root.innerHTML='<div style="padding:24px"><div class="stat-card" style="text-align:center;padding:32px"><div class="spinner"></div></div></div>';
+  let d;
+  try{ d=await fetch('/api/usage/dashboard').then(r=>r.json()); }
+  catch(e){ root.innerHTML='<div style="padding:24px"><div class="stat-card" style="padding:32px;text-align:center;color:var(--muted)">Could not load usage data.</div></div>'; return; }
+  const t=d.totals||{};
+  const cards=`<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:18px">
+    ${statCard('Total Spend','$'+(t.total_cost||0).toFixed(2),(t.total_runs||0)+' runs','#f97316')}
+    ${statCard('Total Tokens',((t.total_tokens||0)/1000).toFixed(1)+'K','across fleet','#f97316')}
+    ${statCard('Avg / Run','$'+(t.avg_cost_per_run||0).toFixed(4),'per execution','#f97316')}
+    ${statCard('Projected / Mo','$'+(t.projected_monthly_cost||0).toFixed(2),'from last 7 days','#eab308')}
+  </div>`;
+  const prov=(d.by_provider||[]).map(p=>`<tr><td style="text-transform:capitalize">${esc(p.provider||'unknown')}</td><td>${((p.tokens||0)/1000).toFixed(1)}K</td><td>${p.runs}</td><td style="font-family:monospace">$${(p.cost||0).toFixed(4)}</td></tr>`).join('');
+  const model=(d.by_model||[]).map(p=>`<tr><td style="font-family:monospace;font-size:11px">${esc(p.model||'unknown')}</td><td>${((p.tokens||0)/1000).toFixed(1)}K</td><td style="font-family:monospace">$${(p.cost||0).toFixed(4)}</td></tr>`).join('');
+  const agent=(d.by_agent||[]).map(p=>{const nm=(AGENTS.find(a=>a.id===p.agent_id)||{}).name||p.agent_id;return `<tr><td>${esc(nm)}</td><td>${((p.tokens||0)/1000).toFixed(1)}K</td><td>${p.runs}</td><td style="font-family:monospace">$${(p.cost||0).toFixed(4)}</td></tr>`;}).join('');
+  const user=(d.by_user||[]).map(p=>`<tr><td style="font-family:monospace;font-size:11px">${esc(p.user_id||'system')}</td><td>${((p.tokens||0)/1000).toFixed(1)}K</td><td>${p.runs}</td><td style="font-family:monospace">$${(p.cost||0).toFixed(4)}</td></tr>`).join('');
+  // spark for daily
+  const series=d.daily_series||[];
+  const maxc=Math.max(0.0001,...series.map(s=>s.cost||0));
+  const spark=series.map(s=>`<div title="${s.date}: $${(s.cost||0).toFixed(4)}" style="flex:1;background:#f97316;height:${Math.max(2,(s.cost/maxc)*60)}px;border-radius:2px 2px 0 0;opacity:.85"></div>`).join('');
+  root.innerHTML=`<div style="padding:24px"><h2 style="margin:0 0 4px">Usage & Cost</h2>
+    <div style="color:var(--muted);font-size:12px;margin-bottom:16px">Cost attribution across agents, users, providers, and models. Customers bring their own keys — Cortex gives them the visibility and guardrails.</div>
+    ${cards}
+    <div class="stat-card" style="margin-bottom:14px"><div class="card-title">Daily Spend (30 days)</div><div style="display:flex;gap:2px;align-items:flex-end;height:64px">${spark}</div></div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
+      <div class="stat-card"><div class="card-title">By Provider</div><table class="data-table"><thead><tr><th>Provider</th><th>Tokens</th><th>Runs</th><th>Cost</th></tr></thead><tbody>${prov||'<tr><td colspan=4 style="color:var(--muted);padding:12px">No usage yet</td></tr>'}</tbody></table></div>
+      <div class="stat-card"><div class="card-title">By Model</div><table class="data-table"><thead><tr><th>Model</th><th>Tokens</th><th>Cost</th></tr></thead><tbody>${model||'<tr><td colspan=3 style="color:var(--muted);padding:12px">No usage yet</td></tr>'}</tbody></table></div>
+      <div class="stat-card"><div class="card-title">By Agent</div><table class="data-table"><thead><tr><th>Agent</th><th>Tokens</th><th>Runs</th><th>Cost</th></tr></thead><tbody>${agent||'<tr><td colspan=4 style="color:var(--muted);padding:12px">No usage yet</td></tr>'}</tbody></table></div>
+      <div class="stat-card"><div class="card-title">By User</div><table class="data-table"><thead><tr><th>User</th><th>Tokens</th><th>Runs</th><th>Cost</th></tr></thead><tbody>${user||'<tr><td colspan=4 style="color:var(--muted);padding:12px">No usage yet</td></tr>'}</tbody></table></div>
+    </div></div>`;
+}
+
+/* ═══════════════ TEAMS / WORKSPACES ═══════════════ */
+async function renderTeams(){
+  const root=document.getElementById('root');
+  root.innerHTML='<div style="padding:24px"><div class="stat-card" style="text-align:center;padding:32px"><div class="spinner"></div></div></div>';
+  const d=await fetch('/api/teams').then(r=>r.json()).catch(()=>({workspaces:[]}));
+  const roles=await fetch('/api/teams/roles').then(r=>r.json()).catch(()=>({roles:[]}));
+  const wsRows=(d.workspaces||[]).map(w=>`<tr onclick="showWorkspace('${w.id}')" style="cursor:pointer"><td>${esc(w.name)}</td><td style="font-family:monospace;font-size:11px">${esc(w.slug)}</td><td>${w.member_count} members</td><td><span style="text-transform:capitalize">${esc(w.my_role||'')}</span></td></tr>`).join('');
+  const roleCards=(roles.roles||[]).map(r=>`<div style="padding:8px 0;border-bottom:1px solid var(--line)"><div style="display:flex;justify-content:space-between"><span style="font-weight:600">${esc(r.label)}</span><span style="font-size:11px;color:var(--muted)">level ${r.level}</span></div><div style="font-size:11px;color:var(--muted)">${esc(r.description)}</div></div>`).join('');
+  root.innerHTML=`<div style="padding:24px"><h2 style="margin:0 0 4px">Teams & Workspaces</h2>
+    <div style="color:var(--muted);font-size:12px;margin-bottom:16px">Multi-tenant workspaces with role-based access. Owners and admins invite members; Cortex manages access, not billing.</div>
+    <div style="display:flex;gap:8px;margin-bottom:14px"><input id="wsName" placeholder="New workspace name" style="flex:1;padding:9px 12px;background:var(--panel);border:1px solid var(--line);border-radius:6px;color:var(--fg)"><button class="btn" onclick="createWorkspace()">Create Workspace</button></div>
+    <div style="display:grid;grid-template-columns:2fr 1fr;gap:14px">
+      <div class="stat-card"><div class="card-title">Your Workspaces</div><table class="data-table"><thead><tr><th>Name</th><th>Slug</th><th>Members</th><th>Your Role</th></tr></thead><tbody>${wsRows||'<tr><td colspan=4 style="color:var(--muted);padding:12px">No workspaces yet. Create one above.</td></tr>'}</tbody></table><div id="wsDetail"></div></div>
+      <div class="stat-card"><div class="card-title">Roles</div>${roleCards}</div>
+    </div></div>`;
+}
+async function createWorkspace(){
+  const name=document.getElementById('wsName').value.trim(); if(!name)return;
+  await fetch('/api/teams',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});
+  renderTeams();
+}
+async function showWorkspace(wid){
+  const d=await fetch('/api/teams/'+wid+'/members').then(r=>r.json()).catch(()=>({members:[],invites:[]}));
+  const mem=(d.members||[]).map(m=>`<tr><td>${esc(m.email)}</td><td>${esc(m.role_label||m.role)}</td></tr>`).join('');
+  const inv=(d.invites||[]).map(i=>`<tr><td>${esc(i.email)}</td><td>${esc(i.role)}</td><td>${esc(i.status)}</td></tr>`).join('');
+  document.getElementById('wsDetail').innerHTML=`<div style="margin-top:14px;padding-top:14px;border-top:1px solid var(--line)">
+    <div style="display:flex;gap:8px;margin-bottom:10px"><input id="invEmail" placeholder="email to invite" style="flex:1;padding:7px 10px;background:var(--panel);border:1px solid var(--line);border-radius:6px;color:var(--fg)"><select id="invRole" style="padding:7px;background:var(--panel);border:1px solid var(--line);border-radius:6px;color:var(--fg)"><option>operator</option><option>viewer</option><option>admin</option></select><button class="btn-sm" onclick="sendInvite('${wid}')">Invite</button></div>
+    <div class="card-title">Members</div><table class="data-table"><tbody>${mem}</tbody></table>
+    ${inv?`<div class="card-title" style="margin-top:10px">Pending Invites</div><table class="data-table"><tbody>${inv}</tbody></table>`:''}</div>`;
+}
+async function sendInvite(wid){
+  const email=document.getElementById('invEmail').value.trim(); const role=document.getElementById('invRole').value;
+  if(!email)return;
+  const r=await fetch('/api/teams/'+wid+'/invite',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email,role})}).then(r=>r.json());
+  if(r.token) alert('Invite created. Token (share once):\\n'+r.token);
+  showWorkspace(wid);
+}
+
+/* ═══════════════ PLUGINS ═══════════════ */
+async function renderPlugins(){
+  const root=document.getElementById('root');
+  root.innerHTML='<div style="padding:24px"><div class="stat-card" style="text-align:center;padding:32px"><div class="spinner"></div></div></div>';
+  const d=await fetch('/api/plugins').then(r=>r.json()).catch(()=>({plugins:[]}));
+  const cards=(d.plugins||[]).map(p=>`<div class="stat-card"><div style="display:flex;justify-content:space-between;align-items:center"><span style="font-size:18px">${esc(p.icon||'🔌')} <span style="font-weight:600;font-size:14px">${esc(p.name)}</span></span><label class="switch"><input type="checkbox" ${p.enabled?'checked':''} onchange="togglePlugin('${p.name}',this.checked)"><span class="slider"></span></label></div>
+    <div style="font-size:12px;color:var(--muted);margin:8px 0">${esc(p.description)}</div>
+    <div style="display:flex;gap:6px;flex-wrap:wrap"><span class="chip">${esc(p.category)}</span>${(p.hooks||[]).map(h=>`<span class="chip" style="opacity:.7">${esc(h)}</span>`).join('')}</div>
+    <div style="font-size:11px;color:var(--muted);margin-top:8px">Used by ${p.install_count||0} agents · ${p.invoke_count||0} invocations</div></div>`).join('');
+  root.innerHTML=`<div style="padding:24px"><h2 style="margin:0 0 4px">Plugins</h2>
+    <div style="color:var(--muted);font-size:12px;margin-bottom:16px">Extend agents with tools, integrations, and lifecycle hooks. ${(d.stats||{}).enabled||0} of ${(d.stats||{}).total||0} enabled.</div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px">${cards}</div></div>`;
+}
+async function togglePlugin(name,on){ await fetch('/api/plugins/'+encodeURIComponent(name)+'/'+(on?'enable':'disable'),{method:'POST'}); }
+
+/* ═══════════════ AGENT MESH (comms) ═══════════════ */
+async function renderComms(){
+  const root=document.getElementById('root');
+  root.innerHTML='<div style="padding:24px"><div class="stat-card" style="text-align:center;padding:32px"><div class="spinner"></div></div></div>';
+  const [stats,hist,wf]=await Promise.all([
+    fetch('/api/comms/stats').then(r=>r.json()).catch(()=>({})),
+    fetch('/api/comms/history?limit=40').then(r=>r.json()).catch(()=>({messages:[]})),
+    fetch('/api/comms/workflows').then(r=>r.json()).catch(()=>({workflows:[]})),
+  ]);
+  const msgs=(hist.messages||[]).map(m=>`<tr><td style="font-family:monospace;font-size:11px">${esc(m.from)}</td><td>→</td><td style="font-family:monospace;font-size:11px">${esc(m.to)}</td><td>${esc(m.type)}</td><td>${esc(m.status)}</td></tr>`).join('');
+  const wfs=(wf.workflows||[]).map(w=>`<tr><td>${esc(w.name)}</td><td>${Object.keys(w.steps||{}).length} steps</td><td>${esc(w.status)}</td><td><button class="btn-sm" onclick="runWorkflow('${w.id}')">Run</button></td></tr>`).join('');
+  root.innerHTML=`<div style="padding:24px"><h2 style="margin:0 0 4px">Agent Mesh</h2>
+    <div style="color:var(--muted);font-size:12px;margin-bottom:16px">Agent-to-agent messaging and multi-agent workflows (DAGs). ${stats.total_messages||0} messages · ${stats.workflows||0} workflows.</div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
+      <div class="stat-card"><div class="card-title">Message History</div><table class="data-table"><tbody>${msgs||'<tr><td colspan=5 style="color:var(--muted);padding:12px">No messages yet</td></tr>'}</tbody></table></div>
+      <div class="stat-card"><div class="card-title">Workflows</div><table class="data-table"><tbody>${wfs||'<tr><td colspan=4 style="color:var(--muted);padding:12px">No workflows defined</td></tr>'}</tbody></table></div>
+    </div></div>`;
+}
+async function runWorkflow(id){ await fetch('/api/comms/workflows/'+id+'/run',{method:'POST'}); renderComms(); }
+
+/* ═══════════════ WORKFLOWS (Phase 2: build, run, learn) ═══════════════ */
+let wfBuilder=[];        // [{agent_id, instruction, depends_on:[idx]}]
+let wfAgentCache=[];
+let wfOpenRun=null;      // expanded workflow run id
+
+async function renderWorkflows(){
+  const root=document.getElementById('root');
+  root.innerHTML='<div style="padding:24px"><div class="stat-card" style="text-align:center;padding:32px"><div class="spinner"></div></div></div>';
+  const [ag,hist,pats,graph]=await Promise.all([
+    fetch('/api/agents').then(r=>r.json()).catch(()=>({agents:[]})),
+    fetch('/api/phase2/workflow-runs?limit=25').then(r=>r.json()).catch(()=>({runs:[]})),
+    fetch('/api/phase2/patterns?limit=10').then(r=>r.json()).catch(()=>({patterns:[]})),
+    fetch('/api/phase2/graph').then(r=>r.json()).catch(()=>({nodes:[],edges:[]})),
+  ]);
+  wfAgentCache=(ag.agents||ag||[]).filter(a=>a&&a.id);
+  if(!wfBuilder.length) wfBuilder=[{agent_id:'',instruction:'',depends_on:[]}];
+
+  root.innerHTML=`<div style="padding:24px">
+    <h2 style="margin:0 0 4px">Workflows</h2>
+    <div style="color:var(--muted);font-size:12px;margin-bottom:16px">
+      Chain agents into a DAG, run it, and Cortex records what happened. Patterns appear once the same sequence has run more than once.
+    </div>
+    <div style="display:grid;grid-template-columns:1.15fr .85fr;gap:14px;align-items:start">
+      <div style="display:flex;flex-direction:column;gap:14px">
+        ${wfBuilderCard()}
+        ${wfHistoryCard(hist.runs||[])}
+      </div>
+      <div style="display:flex;flex-direction:column;gap:14px">
+        ${wfPatternsCard(pats.patterns||[])}
+        ${wfGraphCard(graph)}
+      </div>
+    </div></div>`;
+}
+
+/* ── builder ─────────────────────────────────────── */
+function wfBuilderCard(){
+  const opts=a=>wfAgentCache.map(x=>`<option value="${esc(x.id)}"${x.id===a?' selected':''}>${esc(x.name||x.slug||x.id)}</option>`).join('');
+  const rows=wfBuilder.map((s,i)=>{
+    const deps=wfBuilder.slice(0,i).map((_,j)=>
+      `<label style="margin-right:8px;font-size:11px;white-space:nowrap"><input type="checkbox" ${s.depends_on.includes(j)?'checked':''} onchange="wfToggleDep(${i},${j})"> step ${j+1}</label>`).join('');
+    return `<div style="border:1px solid var(--line);border-radius:4px;padding:10px;margin-bottom:8px;background:var(--paper)">
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:6px">
+        <span class="pill" style="background:var(--accentsoft);color:var(--terra)">step ${i+1}</span>
+        <select onchange="wfSet(${i},'agent_id',this.value)" style="flex:1;padding:6px 8px;border:1px solid var(--line);border-radius:3px;font:inherit;font-size:12px">
+          <option value="">— pick an agent —</option>${opts(s.agent_id)}
+        </select>
+        ${wfBuilder.length>1?`<button class="btn-sm" onclick="wfRemove(${i})" title="Remove step">×</button>`:''}
+      </div>
+      <input value="${esc(s.instruction)}" oninput="wfSet(${i},'instruction',this.value)"
+        placeholder="What should this agent do?"
+        style="width:100%;padding:6px 8px;border:1px solid var(--line);border-radius:3px;font:inherit;font-size:12px;box-sizing:border-box">
+      ${i>0?`<div style="margin-top:6px;color:var(--muted);font-size:11px">waits for: ${deps||'<i>nothing</i>'}</div>`:''}
+    </div>`;
+  }).join('');
+
+  return `<div class="stat-card">
+    <div class="card-title">Build a workflow</div>
+    <input id="wf-name" placeholder="Workflow name" value=""
+      style="width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:3px;font:inherit;font-size:13px;margin:8px 0 10px;box-sizing:border-box">
+    ${rows}
+    <div style="display:flex;gap:8px;margin-top:10px">
+      <button class="btn-sm" onclick="wfAddStep()">+ Add step</button>
+      <div style="flex:1"></div>
+      <button class="btn btn-primary" onclick="wfCreateAndRun()">Create &amp; run</button>
+    </div>
+    <div id="wf-status" style="margin-top:10px;font-size:12px"></div>
+  </div>`;
+}
+
+function wfSet(i,k,v){ wfBuilder[i][k]=v; }
+function wfToggleDep(i,j){
+  const d=wfBuilder[i].depends_on, at=d.indexOf(j);
+  if(at>=0) d.splice(at,1); else d.push(j);
+  renderWorkflows();
+}
+function wfAddStep(){ wfBuilder.push({agent_id:'',instruction:'',depends_on:[]}); renderWorkflows(); }
+function wfRemove(i){
+  wfBuilder.splice(i,1);
+  wfBuilder.forEach(s=>{ s.depends_on=s.depends_on.filter(d=>d!==i).map(d=>d>i?d-1:d); });
+  renderWorkflows();
+}
+
+async function wfCreateAndRun(){
+  const st=document.getElementById('wf-status');
+  const name=(document.getElementById('wf-name').value||'').trim()||'Untitled workflow';
+  const bad=wfBuilder.findIndex(s=>!s.agent_id);
+  if(bad>=0){ st.innerHTML=`<span style="color:var(--brick)">Step ${bad+1} has no agent selected.</span>`; return; }
+
+  const steps=wfBuilder.map((s,i)=>({id:'s'+i, agent_id:s.agent_id,
+    instruction:s.instruction||'Proceed.', depends_on:s.depends_on.map(d=>'s'+d)}));
+
+  st.innerHTML='<span style="color:var(--muted)">Creating…</span>';
+  const cr=await fetch('/api/comms/workflows',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify({name,steps})}).then(r=>r.json());
+  const wid=cr.workflow_id||(cr.workflow||{}).id;
+  if(!wid){ st.innerHTML='<span style="color:var(--brick)">Could not create workflow.</span>'; return; }
+
+  // The bus advances one wave of ready steps per call — drive it to completion.
+  let waves=0, recorded=false, runId=null;
+  for(let i=0;i<steps.length+2;i++){
+    st.innerHTML=`<span style="color:var(--muted)">Running… wave ${i+1}</span>`;
+    const r=await fetch('/api/comms/workflows/'+wid+'/run',{method:'POST'}).then(x=>x.json()).catch(()=>null);
+    if(!r) break;
+    waves++;
+    if(r.recorded) recorded=true;
+    if(r.workflow_run_id) runId=r.workflow_run_id;
+    if((r.remaining||0)===0) break;
+  }
+  st.innerHTML=`<span style="color:var(--terra)">Ran ${waves} wave${waves===1?'':'s'}.</span>`
+    + (recorded?' <span style="color:var(--muted)">Recorded to history.</span>'
+              :' <span style="color:var(--brick)">Not recorded — check server logs.</span>');
+  wfOpenRun=runId;
+  setTimeout(renderWorkflows,600);
+}
+
+/* ── history ─────────────────────────────────────── */
+function wfHistoryCard(runs){
+  if(!runs.length) return `<div class="stat-card"><div class="card-title">Run history</div>
+    <div style="color:var(--muted);font-size:12px;padding:12px 0">
+      Nothing recorded yet. Build and run a workflow above — every run is saved here and survives a restart.
+    </div></div>`;
+
+  const rows=runs.map(r=>{
+    const cls=r.status==='completed'?'running':(r.status==='failed'?'error':'stopped');
+    return `<tr style="cursor:pointer" onclick="wfToggleRun('${esc(r.id)}')">
+      <td>${esc(r.name||'—')}</td>
+      <td><span class="pill ${cls}">${esc(r.status)}</span></td>
+      <td style="font-family:monospace;font-size:11px">${r.succeeded}/${r.steps}</td>
+      <td style="font-family:monospace;font-size:11px">${Math.round(r.latency_ms)}ms</td>
+      <td style="font-family:monospace;font-size:11px">${r.cost_usd?('$'+r.cost_usd.toFixed(4)):'—'}</td>
+    </tr>` + (wfOpenRun===r.id?`<tr><td colspan="5" style="padding:0">
+      <div id="wf-steps-${esc(r.id)}" style="padding:8px 12px;background:var(--paper);font-size:11px;color:var(--muted)">loading steps…</div></td></tr>`:'');
+  }).join('');
+
+  return `<div class="stat-card"><div class="card-title">Run history</div>
+    <table class="data-table">
+      <thead><tr><th>Workflow</th><th>Status</th><th>Steps</th><th>Latency</th><th>Cost</th></tr></thead>
+      <tbody>${rows}</tbody></table>
+    <div class="hint" style="margin-top:8px">Click a run to see its steps.</div></div>`;
+}
+
+async function wfToggleRun(id){
+  if(wfOpenRun===id){ wfOpenRun=null; return renderWorkflows(); }
+  wfOpenRun=id;
+  await renderWorkflows();
+  const el=document.getElementById('wf-steps-'+id);
+  if(!el) return;
+  const d=await fetch('/api/phase2/workflow-runs/'+id).then(r=>r.json()).catch(()=>null);
+  if(!d||!d.step_detail){ el.textContent='Could not load steps.'; return; }
+  const name=i=>{ const a=wfAgentCache.find(x=>x.id===i); return a?(a.name||a.slug):i; };
+  el.innerHTML=d.step_detail.map(s=>
+    `<div style="padding:3px 0">
+      <span class="pill" style="background:var(--accentsoft);color:var(--terra)">depth ${s.depth}</span>
+      <b>${esc(name(s.agent_id))}</b> — ${esc(s.status)}
+      ${s.latency_ms?` · ${Math.round(s.latency_ms)}ms`:''}
+      ${s.run_id?` · <span style="font-family:monospace">run ${esc(s.run_id.slice(0,8))}</span>`
+                :' · <i>no run row linked</i>'}
+      ${s.error?` · <span style="color:var(--brick)">${esc(s.error.slice(0,120))}</span>`:''}
+    </div>`).join('');
+}
+
+/* ── patterns ────────────────────────────────────── */
+function wfPatternsCard(pats){
+  const head=`<div class="card-title">Patterns</div>`;
+  if(!pats.length) return `<div class="stat-card">${head}
+    <div style="color:var(--muted);font-size:12px;padding:12px 0">
+      No patterns yet. A pattern is a sequence of agents that has run <b>more than once</b> — Cortex needs a repeat before it can say anything about how a sequence performs.
+    </div>
+    <button class="btn-sm" onclick="wfAnalyze()">Analyze now</button>
+    <div id="wf-an" style="margin-top:8px;font-size:11px;color:var(--muted)"></div></div>`;
+
+  const name=i=>{ const a=wfAgentCache.find(x=>x.id===i); return a?(a.name||a.slug):i.slice(0,8); };
+  const rows=pats.map(p=>{
+    const succeeded=Math.round((p.success_rate||0)*(p.executions||0));
+    const trend=p.trend==='improving'?'<span style="color:var(--terra)">improving</span>'
+              :p.trend==='declining'?'<span style="color:var(--brick)">declining</span>'
+              :p.trend==='stable'?'stable':'<span style="color:var(--muted)">not enough runs</span>';
+    return `<div style="border-top:1px solid var(--line);padding:9px 0">
+      <div style="font-size:12px;margin-bottom:3px">${(p.agents||[]).map(a=>esc(name(a))).join(' <span style="color:var(--muted)">→</span> ')}</div>
+      <div style="font-size:11px;color:var(--muted);font-family:'IBM Plex Mono',monospace">
+        ${succeeded}/${p.executions} runs succeeded ·
+        ${Math.round(p.avg_latency_ms)}ms avg ·
+        ${p.avg_cost_usd?('$'+p.avg_cost_usd.toFixed(4)+' avg'):'no cost data'} · ${trend}
+      </div></div>`;
+  }).join('');
+
+  return `<div class="stat-card">${head}
+    <div style="font-size:11px;color:var(--muted);margin-bottom:2px">Ranked by success rate weighted by how often each ran.</div>
+    ${rows}
+    <div style="margin-top:10px"><button class="btn-sm" onclick="wfAnalyze()">Re-analyze</button>
+    <span id="wf-an" style="margin-left:8px;font-size:11px;color:var(--muted)"></span></div></div>`;
+}
+
+async function wfAnalyze(){
+  const el=document.getElementById('wf-an');
+  if(el) el.textContent='analyzing…';
+  const r=await fetch('/api/phase2/patterns/analyze',{method:'POST'}).then(x=>x.json()).catch(()=>null);
+  if(el&&r) el.textContent=r.note?r.note:`${r.patterns||0} pattern(s) from ${r.runs_analyzed||0} runs`;
+  setTimeout(renderWorkflows,700);
+}
+
+/* ── relationship graph ──────────────────────────── */
+function wfGraphCard(g){
+  const nodes=g.nodes||[], edges=g.edges||[];
+  const head=`<div class="card-title">Agent relationships</div>`;
+  if(!nodes.length) return `<div class="stat-card">${head}
+    <div style="color:var(--muted);font-size:12px;padding:12px 0">
+      No relationships found yet. Cortex reads these from agent config (escalation targets, shared data sources) and from workflows that have actually run.
+    </div>
+    <button class="btn-sm" onclick="wfDiscover()">Discover</button>
+    <div id="wf-dsc" style="margin-top:8px;font-size:11px;color:var(--muted)"></div></div>`;
+
+  // Circular layout — readable for the handful of agents a graph like this holds.
+  const W=400,H=260,cx=W/2,cy=H/2,R=Math.min(W,H)/2-58;
+  const pos={};
+  nodes.forEach((n,i)=>{ const a=(i/nodes.length)*2*Math.PI-Math.PI/2;
+    pos[n.id]={x:cx+R*Math.cos(a),y:cy+R*Math.sin(a)}; });
+
+  const seen=new Set();
+  const lines=edges.map(e=>{
+    const p=pos[e.source],q=pos[e.target]; if(!p||!q) return '';
+    const key=[e.source,e.target].sort().join('|')+e.type;
+    if(seen.has(key)) return ''; seen.add(key);   // one line per undirected pair+type
+    const strong=e.type==='escalation'||e.type==='workflow_dependency';
+    return `<line x1="${p.x}" y1="${p.y}" x2="${q.x}" y2="${q.y}"
+      stroke="${strong?'var(--terra)':'var(--line)'}"
+      stroke-width="${Math.max(1,(e.strength||50)/45)}"
+      ${strong?'':'stroke-dasharray="3,3"'} opacity="0.75"></line>`;
+  }).join('');
+
+  const dots=nodes.map((n,i)=>{const p=pos[n.id];
+    // Push the label radially outward so it clears the node and its edges.
+    const a=(i/nodes.length)*2*Math.PI-Math.PI/2;
+    const lx=cx+(R+20)*Math.cos(a), ly=cy+(R+20)*Math.sin(a);
+    const anchor=Math.cos(a)>0.3?'start':(Math.cos(a)<-0.3?'end':'middle');
+    const dy=Math.sin(a)>0.3?11:(Math.sin(a)<-0.3?-4:4);
+    return `<g><circle cx="${p.x}" cy="${p.y}" r="7" fill="var(--card)" stroke="var(--terra)" stroke-width="2"></circle>
+      <text x="${lx}" y="${ly+dy}" text-anchor="${anchor}" font-size="10" fill="var(--fg)">${esc((n.name||n.id).slice(0,16))}</text></g>`;
+  }).join('');
+
+  const kinds={};
+  edges.forEach(e=>{kinds[e.type]=(kinds[e.type]||0)+1;});
+  const legend=Object.entries(kinds).map(([k,v])=>
+    `<span class="chip" style="margin-right:4px">${esc(k.replace(/_/g,' '))} ${v}</span>`).join('');
+
+  return `<div class="stat-card">${head}
+    <svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;display:block">${lines}${dots}</svg>
+    <div style="margin-top:6px">${legend}</div>
+    <div class="hint" style="margin-top:6px">Solid = declared handoff or an executed dependency. Dashed = shared data source or co-execution.</div>
+    <div style="margin-top:8px"><button class="btn-sm" onclick="wfDiscover()">Re-discover</button>
+    <span id="wf-dsc" style="margin-left:8px;font-size:11px;color:var(--muted)"></span></div></div>`;
+}
+
+async function wfDiscover(){
+  const el=document.getElementById('wf-dsc');
+  if(el) el.textContent='scanning…';
+  const r=await fetch('/api/phase2/discover?source=both',{method:'POST'}).then(x=>x.json()).catch(()=>null);
+  if(el&&r){
+    const c=(r.config||{}), rt=(r.runtime||{});
+    el.textContent=`config: +${c.created||0}/~${c.updated||0} · runtime: ${rt.note?rt.note:('+'+(rt.created||0)+'/~'+(rt.updated||0))}`;
+  }
+  setTimeout(renderWorkflows,700);
+}
+
+/* ═══════════════ RECOVERY (recycle bin + version history) ═══════════════ */
+async function renderRecovery(){
+  const root=document.getElementById('root');
+  root.innerHTML='<div style="padding:24px"><div class="stat-card" style="text-align:center;padding:32px"><div class="spinner"></div></div></div>';
+  const bin=await fetch('/api/recycle-bin').then(r=>r.json()).catch(()=>({deleted_agents:[]}));
+  const binRows=(bin.deleted_agents||[]).map(a=>`<tr><td>${esc(a.name)}</td><td style="font-size:11px;color:var(--muted)">${esc((a.deleted_at||'').slice(0,10))}</td><td style="font-size:11px;color:var(--muted)">${esc((a.purge_after||'').slice(0,10))}</td><td><button class="btn-sm" onclick="restoreAgent('${a.id}')">Restore</button></td></tr>`).join('');
+  const agentOpts=AGENTS.map(a=>`<option value="${a.id}">${esc(a.name)}</option>`).join('');
+  root.innerHTML=`<div style="padding:24px"><h2 style="margin:0 0 4px">Recovery</h2>
+    <div style="color:var(--muted);font-size:12px;margin-bottom:16px">Deleted agents are recoverable for ${bin.retention_days||30} days. Every config change is snapshotted and hash-chained, so any prior version can be restored or rebuilt.</div>
+    <div class="stat-card" style="margin-bottom:14px"><div class="card-title">🗑 Recycle Bin</div>
+      <table class="data-table"><thead><tr><th>Agent</th><th>Deleted</th><th>Purges</th><th></th></tr></thead>
+      <tbody>${binRows||'<tr><td colspan=4 style="color:var(--muted);padding:12px">Recycle bin is empty</td></tr>'}</tbody></table></div>
+    <div class="stat-card"><div class="card-title">Version History & Rollback</div>
+      <select id="verAgent" onchange="loadVersions(this.value)" style="width:100%;padding:9px 12px;margin-bottom:12px;background:var(--panel);border:1px solid var(--line);border-radius:6px;color:var(--fg)"><option value="">Select an agent...</option>${agentOpts}</select>
+      <div id="verList"></div></div></div>`;
+}
+async function restoreAgent(id){ await fetch('/api/recycle-bin/'+id+'/restore',{method:'POST'}); await boot(); renderRecovery(); }
+async function loadVersions(aid){
+  if(!aid){document.getElementById('verList').innerHTML='';return;}
+  const d=await fetch('/api/agents/'+aid+'/versions').then(r=>r.json()).catch(()=>({versions:[]}));
+  const integ=d.integrity||{};
+  const rows=(d.versions||[]).map(v=>`<tr><td style="font-family:monospace">v${v.version}</td><td>${esc(v.change_type)}</td><td style="font-size:12px">${esc(v.change_summary||'')}</td><td style="font-size:11px;color:var(--muted)">${esc(v.changer_email||v.changed_by||'system')}</td><td style="font-size:11px;color:var(--muted)">${esc((v.created_at||'').slice(0,16).replace('T',' '))}</td><td><button class="btn-sm" onclick="restoreVersion('${aid}',${v.version})">Restore</button></td></tr>`).join('');
+  document.getElementById('verList').innerHTML=`<div style="font-size:11px;margin-bottom:8px;color:${integ.intact?'#22c55e':'#ef4444'}">${integ.intact?'✓ Hash chain intact — '+integ.versions+' versions, tamper-evident':'⚠ Chain integrity issue: versions '+(integ.broken_versions||[]).join(', ')}</div>
+    <table class="data-table"><thead><tr><th>Version</th><th>Type</th><th>Change</th><th>By</th><th>When</th><th></th></tr></thead><tbody>${rows||'<tr><td colspan=6 style="color:var(--muted);padding:12px">No version history</td></tr>'}</tbody></table>`;
+}
+async function restoreVersion(aid,v){
+  if(!confirm('Restore agent to version '+v+'? This creates a new version with the old config.'))return;
+  await fetch('/api/agents/'+aid+'/versions/'+v+'/restore',{method:'POST'});
+  await boot(); loadVersions(aid);
 }
 
 async function setView(v){ view=v; await render(); }
