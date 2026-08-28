@@ -1100,6 +1100,7 @@ def clone_from_template(template_id: str, request: Request):
         db.add(agent)
         tmpl.use_count = (tmpl.use_count or 0) + 1
         db.commit()
+        _baseline_snapshot(db, agent)
         return {"ok": True, "agent_id": agent.id, "slug": agent.slug}
     finally:
         db.close()
@@ -1451,6 +1452,31 @@ def _seed_sample_agents(db):
                            endpoint=endpoint, config=config)
         db.add(agent)
     db.commit()
+    # Snapshot every seeded sample, not just the last one the loop bound.
+    for slug, *_ in samples:
+        a = db.query(AgentModel).filter(AgentModel.id == slug).first()
+        if a:
+            _baseline_snapshot(db, a)
+
+def _baseline_snapshot(db, agent, changed_by=None, changer_email=""):
+    """Record v1 for a newly created agent.
+
+    Without this an agent carries version=1 with no AgentVersion row, so the
+    FIRST config change writes v1 (describing the new config) and leaves
+    agent.version at 1 — meaning runs from before and after that change both
+    record config_version=1 and pool into one bucket. Snapshotting at birth
+    makes the first change v2, which is what the version history and the
+    per-version comparison both assume.
+    """
+    try:
+        snapshot_agent_version(
+            db, agent, changed_by=changed_by, changer_email=changer_email,
+            change_type="create", prev_config={},
+            change_summary="Initial configuration",
+        )
+    except Exception as e:
+        print(f"[cortex] baseline snapshot failed for {getattr(agent,'id','?')}: {e}")
+
 
 # In-memory caches for transient state (version history + pending proposals)
 HISTORY = {}  # agent_id -> list of {version, at, by, note, config}
@@ -2017,6 +2043,7 @@ def register_agent(body: RegisterAgentIn, request: Request):
         )
         db.add(agent)
         db.commit()
+        _baseline_snapshot(db, agent)
         db.refresh(agent)
         _ensure_history(agent_id)
         log_event(agent_id, "agent.registered", {"name": body.name})
@@ -2207,6 +2234,7 @@ def import_agent(body: ImportAgentIn):
         )
         db.add(agent)
         db.commit()
+        _baseline_snapshot(db, agent)
         db.refresh(agent)
         _ensure_history(agent_id)
         log_event(agent_id, "agent.imported", {"name": normalized["name"], "source_format": normalized.get("source_format")})
