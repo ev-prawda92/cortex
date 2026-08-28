@@ -3772,6 +3772,34 @@ def p2_rerun_workflow(run_id: str, request: Request):
         db.close()
 
 
+@app.get("/api/phase2/agents/{agent_id}/versions")
+def p2_version_performance(agent_id: str, request: Request):
+    """How each config version of this agent has actually performed.
+
+    Derived entirely from runs that already exist — nothing to set up.
+    """
+    if not _get_session(request):
+        raise HTTPException(401, "not authenticated")
+    db = SessionLocal()
+    try:
+        return phase2.version_performance(db, agent_id)
+    finally:
+        db.close()
+
+
+@app.get("/api/phase2/regressions")
+def p2_regressions(request: Request):
+    """Agents whose newest config version is measurably worse than the last."""
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "not authenticated")
+    db = SessionLocal()
+    try:
+        return {"regressions": phase2.fleet_regressions(db, owner_id=sess.get("user_id"))}
+    finally:
+        db.close()
+
+
 @app.post("/api/phase2/patterns/analyze")
 def p2_analyze_patterns(request: Request, lookback_days: int = 30,
                         min_executions: int = 2):
@@ -4999,6 +5027,7 @@ async function renderControl(){
         <div style="font-size:9px;color:var(--muted);text-transform:uppercase">Retries</div>
       </div>
     </div>
+    <div id="ver-perf" style="margin-top:10px"></div>
   </div>`;
 
   // Advanced view: full cfgRows + data source management
@@ -5034,6 +5063,7 @@ async function renderControl(){
       </div>
     </div>`;
 
+  loadVersionPerf(sel);   // sel is the agent id string, not an object
   document.getElementById('root').innerHTML=`<div class="wrap">${sidebar()}
     <div class="panel">
       <div class="phead">
@@ -6776,6 +6806,41 @@ async function renderComms(){
     </div></div>`;
 }
 async function runWorkflow(id){ await fetch('/api/comms/workflows/'+id+'/run',{method:'POST'}); renderComms(); }
+
+/* ── did the last config change help? (learned from runs) ── */
+async function loadVersionPerf(agentId){
+  const d=await fetch('/api/phase2/agents/'+agentId+'/versions')
+    .then(r=>r.json()).catch(()=>null);
+  const el=document.getElementById('ver-perf');
+  if(!el||!d) return;
+  const vs=d.versions||[], v=d.verdict;
+  if(!vs.length){ el.innerHTML=''; return; }
+
+  const tone = v&&v.direction==='worse'  ? {bg:'var(--bricksoft)', fg:'var(--brick)', label:'Regression'}
+             : v&&v.direction==='better' ? {bg:'var(--accentsoft)',fg:'var(--terra)', label:'Improved'}
+             : {bg:'#faf8f5', fg:'var(--muted)', label:'No clear change'};
+
+  const rows=vs.slice(0,4).map(x=>{
+    const pct=Math.round(x.success_rate*100);
+    return `<div style="display:flex;align-items:center;gap:8px;padding:3px 0;font-size:11px">
+      <span class="pill" style="background:#eceef1;color:var(--muted);min-width:34px;text-align:center">v${x.version}</span>
+      <div style="flex:1;height:5px;background:#eceef1;border-radius:3px;overflow:hidden">
+        <div style="width:${pct}%;height:100%;background:var(--terra)"></div>
+      </div>
+      <span style="font-family:'IBM Plex Mono',monospace;color:var(--muted);white-space:nowrap">
+        ${pct}% · ${x.runs} run${x.runs===1?'':'s'}${x.enough_runs?'':' <i>thin</i>'}
+      </span></div>`;
+  }).join('');
+
+  el.innerHTML=`<div style="border:1px solid var(--line);border-radius:4px;padding:10px;background:${tone.bg}">
+    <div style="display:flex;align-items:center;gap:6px;margin-bottom:6px">
+      <span style="font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:${tone.fg}">${tone.label}</span>
+      <span style="font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em">· completion rate by config version</span>
+    </div>
+    ${rows}
+    ${v?`<div style="margin-top:7px;font-size:11px;color:var(--ink);line-height:1.45">${esc(v.summary)}</div>`:''}
+  </div>`;
+}
 
 /* ═══════════════ WORKFLOWS (Phase 2: build, run, learn) ═══════════════ */
 let wfBuilder=[];        // [{agent_id, instruction, depends_on:[idx]}]

@@ -936,3 +936,131 @@ class PatternAnalyzer:
 discovery = RelationshipDiscovery()
 recorder = WorkflowRecorder()
 patterns = PatternAnalyzer()
+
+
+# ═══════════════════════════════════════════════════════════════
+#  VERSION PERFORMANCE  (learned from runs — no new tables, no new steps)
+# ═══════════════════════════════════════════════════════════════
+#
+#  Every run already records config_version and outcome. That is enough to
+#  answer the question CORTEX's whole loop raises and never closes: after you
+#  approved that config change, did the agent get better or worse?
+#
+#  Nothing here writes. Nothing here asks the user to do anything new. It
+#  reads runs that already exist and reports rates.
+
+MIN_RUNS_PER_VERSION = 5    # below this, report the numbers but claim nothing
+MEANINGFUL_DELTA = 0.15     # 15 points; smaller gaps are noise at these volumes
+
+
+def version_performance(db: Session, agent_id: str) -> dict:
+    """Outcome rates per config version for one agent, newest version first.
+
+    Returns the per-version numbers plus a verdict comparing the current
+    version against the one before it. The verdict stays silent unless both
+    versions have enough runs and the gap is big enough to mean something —
+    at these volumes a 3-point difference is noise, and saying otherwise
+    would be the same false precision as a made-up confidence score.
+    """
+    runs = (db.query(Run)
+            .filter(Run.agent_id == agent_id)
+            .order_by(Run.started_at).all())
+
+    if not runs:
+        return {"agent_id": agent_id, "versions": [], "verdict": None,
+                "note": "no runs recorded for this agent yet"}
+
+    buckets: Dict[int, list] = {}
+    for r in runs:
+        buckets.setdefault(r.config_version or 1, []).append(r)
+
+    versions = []
+    for v in sorted(buckets, reverse=True):
+        group = buckets[v]
+        n = len(group)
+        completed = sum(1 for r in group if (r.outcome or "").upper() == "COMPLETED")
+        escalated = sum(1 for r in group if (r.outcome or "").upper() == "ESCALATED")
+        errored = sum(1 for r in group if (r.outcome or "").upper() == "ERROR")
+        lat = [run_latency_ms(r) for r in group]
+        versions.append({
+            "version": v,
+            "runs": n,
+            "completed": completed,
+            "escalated": escalated,
+            "error": errored,
+            "success_rate": completed / n if n else 0.0,
+            "escalation_rate": escalated / n if n else 0.0,
+            "error_rate": errored / n if n else 0.0,
+            "avg_latency_ms": (sum(lat) / len(lat)) if lat else 0.0,
+            "avg_tokens": sum(r.total_tokens or 0 for r in group) / n if n else 0,
+            "enough_runs": n >= MIN_RUNS_PER_VERSION,
+            "first_run": as_aware(group[0].started_at).isoformat() if group[0].started_at else None,
+            "last_run": as_aware(group[-1].started_at).isoformat() if group[-1].started_at else None,
+        })
+
+    return {"agent_id": agent_id, "versions": versions,
+            "verdict": _verdict(versions)}
+
+
+def _verdict(versions: List[dict]) -> Optional[dict]:
+    """Compare the current version to the one before it."""
+    if len(versions) < 2:
+        return {"direction": "insufficient_data",
+                "summary": "Only one config version has run so far — "
+                           "nothing to compare against yet."}
+
+    cur, prev = versions[0], versions[1]
+
+    if not (cur["enough_runs"] and prev["enough_runs"]):
+        thin = cur if not cur["enough_runs"] else prev
+        return {"direction": "insufficient_data",
+                "current": cur["version"], "previous": prev["version"],
+                "summary": f"v{thin['version']} has only {thin['runs']} run"
+                           f"{'' if thin['runs'] == 1 else 's'} — "
+                           f"need {MIN_RUNS_PER_VERSION} before comparing."}
+
+    delta = cur["success_rate"] - prev["success_rate"]
+    pc, pp = round(cur["success_rate"] * 100), round(prev["success_rate"] * 100)
+
+    if abs(delta) < MEANINGFUL_DELTA:
+        direction, summary = "no_clear_change", (
+            f"v{cur['version']} completes {pc}% of runs, v{prev['version']} "
+            f"completed {pp}%. Too close to call at {cur['runs']} and "
+            f"{prev['runs']} runs.")
+    elif delta < 0:
+        direction, summary = "worse", (
+            f"v{cur['version']} completes {pc}% of runs. v{prev['version']} "
+            f"completed {pp}%. Escalations went from "
+            f"{round(prev['escalation_rate']*100)}% to "
+            f"{round(cur['escalation_rate']*100)}%.")
+    else:
+        direction, summary = "better", (
+            f"v{cur['version']} completes {pc}% of runs, up from {pp}% "
+            f"on v{prev['version']}.")
+
+    return {"direction": direction, "current": cur["version"],
+            "previous": prev["version"], "delta": round(delta, 3),
+            "summary": summary}
+
+
+def fleet_regressions(db: Session, owner_id: str = None) -> list:
+    """Agents whose newest config version is performing worse than the last.
+
+    The one thing worth interrupting someone about: a change they approved
+    made an agent measurably worse.
+    """
+    q = db.query(Agent).filter(Agent.is_deleted == False)  # noqa: E712
+    if owner_id:
+        q = q.filter(Agent.owner_id == owner_id)
+
+    out = []
+    for a in q.all():
+        vp = version_performance(db, a.id)
+        v = vp.get("verdict") or {}
+        if v.get("direction") == "worse":
+            out.append({"agent_id": a.id, "name": a.name or a.slug,
+                        "summary": v["summary"], "delta": v.get("delta"),
+                        "current_version": v.get("current"),
+                        "previous_version": v.get("previous")})
+    out.sort(key=lambda x: x.get("delta") or 0)
+    return out
