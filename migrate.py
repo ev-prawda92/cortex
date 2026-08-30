@@ -37,10 +37,16 @@ DRY_RUN = "--dry-run" in sys.argv
 
 # Columns added to `agents` by the recovery feature: name -> DDL type snippet
 AGENTS_NEW_COLUMNS = {
+    # Recovery / recycle bin
     "is_deleted":  "BOOLEAN DEFAULT FALSE",
     "deleted_at":  "TIMESTAMP WITH TIME ZONE",
     "deleted_by":  "VARCHAR(64)",
     "purge_after": "TIMESTAMP WITH TIME ZONE",
+    # Lifecycle stage and ownership
+    "lifecycle":            "VARCHAR(16) DEFAULT 'active'",
+    "lifecycle_note":       "VARCHAR(512) DEFAULT ''",
+    "lifecycle_changed_at": "TIMESTAMP WITH TIME ZONE",
+    "contact":              "VARCHAR(255) DEFAULT ''",
 }
 
 

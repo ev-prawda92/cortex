@@ -1270,8 +1270,13 @@ _car_engine = CAREngine()
 EVENT_LOG = []  # list of {timestamp, agent_id, event_type, data}
 MAX_EVENTS = 500
 
-def log_event(agent_id: str, event_type: str, data: dict = None):
-    """Log an event to the in-memory event log AND the database audit trail."""
+def log_event(agent_id: str, event_type: str, data: dict = None, persist: bool = True):
+    """Log an event to the in-memory event log AND the database audit trail.
+
+    Pass persist=False when the caller has already written its own richer
+    log_audit row (with a user_id, say) — otherwise the same event lands in
+    audit_log twice, and the second copy is the poorer of the two.
+    """
     global EVENT_LOG
     EVENT_LOG.insert(0, {
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -1282,6 +1287,8 @@ def log_event(agent_id: str, event_type: str, data: dict = None):
     if len(EVENT_LOG) > MAX_EVENTS:
         EVENT_LOG = EVENT_LOG[:MAX_EVENTS]
     # Also persist to the audit_log table
+    if not persist:
+        return
     try:
         _db = SessionLocal()
         log_audit(_db, agent_id=agent_id, event=event_type, data=data or {})
@@ -1402,6 +1409,9 @@ def _agent_to_dict(a):
         "containment": a.containment or 0, "resolution": a.resolution or 0,
         "escalation": a.escalation or 0, "clinical_flags": 0,
         "owner_id": a.owner_id or "",
+        "lifecycle": a.lifecycle or "active",
+        "lifecycle_note": a.lifecycle_note or "",
+        "contact": a.contact or "",
     }
 
 def _seed_sample_agents(db):
@@ -1782,6 +1792,8 @@ def list_agents(request: Request):
                  "posture": (a.config or {}).get("posture", a.agent_type or "custom"),
                  "owner_id": a.owner_id or "",
                  "owner_name": owner_names.get(a.owner_id, "") if a.owner_id else "",
+                 "lifecycle": a.lifecycle or "active",
+                 "contact": a.contact or "",
                  }
                 for a in agents
             ],
@@ -2048,6 +2060,144 @@ def register_agent(body: RegisterAgentIn, request: Request):
         _ensure_history(agent_id)
         log_event(agent_id, "agent.registered", {"name": body.name})
         return {"ok": True, "agent_id": agent_id, "agent": {"id": agent_id, **_agent_to_dict(agent)}}
+    finally:
+        db.close()
+
+
+# ── Auscult: clinical transcript intake ─────────────────────────────
+class AuscultTranscriptIn(BaseModel):
+    patient_id: str
+    transcript: str
+    provider: str = ""
+    encounter_type: str = "office_visit"
+
+@app.post("/api/auscult/intake")
+def auscult_transcript_intake(body: AuscultTranscriptIn, request: Request):
+    """
+    Auscult transcript intake endpoint.
+    Accepts a clinical encounter transcript, parses it into structured
+    proposals, runs deterministic safety checks, and creates ApprovalRequest
+    records for physician attestation. Nothing writes to the chart until approved.
+    """
+    sess = _get_session(request)
+    db = SessionLocal()
+    try:
+        # Verify the Auscult agent is registered
+        agent = db.query(AgentModel).filter(
+            AgentModel.id == "auscult",
+            AgentModel.is_deleted == False
+        ).first()
+        if not agent:
+            raise HTTPException(404, "Auscult agent not registered. POST /api/agents/register first.")
+
+        # Create a run record
+        run = RunModel(
+            agent_id="auscult",
+            claim=f"Auscult intake: {body.patient_id} ({body.encounter_type})",
+            outcome="running",
+        )
+        db.add(run)
+        db.commit()
+        db.refresh(run)
+
+        # In production, this invokes the AuscultAgent from cortex_agents_framework.py.
+        # For the proof-of-concept, we run the deterministic safety pipeline inline
+        # so the endpoint works without an Anthropic API key.
+
+        # ── Mock parsed proposals (in prod: AuscultAgent.parse_transcript) ──
+        proposals = [
+            {"proposal_id": "RX-001", "type": "medication", "action": "modify",
+             "medication": "lisinopril", "dose": "20mg daily",
+             "details": "Increase for persistent HTN — BP 148/92"},
+            {"proposal_id": "LAB-001", "type": "lab_order", "action": "order",
+             "details": "BMP — recheck K+ and renal function post dose change"},
+            {"proposal_id": "LAB-002", "type": "lab_order", "action": "order",
+             "details": "Lipid panel — overdue > 12 months"},
+            {"proposal_id": "REF-001", "type": "referral", "action": "order",
+             "details": "Cardiology — persistent uncontrolled HTN"},
+            {"proposal_id": "RX-002", "type": "medication", "action": "new",
+             "medication": "amoxicillin", "dose": "500mg TID x 10 days",
+             "details": "Dental abscess"},
+        ]
+
+        # ── Mock chart context ──
+        chart = {
+            "allergies": ["amoxicillin (anaphylaxis/severe)", "sulfa (rash/moderate)"],
+            "active_meds": ["lisinopril 10mg daily", "atorvastatin 40mg daily", "metformin 500mg BID"],
+        }
+
+        # ── Deterministic safety checks ──
+        checked = []
+        for p in proposals:
+            status = "SAFE"
+            notes = ""
+            alternative = None
+            med = (p.get("medication") or "").lower()
+
+            if med == "amoxicillin":
+                status = "BLOCKED"
+                notes = "ALLERGY CONFLICT — amoxicillin: anaphylaxis (severe)"
+                alternative = "clindamycin 300mg TID x 10 days"
+            elif med == "lisinopril" and "20mg" in p.get("dose", ""):
+                notes = "Dose in range (2.5–40mg). Recheck K+ recommended."
+
+            checked.append({**p, "safety_status": status, "safety_notes": notes, "alternative": alternative})
+
+        # ── Create ApprovalRequest per proposal ──
+        approval_ids = []
+        for p in checked:
+            ar = ApprovalRequest(
+                agent_id="auscult",
+                run_id=run.id,
+                requested_by=body.provider or "Auscult Agent",
+                action=f"{p['type']}: {p['action']} — {p.get('medication') or p['details'][:40]}",
+                context={
+                    "patient_id": body.patient_id,
+                    "proposal": p,
+                    "safety_status": p["safety_status"],
+                    "safety_notes": p["safety_notes"],
+                    "alternative": p.get("alternative"),
+                    "encounter_type": body.encounter_type,
+                },
+                status="pending",
+            )
+            db.add(ar)
+            db.commit()
+            db.refresh(ar)
+            approval_ids.append(ar.id)
+
+        # Update run
+        run.outcome = "awaiting_approval"
+        run.detail = json.dumps({
+            "proposals": len(checked),
+            "safe": sum(1 for c in checked if c["safety_status"] == "SAFE"),
+            "blocked": sum(1 for c in checked if c["safety_status"] == "BLOCKED"),
+            "approval_ids": approval_ids,
+        })
+        db.commit()
+
+        log_event("auscult", "auscult.intake", {
+            "patient_id": body.patient_id,
+            "proposals": len(checked),
+            "blocked": sum(1 for c in checked if c["safety_status"] == "BLOCKED"),
+            "run_id": run.id,
+        })
+
+        return {
+            "ok": True,
+            "run_id": run.id,
+            "patient_id": body.patient_id,
+            "proposals_parsed": len(checked),
+            "safety_summary": {
+                "safe": sum(1 for c in checked if c["safety_status"] == "SAFE"),
+                "warning": sum(1 for c in checked if c["safety_status"] == "WARNING"),
+                "blocked": sum(1 for c in checked if c["safety_status"] == "BLOCKED"),
+            },
+            "checked_proposals": checked,
+            "approval_ids": approval_ids,
+            "chart_context": chart,
+            "note": "All proposals routed to Cortex approval gate. Attest via POST /api/approvals/{id}",
+        }
     finally:
         db.close()
 
@@ -2905,6 +3055,129 @@ def fetch_released_config(agent_id: str, request: Request, env: str = "productio
                 "version": rec.active_version,
                 "config": snap.config or {},
                 "released_at": rec.updated_at.isoformat() if rec.updated_at else None}
+    finally:
+        db.close()
+
+
+LIFECYCLE_STAGES = ["draft", "active", "deprecated", "retired"]
+
+
+class LifecycleIn(BaseModel):
+    lifecycle: str
+    note: str = ""
+
+
+class OwnershipIn(BaseModel):
+    owner_id: str | None = None
+    contact: str | None = None
+    account: str | None = None
+
+
+@app.post("/api/agents/{agent_id}/lifecycle")
+def set_lifecycle(agent_id: str, body: LifecycleIn, request: Request):
+    """Move an agent through its lifecycle.
+
+    Separate from run status on purpose. An agent can be deprecated and still
+    running — that is the state that lets a team say "stop building on this"
+    without anyone having to be brave enough to switch it off yet.
+    """
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "not authenticated")
+    stage = (body.lifecycle or "").strip().lower()
+    if stage not in LIFECYCLE_STAGES:
+        raise HTTPException(400, f"lifecycle must be one of: {', '.join(LIFECYCLE_STAGES)}")
+
+    db = SessionLocal()
+    try:
+        a = db.query(AgentModel).filter(AgentModel.id == agent_id).first()
+        if not a:
+            raise HTTPException(404, "agent not found")
+        previous = a.lifecycle or "active"
+
+        # Retiring something still executing is almost always a mistake — say so
+        # rather than silently stopping it on the user's behalf.
+        if stage == "retired" and (a.status == "running" or a.live):
+            raise HTTPException(400,
+                "this agent is still running — stop it before retiring, "
+                "or mark it deprecated instead")
+
+        a.lifecycle = stage
+        a.lifecycle_note = (body.note or "")[:512]
+        a.lifecycle_changed_at = utcnow()
+        db.commit()
+
+        log_audit(db, agent_id=agent_id, event="lifecycle.changed",
+                  data={"from": previous, "to": stage, "note": a.lifecycle_note},
+                  user_id=sess.get("user_id"))
+        # persist=False: log_audit above already wrote the durable row, with
+        # the note and the user attached. This call is only for the live feed.
+        log_event(agent_id, "lifecycle.changed", {"from": previous, "to": stage},
+                  persist=False)
+        return {"ok": True, "agent_id": agent_id, "from": previous, "to": stage,
+                "note": a.lifecycle_note}
+    finally:
+        db.close()
+
+
+@app.post("/api/agents/{agent_id}/ownership")
+def set_ownership(agent_id: str, body: OwnershipIn, request: Request):
+    """Set who is responsible for an agent and where to reach them."""
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "not authenticated")
+    db = SessionLocal()
+    try:
+        a = db.query(AgentModel).filter(AgentModel.id == agent_id).first()
+        if not a:
+            raise HTTPException(404, "agent not found")
+        before = {"owner_id": a.owner_id, "contact": a.contact, "account": a.account}
+        if body.owner_id is not None:
+            if body.owner_id and not db.query(User).filter(User.id == body.owner_id).first():
+                raise HTTPException(400, "no such user")
+            a.owner_id = body.owner_id or None
+        if body.contact is not None:
+            a.contact = (body.contact or "")[:255]
+        if body.account is not None:
+            a.account = (body.account or "")[:128]
+        db.commit()
+
+        log_audit(db, agent_id=agent_id, event="ownership.changed",
+                  data={"before": before,
+                        "after": {"owner_id": a.owner_id, "contact": a.contact,
+                                  "account": a.account}},
+                  user_id=sess.get("user_id"))
+        return {"ok": True, "agent_id": agent_id, "owner_id": a.owner_id,
+                "contact": a.contact or "", "account": a.account or ""}
+    finally:
+        db.close()
+
+
+@app.get("/api/agents/{agent_id}/ownership")
+def get_ownership(agent_id: str, request: Request):
+    """Who owns this agent, where to reach them, and its lifecycle stage."""
+    if not _get_session(request):
+        raise HTTPException(401, "not authenticated")
+    db = SessionLocal()
+    try:
+        a = db.query(AgentModel).filter(AgentModel.id == agent_id).first()
+        if not a:
+            raise HTTPException(404, "agent not found")
+        owner = db.query(User).filter(User.id == a.owner_id).first() if a.owner_id else None
+        users = [{"id": u.id, "name": u.name or u.email, "email": u.email}
+                 for u in db.query(User).filter(User.is_active == True).all()]  # noqa: E712
+        return {
+            "agent_id": agent_id,
+            "owner_id": a.owner_id or "",
+            "owner_name": (owner.name or owner.email) if owner else "",
+            "owner_email": owner.email if owner else "",
+            "contact": a.contact or "",
+            "account": a.account or "",
+            "lifecycle": a.lifecycle or "active",
+            "lifecycle_note": a.lifecycle_note or "",
+            "lifecycle_changed_at": a.lifecycle_changed_at.isoformat() if a.lifecycle_changed_at else None,
+            "assignable_users": users,
+        }
     finally:
         db.close()
 
@@ -4647,6 +4920,19 @@ h4{font-size:10.5px;font-weight:600;letter-spacing:.1em;text-transform:uppercase
 
 <script>
 let AGENTS=[], sel=null, pending=null, view='monitor', META={}, USER=null, advancedMode=false;
+
+/* Refresh the agent list + header counts. Called at boot and after any change
+   that alters what the list shows (ownership, lifecycle, delete). */
+async function loadAgents(){
+  const r=await fetch('/api/agents'); const d=await r.json();
+  AGENTS=d.agents||[]; META=d;
+  const c=document.getElementById('count');
+  if(c) c.textContent=d.total||0;
+  const l=document.getElementById('llm-state');
+  if(l) l.textContent = d.llm ? 'model-assisted' : 'rule-based';
+  if(!sel && AGENTS.length) sel=AGENTS[0].id;
+  return d;
+}
 const TABS=['monitor','agents','observability','control','runs','usage','integrations','deploy','events','history','automation','templates','teams','plugins','comms','workflows','recovery','attestations','approvals','analytics','runtime','settings'];
 
 async function boot(){
@@ -4662,13 +4948,7 @@ async function boot(){
     if(USER.is_admin){document.getElementById('nav-admin').style.display='';}
     applyRoleNav();
   }catch(e){console.error('boot auth:',e);}
-  try{
-    const r=await fetch('/api/agents'); const d=await r.json();
-    AGENTS=d.agents||[]; META=d;
-    document.getElementById('count').textContent=d.total||0;
-    document.getElementById('llm-state').textContent = d.llm ? 'model-assisted' : 'rule-based';
-    if(!sel && AGENTS.length) sel=AGENTS[0].id;
-  }catch(e){console.error('boot agents:',e);}
+  try{ await loadAgents(); }catch(e){console.error('boot agents:',e);}
   try{pollNotifications();}catch(e){}
   await render();
 }
@@ -4908,6 +5188,7 @@ async function renderAgents(){
       <div style="display:flex;justify-content:space-between;align-items:start;margin-bottom:4px">
         <div class="ac-name">${esc(a.name)}</div>
         <div style="display:flex;gap:4px;align-items:center">
+          ${(a.lifecycle&&a.lifecycle!=='active')?lifecycleBadge(a.lifecycle):''}
           <span class="pill ${a.status}">${a.status}</span>
           <button class="btn ghost" style="padding:2px 6px;font-size:10px;color:var(--brick)" onclick="event.stopPropagation();deleteAgent('${a.id}','${esc(a.name)}')">Delete</button>
         </div>
@@ -4917,6 +5198,7 @@ async function renderAgents(){
         <span class="typetag ${a.type}">${a.type}</span>
         <span class="eptag">${(a.endpoint||{}).type||'embedded'}</span>
         <span style="font-family:'IBM Plex Mono';font-size:9px;color:var(--faint);padding:2px 6px">${a.data_sources_count||0} sources · ${a.tools_count||0} tools</span>
+        <span style="font-family:'IBM Plex Mono';font-size:9px;padding:2px 6px;color:${a.owner_name?'var(--muted)':'var(--brick)'}">${a.owner_name?esc(a.owner_name):'unowned'}</span>
       </div>
     </div>`).join('');
 
@@ -5267,7 +5549,7 @@ function sidebar(){
     <button class="card ${sel===a.id?'active':''}" data-s="${a.status}" onclick="pick('${a.id}')">
       <div class="ctop"><span class="cname">${esc(a.name)}</span><span class="cstat">${a.status}</span></div>
       <div class="cmeta"><span>${a.data_sources_count||0} src</span><span>${a.tools_count||0} tools</span></div>
-      <span class="typetag ${a.type}">${a.type}</span>${a.live?'<span class="livetag">LIVE</span>':''}
+      <span class="typetag ${a.type}">${a.type}</span>${a.live?'<span class="livetag">LIVE</span>':''}${(a.lifecycle&&a.lifecycle!=='active')?' '+lifecycleBadge(a.lifecycle):''}
     </button>`).join('')}</div></div>`;
 }
 
@@ -5359,11 +5641,12 @@ async function renderControl(){
     </div>`;
 
   loadVersionPerf(sel);   // sel is the agent id string, not an object
+  loadOwnership(sel);
   document.getElementById('root').innerHTML=`<div class="wrap">${sidebar()}
     <div class="panel">
       <div class="phead">
         <div>
-          <h3>${esc(a.name)}</h3>
+          <h3>${esc(a.name)} ${lifecycleBadge(a.lifecycle||'active','vertical-align:middle;margin-left:6px')}</h3>
           <div class="acct">${esc(a.account||'Custom')}</div>
           <div style="margin-top:4px;font-size:11.5px;color:var(--muted)">${esc(a.description||'')}</div>
         </div>
@@ -5378,6 +5661,11 @@ async function renderControl(){
         </div>
       </div>
       ${advancedMode ? advancedConfig : `<div class="sect"><h4>Overview</h4>${simpleConfig}</div>`}
+
+      <div class="sect">
+        <h4>Ownership &amp; Lifecycle</h4>
+        <div id="own-panel"><div class="hint" style="margin:0">Loading…</div></div>
+      </div>
 
       ${liveRunPanel(a)}
       <div class="sect">
@@ -7113,6 +7401,105 @@ async function renderComms(){
     </div></div>`;
 }
 async function runWorkflow(id){ await fetch('/api/comms/workflows/'+id+'/run',{method:'POST'}); renderComms(); }
+
+/* ── ownership & lifecycle: who is responsible, and where this agent is in its life ── */
+const LIFECYCLE_META={
+  draft:      {label:'Draft',      fg:'#6b6155', bg:'#ece5db', hint:'Being built. Not for anyone to depend on yet.'},
+  active:     {label:'Active',     fg:'#2a5a30', bg:'#d4e0d6', hint:'Supported. Safe to build on.'},
+  deprecated: {label:'Deprecated', fg:'#8a5a12', bg:'#f0e2c8', hint:'Still runs, but do not build anything new on it.'},
+  retired:    {label:'Retired',    fg:'#7a3b32', bg:'#eedbd7', hint:'Out of service. Kept for the record.'}
+};
+function lifecycleBadge(stage,extra){
+  const m=LIFECYCLE_META[stage]||LIFECYCLE_META.active;
+  return `<span title="${esc(m.hint)}" style="font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;padding:2px 6px;border-radius:3px;color:${m.fg};background:${m.bg};${extra||''}">${m.label}</span>`;
+}
+
+async function loadOwnership(agentId){
+  // Look the element up AFTER the fetch: renderControl fires this before it
+  // writes its own markup, so #own-panel does not exist yet at call time.
+  const d=await fetch('/api/agents/'+agentId+'/ownership').then(r=>r.ok?r.json():null).catch(()=>null);
+  const el=document.getElementById('own-panel');
+  if(!el) return;
+  if(!d){ el.innerHTML='<div class="hint" style="margin:0">Could not load ownership.</div>'; return; }
+  const stage=d.lifecycle||'active';
+  const users=d.assignable_users||[];
+  const opts=['<option value="">— unassigned —</option>'].concat(
+    users.map(u=>`<option value="${u.id}" ${u.id===d.owner_id?'selected':''}>${esc(u.name)}</option>`)).join('');
+  const stages=Object.keys(LIFECYCLE_META).map(k=>
+    `<option value="${k}" ${k===stage?'selected':''}>${LIFECYCLE_META[k].label}</option>`).join('');
+  const changed=d.lifecycle_changed_at
+    ? new Date(d.lifecycle_changed_at).toLocaleString()
+    : 'never changed';
+
+  el.innerHTML=`
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+    <div style="padding:12px;background:#faf8f5;border-radius:6px;border:1px solid var(--line)">
+      <div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:var(--accent);margin-bottom:8px">Responsible</div>
+      <div class="form-group" style="margin-bottom:8px">
+        <label>Owner</label>
+        <select id="own-owner" style="width:100%;padding:6px 8px;border:1px solid var(--line);border-radius:3px;font:inherit;font-size:12px;background:white">${opts}</select>
+      </div>
+      <div class="form-group" style="margin-bottom:8px">
+        <label>Contact at 3am</label>
+        <input id="own-contact" value="${esc(d.contact||'')}" placeholder="#oncall-channel or rota@team" style="width:100%;padding:6px 8px;border:1px solid var(--line);border-radius:3px;font:inherit;font-size:12px">
+      </div>
+      <div class="form-group" style="margin-bottom:8px">
+        <label>Account / Team</label>
+        <input id="own-account" value="${esc(d.account||'')}" placeholder="e.g. Clinical Ops" style="width:100%;padding:6px 8px;border:1px solid var(--line);border-radius:3px;font:inherit;font-size:12px">
+      </div>
+      <button class="btn accent" style="padding:6px 12px;font-size:11px" onclick="saveOwnership('${agentId}')">Save</button>
+      ${d.owner_id?'':'<div style="font-size:10px;color:var(--brick);margin-top:6px">Nobody owns this agent.</div>'}
+    </div>
+
+    <div style="padding:12px;background:#faf8f5;border-radius:6px;border:1px solid var(--line)">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+        <div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:var(--accent)">Lifecycle</div>
+        ${lifecycleBadge(stage)}
+      </div>
+      <div style="font-size:11px;color:var(--muted);margin-bottom:8px">${esc(LIFECYCLE_META[stage].hint)}</div>
+      <div class="form-group" style="margin-bottom:8px">
+        <label>Stage</label>
+        <select id="lc-stage" style="width:100%;padding:6px 8px;border:1px solid var(--line);border-radius:3px;font:inherit;font-size:12px;background:white">${stages}</select>
+      </div>
+      <div class="form-group" style="margin-bottom:8px">
+        <label>Why / what to use instead</label>
+        <input id="lc-note" value="${esc(d.lifecycle_note||'')}" placeholder="e.g. superseded by intake-v2" style="width:100%;padding:6px 8px;border:1px solid var(--line);border-radius:3px;font:inherit;font-size:12px">
+      </div>
+      <button class="btn accent" style="padding:6px 12px;font-size:11px" onclick="setLifecycle('${agentId}')">Update Stage</button>
+      <div style="font-size:10px;color:var(--faint);margin-top:6px">Last changed: ${esc(changed)}</div>
+      <div id="lc-msg" style="font-size:11px;margin-top:6px"></div>
+    </div>
+  </div>`;
+}
+
+async function saveOwnership(agentId){
+  const body={owner_id:document.getElementById('own-owner').value,
+              contact:document.getElementById('own-contact').value,
+              account:document.getElementById('own-account').value};
+  const r=await fetch('/api/agents/'+agentId+'/ownership',
+    {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  const j=await r.json().catch(()=>({}));
+  const m=document.getElementById('lc-msg');
+  if(!r.ok){ if(m){m.style.color='var(--brick)';m.textContent=j.detail||'Could not save.';} return; }
+  await loadAgents();
+  loadOwnership(agentId);
+}
+
+async function setLifecycle(agentId){
+  const m=document.getElementById('lc-msg');
+  const body={lifecycle:document.getElementById('lc-stage').value,
+              note:document.getElementById('lc-note').value};
+  const r=await fetch('/api/agents/'+agentId+'/lifecycle',
+    {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  const j=await r.json().catch(()=>({}));
+  if(!r.ok){
+    // The refusal is the useful part — show it verbatim rather than a generic error.
+    if(m){ m.style.color='var(--brick)'; m.textContent=j.detail||'Could not change stage.'; }
+    return;
+  }
+  await loadAgents();
+  renderControl();
+}
 
 /* ── did the last config change help? (learned from runs) ── */
 async function loadVersionPerf(agentId){

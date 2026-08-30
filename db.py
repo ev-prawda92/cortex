@@ -30,20 +30,22 @@ from sqlalchemy.orm import (
 # ── Database URL ──────────────────────────────────────────────
 DATABASE_URL = os.environ.get(
     "DATABASE_URL",
-    "postgresql://cortex:cortex@localhost:5432/cortex"
+    "sqlite:///cortex.db"
 )
 
 # Handle Railway/Render-style postgres:// URLs (SQLAlchemy needs postgresql://)
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-engine = create_engine(
-    DATABASE_URL,
-    pool_size=10,
-    max_overflow=20,
-    pool_pre_ping=True,  # auto-reconnect on stale connections
+_engine_kwargs = dict(
     echo=os.environ.get("SQL_ECHO", "").lower() == "true",
 )
+if not DATABASE_URL.startswith("sqlite"):
+    _engine_kwargs.update(pool_size=10, max_overflow=20, pool_pre_ping=True)
+else:
+    _engine_kwargs["connect_args"] = {"check_same_thread": False}
+
+engine = create_engine(DATABASE_URL, **_engine_kwargs)
 
 SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
 Base = declarative_base()
@@ -117,10 +119,23 @@ class Agent(Base):
     account = Column(String(128), default="")  # team/org label
     agent_type = Column(String(32), default="custom")  # sample | custom | imported
 
-    # State
+    # Runtime state — is it executing right now.
     status = Column(String(32), default="stopped")  # running | stopped | error
     live = Column(Boolean, default=False)
     version = Column(Integer, default=1)
+
+    # Lifecycle stage — a different axis from runtime state. An agent can be
+    # deprecated and still running; that is the whole point of the stage. It
+    # tells a team "stop building on this" long before anyone dares turn it off,
+    # which is why estates accumulate agents nobody will retire.
+    lifecycle = Column(String(16), default="active", index=True)
+    # draft | active | deprecated | retired
+    lifecycle_note = Column(String(512), default="")   # why, and what to use instead
+    lifecycle_changed_at = Column(DateTime(timezone=True), nullable=True)
+
+    # Ownership — owner_id is the responsible human, not merely whoever clicked
+    # create. contact is where an alert goes at 3am: a rota, a channel, a person.
+    contact = Column(String(255), default="")
 
     # Full config stored as JSON (model, execution, behavior, tools, data_sources, audit)
     config = Column(JSON, default=dict)
