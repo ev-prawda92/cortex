@@ -114,24 +114,15 @@ def _execute_cycle(agent_id: str, agent_dict: dict) -> dict:
     cycle_num = state.cycle_count + 1 if state else 1
     cycle_context = f"\n\n[Continuous mode — cycle #{cycle_num}. Report what you find or do. Be concise.]"
 
-    behavior = cfg.get("behavior", {})
     tools_cfg = cfg.get("tools", [])
     execution = cfg.get("execution", {})
 
-    system_parts = [f"You are {agent_dict.get('name', agent_id)}."]
-    if agent_dict.get("description"):
-        system_parts.append(agent_dict["description"])
-    system_parts.append(f"\nOPERATING CONFIG (live from Cortex):")
-    system_parts.append(f"- mode: continuous (always-on)")
-    system_parts.append(f"- confidence threshold: {behavior.get('confidence_threshold', 0.75)}")
-    if tools_cfg:
-        system_parts.append(f"- available tools: {', '.join(t['name'] for t in tools_cfg)}")
-    system = "\n".join(system_parts)
-
-    # Same tool set and handler the API path uses, so a continuous cycle and a
-    # manual run behave identically — including the implicit escalate tool,
-    # without which a daemon run can never record anything but COMPLETED.
-    from cortex import _tools_for, _run_tool
+    # Same prompt builder, tool set and handler the API path uses, so a
+    # continuous cycle and a manual run behave identically — including the
+    # implicit escalate tool, without which a daemon run can never record
+    # anything but COMPLETED.
+    from cortex import _tools_for, _run_tool, build_system_prompt
+    system = build_system_prompt(agent_dict, continuous=True)
     tools = _tools_for(tools_cfg)
     _tool_handler = _run_tool
 

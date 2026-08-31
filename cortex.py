@@ -1958,14 +1958,29 @@ def update_standing_instruction(agent_id: str, body: StandingInstructionBody, re
         a = db.query(AgentModel).filter(AgentModel.id == agent_id).first()
         if not a:
             raise HTTPException(404, "agent not found")
-        cfg = dict(a.config or {})
+        prev_config = dict(a.config or {})
+        cfg = dict(prev_config)
         cfg["standing_instruction"] = body.standing_instruction
         cfg["run_interval_seconds"] = max(30, body.run_interval_seconds)
+        if cfg == prev_config:
+            return {"ok": True, "unchanged": True, "config": cfg,
+                    "version": a.version or 1}
         a.config = cfg
         from sqlalchemy.orm.attributes import flag_modified
         flag_modified(a, "config")
         db.commit()
-        return {"ok": True, "config": cfg}
+        # The standing instruction is what a continuous agent actually does on
+        # every cycle, so a change to it is a config change like any other and
+        # has to be attributable — otherwise runs before and after it pool into
+        # the same version bucket and the comparison silently lies.
+        snap = snapshot_agent_version(
+            db, a, changed_by=sess.get("user_id"),
+            changer_email=sess.get("email", ""),
+            change_type="update", prev_config=prev_config,
+            change_summary="Standing instruction / run interval updated",
+        )
+        return {"ok": True, "unchanged": False, "config": cfg,
+                "version": snap.version}
     finally:
         db.close()
 
@@ -2773,6 +2788,45 @@ def _run_tool(name: str, input_data: dict) -> str:
             f"taken and no data was returned.]")
 
 
+def build_system_prompt(agent: dict, continuous: bool = False) -> str:
+    """Assemble the system prompt an agent is actually run with.
+
+    One implementation, used by both the single-run path and the continuous
+    daemon, so what the Prompt tab previews is character-for-character what
+    the model receives. Order matters:
+
+        identity  →  the author's system prompt  →  live operating config
+
+    The operating config goes last on purpose. Cortex is the source of truth
+    for how an agent behaves, so a prompt that says "escalate nothing" cannot
+    quietly override an escalation threshold set in config.
+    """
+    cfg = agent.get("config") or {}
+    behavior = cfg.get("behavior", {})
+    tools_cfg = cfg.get("tools", [])
+
+    parts = [f"You are {agent.get('name') or agent.get('id', 'this agent')}."]
+    if agent.get("description"):
+        parts.append(agent["description"])
+
+    authored = (cfg.get("system_prompt") or "").strip()
+    if authored:
+        parts.append("\n" + authored)
+
+    parts.append("\nOPERATING CONFIG (live from Cortex — obey it):")
+    if continuous:
+        parts.append("- mode: continuous (always-on)")
+    parts.append(f"- confidence threshold: {behavior.get('confidence_threshold', 0.75)}")
+    parts.append(f"- escalation threshold: {behavior.get('escalation_threshold', 'high')}")
+    if behavior.get("confirm_before_action"):
+        parts.append("- confirm before action: state what you will do before doing it.")
+    if behavior.get("auto_escalate_on_error"):
+        parts.append("- auto-escalate on error: escalate to a human if an error occurs.")
+    if tools_cfg:
+        parts.append(f"- available tools: {', '.join(t['name'] for t in tools_cfg)}")
+    return "\n".join(parts)
+
+
 def _execute_agent(agent_id: str, claim: str) -> dict:
     """Execute an agent using its CURRENT Cortex config, and record the run.
 
@@ -2864,19 +2918,7 @@ def _execute_agent(agent_id: str, claim: str) -> dict:
     tools_cfg = cfg.get("tools", [])
     execution = cfg.get("execution", {})
 
-    system_parts = [f"You are {a.get('name', agent_id)}."]
-    if a.get("description"):
-        system_parts.append(a["description"])
-    system_parts.append(f"\nOPERATING CONFIG (live from Cortex — obey it):")
-    system_parts.append(f"- confidence threshold: {behavior.get('confidence_threshold', 0.75)}")
-    system_parts.append(f"- escalation threshold: {behavior.get('escalation_threshold', 'high')}")
-    if behavior.get("confirm_before_action"):
-        system_parts.append("- confirm before action: state what you will do before doing it.")
-    if behavior.get("auto_escalate_on_error"):
-        system_parts.append("- auto-escalate on error: escalate to a human if an error occurs.")
-    if tools_cfg:
-        system_parts.append(f"- available tools: {', '.join(t['name'] for t in tools_cfg)}")
-    system = "\n".join(system_parts)
+    system = build_system_prompt(a)
 
     tools = _tools_for(tools_cfg)
 
@@ -3055,6 +3097,81 @@ def fetch_released_config(agent_id: str, request: Request, env: str = "productio
                 "version": rec.active_version,
                 "config": snap.config or {},
                 "released_at": rec.updated_at.isoformat() if rec.updated_at else None}
+    finally:
+        db.close()
+
+
+class SystemPromptIn(BaseModel):
+    system_prompt: str = ""
+    note: str = ""
+
+
+@app.get("/api/agents/{agent_id}/system-prompt")
+def get_system_prompt(agent_id: str, request: Request):
+    """The authored prompt, and the full text the model is actually given.
+
+    The preview is built with the same function the run path uses, so what is
+    shown here is not an approximation of the prompt — it is the prompt.
+    """
+    if not _get_session(request):
+        raise HTTPException(401, "not authenticated")
+    db = SessionLocal()
+    try:
+        a = db.query(AgentModel).filter(AgentModel.id == agent_id).first()
+        if not a:
+            raise HTTPException(404, "agent not found")
+        d = _agent_to_dict(a)
+        cfg = a.config or {}
+        return {
+            "agent_id": agent_id,
+            "system_prompt": cfg.get("system_prompt", "") or "",
+            "version": a.version or 1,
+            "assembled": build_system_prompt(d),
+            "assembled_continuous": build_system_prompt(d, continuous=True),
+        }
+    finally:
+        db.close()
+
+
+@app.post("/api/agents/{agent_id}/system-prompt")
+def set_system_prompt(agent_id: str, body: SystemPromptIn, request: Request):
+    """Change an agent's system prompt.
+
+    The prompt lives inside config, not beside it, so it snapshots, diffs,
+    rolls back and attributes runs exactly like every other config change —
+    and a prompt edit that made things worse shows up in version performance
+    the same way a temperature change does.
+    """
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "not authenticated")
+    db = SessionLocal()
+    try:
+        a = db.query(AgentModel).filter(AgentModel.id == agent_id).first()
+        if not a:
+            raise HTTPException(404, "agent not found")
+        prev_config = dict(a.config or {})
+        if (prev_config.get("system_prompt") or "") == body.system_prompt:
+            # No change is not a new version. Saying so beats silently
+            # inflating the version history with identical snapshots.
+            return {"ok": True, "unchanged": True, "version": a.version or 1,
+                    "assembled": build_system_prompt(_agent_to_dict(a))}
+        cfg = dict(prev_config)
+        cfg["system_prompt"] = body.system_prompt
+        a.config = cfg
+        from sqlalchemy.orm.attributes import flag_modified
+        flag_modified(a, "config")
+        db.commit()
+
+        snap = snapshot_agent_version(
+            db, a, changed_by=sess.get("user_id"),
+            changer_email=sess.get("email", ""),
+            change_type="update", prev_config=prev_config,
+            change_summary=body.note or "System prompt updated",
+        )
+        log_event(agent_id, "system_prompt.changed", {"version": snap.version})
+        return {"ok": True, "unchanged": False, "version": snap.version,
+                "assembled": build_system_prompt(_agent_to_dict(a))}
     finally:
         db.close()
 
@@ -5642,6 +5759,7 @@ async function renderControl(){
 
   loadVersionPerf(sel);   // sel is the agent id string, not an object
   loadOwnership(sel);
+  loadPrompt(sel);
   document.getElementById('root').innerHTML=`<div class="wrap">${sidebar()}
     <div class="panel">
       <div class="phead">
@@ -5665,6 +5783,11 @@ async function renderControl(){
       <div class="sect">
         <h4>Ownership &amp; Lifecycle</h4>
         <div id="own-panel"><div class="hint" style="margin:0">Loading…</div></div>
+      </div>
+
+      <div class="sect">
+        <h4>System Prompt</h4>
+        <div id="prompt-panel"><div class="hint" style="margin:0">Loading…</div></div>
       </div>
 
       ${liveRunPanel(a)}
@@ -7401,6 +7524,55 @@ async function renderComms(){
     </div></div>`;
 }
 async function runWorkflow(id){ await fetch('/api/comms/workflows/'+id+'/run',{method:'POST'}); renderComms(); }
+
+/* ── system prompt: what the agent is told, and what it is actually sent ── */
+async function loadPrompt(agentId){
+  const d=await fetch('/api/agents/'+agentId+'/system-prompt')
+    .then(r=>r.ok?r.json():null).catch(()=>null);
+  const el=document.getElementById('prompt-panel');
+  if(!el) return;
+  if(!d){ el.innerHTML='<div class="hint" style="margin:0">Could not load the system prompt.</div>'; return; }
+  el.innerHTML=`
+    <div style="font-size:12px;color:var(--muted);margin-bottom:10px">
+      Cortex holds the prompt, versions it with the rest of the config, and shows you
+      exactly what the model receives — the preview below is built by the same code
+      that runs the agent.
+    </div>
+    <textarea id="sp-text" class="ask" placeholder="What is this agent for, how should it behave, what must it never do?" style="min-height:150px;font-family:'IBM Plex Mono';font-size:12px">${esc(d.system_prompt||'')}</textarea>
+    <div style="display:flex;gap:8px;align-items:center;margin-top:8px">
+      <button class="btn accent" style="padding:6px 12px;font-size:11px" onclick="savePrompt('${agentId}')">Save as new version</button>
+      <button class="btn ghost" style="padding:6px 12px;font-size:11px" onclick="togglePreview()">Show what the model sees</button>
+      <span style="font-size:10px;color:var(--faint)">currently v${d.version}</span>
+      <span id="sp-msg" style="font-size:11px"></span>
+    </div>
+    <pre id="sp-preview" style="display:none;margin-top:10px;padding:12px;background:#faf8f5;border:1px solid var(--line);border-radius:6px;font-family:'IBM Plex Mono';font-size:11px;white-space:pre-wrap;color:var(--ink);max-height:340px;overflow:auto">${esc(d.assembled||'')}</pre>`;
+}
+
+function togglePreview(){
+  const p=document.getElementById('sp-preview');
+  if(p) p.style.display = p.style.display==='none' ? 'block' : 'none';
+}
+
+async function savePrompt(agentId){
+  const m=document.getElementById('sp-msg');
+  const r=await fetch('/api/agents/'+agentId+'/system-prompt',
+    {method:'POST',headers:{'Content-Type':'application/json'},
+     body:JSON.stringify({system_prompt:document.getElementById('sp-text').value})});
+  const j=await r.json().catch(()=>({}));
+  if(!r.ok){ if(m){m.style.color='var(--brick)';m.textContent=j.detail||'Could not save.';} return; }
+  const p=document.getElementById('sp-preview');
+  const wasOpen = p && p.style.display!=='none';
+  // Reload first — it replaces the panel, message element included — then say
+  // what happened, or the confirmation is wiped the moment it is written.
+  await loadPrompt(agentId);
+  if(wasOpen) togglePreview();
+  const m2=document.getElementById('sp-msg');
+  if(m2){
+    m2.style.color='var(--muted)';
+    m2.textContent = j.unchanged ? 'No change — still v'+j.version : 'Saved as v'+j.version;
+  }
+  loadVersionPerf(agentId);
+}
 
 /* ── ownership & lifecycle: who is responsible, and where this agent is in its life ── */
 const LIFECYCLE_META={
