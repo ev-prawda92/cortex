@@ -25,3 +25,4 @@ venv/
 
 # Local backups
 *.bundle
+.cortex-key
