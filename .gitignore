@@ -22,3 +22,6 @@ data/
 # Virtualenv
 .venv/
 venv/
+
+# Local backups
+*.bundle
