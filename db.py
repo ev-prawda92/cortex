@@ -284,6 +284,43 @@ class DataSource(Base):
     agent = relationship("Agent", back_populates="data_sources")
 
 
+class Secret(Base):
+    """An encrypted credential, stored away from the config that references it.
+
+    Agent config is snapshotted into an immutable AgentVersion on every change,
+    served to the UI, diffed and rolled back. A secret placed in config is
+    therefore copied into permanent history the first time anyone edits
+    anything, and handed to every caller who can read the agent. So config
+    carries only an id and a hint; the value lives here, encrypted at rest, and
+    is decrypted at the moment a run needs it and not before.
+
+    There is deliberately no endpoint that returns `ciphertext`. A credential
+    goes in and is used; it does not come back out.
+    """
+
+    __tablename__ = "secrets"
+
+    id = Column(String(64), primary_key=True, default=gen_id)
+    agent_id = Column(String(64), ForeignKey("agents.id"), nullable=True, index=True)
+
+    # What this credential is for, e.g. the data source name it belongs to.
+    label = Column(String(255), default="")
+    ciphertext = Column(Text, default="")
+    # "****4f21" — enough to tell two keys apart, not enough to be one.
+    hint = Column(String(32), default="")
+
+    created_at = Column(DateTime(timezone=True), default=utcnow)
+    created_by = Column(String(64), nullable=True)
+    last_used_at = Column(DateTime(timezone=True), nullable=True)
+
+    def to_dict(self):
+        """Never includes ciphertext. There is no argument that turns it on."""
+        return {"id": self.id, "agent_id": self.agent_id, "label": self.label,
+                "hint": self.hint,
+                "created_at": self.created_at.isoformat() if self.created_at else None,
+                "last_used_at": self.last_used_at.isoformat() if self.last_used_at else None}
+
+
 class AgentRelease(Base):
     """Which config version is live in one of the client's environments.
 
@@ -591,6 +628,63 @@ def _diff_config(old: dict, new: dict) -> dict:
     return diff
 
 
+def store_secret(db: Session, plaintext: str, agent_id: str = None,
+                 label: str = "", created_by: str = None):
+    """Encrypt a credential and return its Secret row. Empty input stores nothing."""
+    import secrets_store
+    if not plaintext:
+        return None
+    row = Secret(id=gen_id(), agent_id=agent_id, label=label,
+                 ciphertext=secrets_store.encrypt(plaintext),
+                 hint=secrets_store.hint(plaintext), created_by=created_by)
+    db.add(row)
+    db.commit()
+    return row
+
+
+def resolve_secret(db: Session, secret_id: str) -> str:
+    """Decrypt a stored credential at the point of use.
+
+    Records the access time, so an operator can see which credentials are
+    actually being used and which have been sitting unused since someone left.
+    """
+    import secrets_store
+    if not secret_id:
+        return ""
+    row = db.query(Secret).filter(Secret.id == secret_id).first()
+    if not row:
+        raise ValueError(f"credential {secret_id} not found")
+    value = secrets_store.decrypt(row.ciphertext)
+    row.last_used_at = utcnow()
+    db.commit()
+    return value
+
+
+def scrub_config_secrets(config: dict) -> dict:
+    """Strip any plaintext credential out of a config dict.
+
+    Belt and braces for the snapshot path. Nothing should be writing
+    auth_value any more, but a snapshot is immutable and forever, so this runs
+    on the way in rather than trusting every future caller to remember.
+    """
+    if not config:
+        return config
+    sources = config.get("data_sources")
+    if not isinstance(sources, list):
+        return config
+    cleaned, changed = [], False
+    for ds in sources:
+        if isinstance(ds, dict) and ds.get("auth_value"):
+            ds = {k: v for k, v in ds.items() if k != "auth_value"}
+            changed = True
+        cleaned.append(ds)
+    if not changed:
+        return config
+    out = dict(config)
+    out["data_sources"] = cleaned
+    return out
+
+
 def snapshot_agent_version(db: Session, agent, changed_by: str = None,
                            changer_email: str = "", change_type: str = "update",
                            change_summary: str = "", prev_config: dict = None) -> "AgentVersion":
@@ -606,7 +700,10 @@ def snapshot_agent_version(db: Session, agent, changed_by: str = None,
     next_version = (last.version + 1) if last else 1
     prev_hash = last.record_hash if last else ""
 
-    config = agent.config or {}
+    # Scrub before the snapshot, not after: an AgentVersion row is immutable
+    # and permanent, so a secret that reaches it is unrecoverable history.
+    config = scrub_config_secrets(agent.config or {})
+    prev_config = scrub_config_secrets(prev_config) if prev_config is not None else None
     diff = _diff_config(prev_config, config) if prev_config is not None else {}
     record_hash = _hash_version(agent.id, next_version, config, prev_hash)
 

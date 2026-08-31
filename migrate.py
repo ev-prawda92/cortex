@@ -157,6 +157,97 @@ def backfill_version_snapshots() -> int:
     return count
 
 
+def migrate_plaintext_credentials():
+    """Move any plaintext credential out of config and into the secrets table.
+
+    Two places hold them today:
+
+      agents.config          — the live config, fixable in place
+      agent_versions.config  — every snapshot ever taken, which is where the
+                               real damage is: one credential entered once was
+                               copied into a new immutable row on every
+                               subsequent config change
+
+    Live configs get their secret encrypted and replaced with a reference.
+    Snapshots get the field stripped outright — a historical version does not
+    need a working credential, it needs to not be carrying one. Rolling back to
+    an old version restores its settings and leaves the current credential
+    alone, which is the behaviour you want anyway: rollback is for config, not
+    for re-injecting a key someone rotated.
+    """
+    from db import SessionLocal, Agent, AgentVersion, Secret, gen_id
+    import secrets_store
+
+    db = SessionLocal()
+    moved = stripped = 0
+    try:
+        for a in db.query(Agent).all():
+            cfg = a.config or {}
+            sources = cfg.get("data_sources")
+            if not isinstance(sources, list):
+                continue
+            changed = False
+            new_sources = []
+            for ds in sources:
+                if not isinstance(ds, dict):
+                    new_sources.append(ds)
+                    continue
+                secret = ds.get("auth_value")
+                if secret:
+                    ds = dict(ds)
+                    if not DRY_RUN:
+                        row = Secret(id=gen_id(), agent_id=a.id,
+                                     label=ds.get("name", ""),
+                                     ciphertext=secrets_store.encrypt(secret),
+                                     hint=secrets_store.hint(secret))
+                        db.add(row)
+                        db.flush()
+                        ds["auth_ref"] = row.id
+                        ds["auth_hint"] = row.hint
+                    ds.pop("auth_value", None)
+                    changed = True
+                    moved += 1
+                new_sources.append(ds)
+            if changed:
+                print(f"  agent {a.id}: moved {moved} credential(s) into the secret store")
+                if not DRY_RUN:
+                    cfg = dict(cfg)
+                    cfg["data_sources"] = new_sources
+                    a.config = cfg
+                    from sqlalchemy.orm.attributes import flag_modified
+                    flag_modified(a, "config")
+
+        for v in db.query(AgentVersion).all():
+            cfg = v.config or {}
+            sources = cfg.get("data_sources")
+            if not isinstance(sources, list):
+                continue
+            if not any(isinstance(d, dict) and d.get("auth_value") for d in sources):
+                continue
+            cleaned = []
+            for ds in sources:
+                if isinstance(ds, dict) and ds.get("auth_value"):
+                    ds = {k: val for k, val in ds.items() if k != "auth_value"}
+                    stripped += 1
+                cleaned.append(ds)
+            print(f"  version {v.agent_id} v{v.version}: stripped credential(s) from snapshot")
+            if not DRY_RUN:
+                cfg = dict(cfg)
+                cfg["data_sources"] = cleaned
+                v.config = cfg
+                from sqlalchemy.orm.attributes import flag_modified
+                flag_modified(v, "config")
+
+        if not DRY_RUN:
+            db.commit()
+    finally:
+        db.close()
+
+    if moved == 0 and stripped == 0:
+        print("  No plaintext credentials found.")
+    return moved, stripped
+
+
 def main():
     print("═" * 60)
     print(f"CORTEX migration — dialect: {engine.dialect.name}"
@@ -165,17 +256,20 @@ def main():
 
     inspector = inspect(engine)
 
-    print("\n[1/3] Tables")
+    print("\n[1/4] Tables")
     created = create_missing_tables(inspector)
 
     # Re-inspect after create_all so column checks see freshly created tables
     inspector = inspect(engine)
 
-    print("\n[2/3] agents columns")
+    print("\n[2/4] agents columns")
     added = add_missing_agent_columns(inspector)
 
-    print("\n[3/3] Version snapshot backfill")
+    print("\n[3/4] Version snapshot backfill")
     backfilled = backfill_version_snapshots()
+
+    print("\n[4/4] Plaintext credentials")
+    moved, stripped = migrate_plaintext_credentials()
 
     print("\n" + "═" * 60)
     if DRY_RUN:
@@ -185,6 +279,8 @@ def main():
     print(f"  Tables created:        {len(created)}")
     print(f"  Columns added:         {len(added)}")
     print(f"  Snapshots backfilled:  {backfilled}")
+    print(f"  Credentials encrypted: {moved}")
+    print(f"  Snapshots scrubbed:    {stripped}")
     print("═" * 60)
 
 

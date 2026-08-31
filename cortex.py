@@ -1259,6 +1259,7 @@ from phase2 import discovery as p2_discovery, recorder as p2_recorder, patterns 
 import db as _db_recovery  # recovery helpers live on the db module
 from db import (
     AgentVersion, snapshot_agent_version, list_agent_versions, verify_version_chain,
+    Secret, store_secret, resolve_secret, scrub_config_secrets,
     soft_delete_agent, restore_agent, restore_agent_version, list_recycle_bin,
     purge_expired_agents, RECYCLE_BIN_RETENTION_DAYS,
 )
@@ -2453,27 +2454,44 @@ class DataSourceIn(BaseModel):
     refresh: str = "manual"  # realtime | 5m | 1h | 1d | manual
 
 @app.post("/api/agents/{agent_id}/data-sources")
-def add_data_source(agent_id: str, body: DataSourceIn):
-    """Add a data source to an agent's config."""
+def add_data_source(agent_id: str, body: DataSourceIn, request: Request):
+    """Add a data source to an agent's config.
+
+    The credential does not go into config. It is encrypted into the secrets
+    table and config keeps only auth_ref plus a hint, so the value is never
+    snapshotted into version history, never diffed, and never served back.
+    """
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "not authenticated")
     db = SessionLocal()
     try:
         a = db.query(AgentModel).filter(AgentModel.id == agent_id).first()
         if not a:
             raise HTTPException(404, "agent not found")
         ds = {"name": body.name, "type": body.type, "endpoint": body.endpoint,
-              "auth_type": body.auth_type, "auth_value": body.auth_value, "refresh": body.refresh}
+              "auth_type": body.auth_type, "refresh": body.refresh,
+              "auth_ref": "", "auth_hint": ""}
+        if body.auth_value:
+            row = store_secret(db, body.auth_value, agent_id=agent_id,
+                               label=body.name, created_by=sess.get("user_id"))
+            ds["auth_ref"] = row.id
+            ds["auth_hint"] = row.hint
         cfg = copy.deepcopy(a.config or {})
         cfg.setdefault("data_sources", []).append(ds)
         a.config = cfg
         db.commit()
+        # The hint, never the value — this response is rendered in the UI.
         log_event(agent_id, "datasource.added", {"name": body.name})
         return {"ok": True, "data_source": ds, "total": len(cfg["data_sources"])}
     finally:
         db.close()
 
 @app.delete("/api/agents/{agent_id}/data-sources/{source_name}")
-def remove_data_source(agent_id: str, source_name: str):
-    """Remove a data source from an agent's config."""
+def remove_data_source(agent_id: str, source_name: str, request: Request):
+    """Remove a data source from an agent's config, and its stored credential."""
+    if not _get_session(request):
+        raise HTTPException(401, "not authenticated")
     db = SessionLocal()
     try:
         a = db.query(AgentModel).filter(AgentModel.id == agent_id).first()
@@ -2482,9 +2500,16 @@ def remove_data_source(agent_id: str, source_name: str):
         cfg = copy.deepcopy(a.config or {})
         sources = cfg.get("data_sources", [])
         before_len = len(sources)
+        going = [s for s in sources if s.get("name") == source_name]
         cfg["data_sources"] = [s for s in sources if s.get("name") != source_name]
         if len(cfg["data_sources"]) == before_len:
             raise HTTPException(404, "data source not found")
+        # Removing the source removes its credential. Leaving the row behind
+        # would accumulate decryptable secrets nothing references any more.
+        for s_ in going:
+            ref = s_.get("auth_ref")
+            if ref:
+                db.query(Secret).filter(Secret.id == ref).delete()
         a.config = cfg
         db.commit()
         log_event(agent_id, "datasource.removed", {"name": source_name})
@@ -5735,6 +5760,7 @@ async function renderControl(){
               <span style="font-weight:500">${esc(d.name)}</span>
               <span style="font-size:10px;padding:1px 6px;border-radius:3px;background:#e0d4c0;color:var(--ink);margin-left:4px">${d.type}</span>
               <span style="font-size:10px;padding:1px 6px;border-radius:3px;background:${d.auth_type==='none'?'#e8e0d4':'#d4dce0'};color:var(--ink);margin-left:4px">${d.auth_type}</span>
+              ${d.auth_hint?`<span title="Stored encrypted. Cortex never shows the value back." style="font-size:10px;padding:1px 6px;border-radius:3px;background:#e4ded2;color:var(--muted);margin-left:4px;font-family:'IBM Plex Mono'">${esc(d.auth_hint)}</span>`:''}
               ${d.refresh&&d.refresh!=='manual'?`<span style="font-size:10px;padding:1px 6px;border-radius:3px;background:#d4e0d6;color:#2a5a30;margin-left:4px">⟳ ${d.refresh}</span>`:''}
             </div>
             <button class="btn ghost" style="padding:2px 8px;font-size:10px" onclick="removeDataSource('${esc(d.name)}')">Remove</button>
