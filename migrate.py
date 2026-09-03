@@ -49,6 +49,10 @@ AGENTS_NEW_COLUMNS = {
     "contact":              "VARCHAR(255) DEFAULT ''",
 }
 
+APPROVAL_NEW_COLUMNS = {
+    "consumed_at": "TIMESTAMP WITH TIME ZONE",
+}
+
 
 def _is_sqlite() -> bool:
     return engine.dialect.name == "sqlite"
@@ -112,6 +116,27 @@ def add_missing_agent_columns(inspector) -> list:
             log("Created index ix_agents_is_deleted.")
         except Exception as e:
             log(f"(index creation skipped: {e})")
+    return added
+
+
+def add_missing_approval_columns(inspector) -> list:
+    """Add replay-protection state to existing approval tables."""
+    if "approval_requests" not in inspector.get_table_names():
+        log("approval_requests does not exist yet — create_all will handle it.")
+        return []
+    existing = {c["name"] for c in inspector.get_columns("approval_requests")}
+    added = []
+    for name, ddl in APPROVAL_NEW_COLUMNS.items():
+        if name in existing:
+            continue
+        stmt = f"ALTER TABLE approval_requests ADD COLUMN {name} {_type_for(ddl)}"
+        log(f"ALTER: {stmt}")
+        if not DRY_RUN:
+            with engine.begin() as conn:
+                conn.execute(text(stmt))
+        added.append(name)
+    if not added:
+        log("approval_requests columns: all present.")
     return added
 
 
@@ -256,19 +281,22 @@ def main():
 
     inspector = inspect(engine)
 
-    print("\n[1/4] Tables")
+    print("\n[1/5] Tables")
     created = create_missing_tables(inspector)
 
     # Re-inspect after create_all so column checks see freshly created tables
     inspector = inspect(engine)
 
-    print("\n[2/4] agents columns")
+    print("\n[2/5] agents columns")
     added = add_missing_agent_columns(inspector)
 
-    print("\n[3/4] Version snapshot backfill")
+    print("\n[3/5] approval_requests columns")
+    approval_added = add_missing_approval_columns(inspector)
+
+    print("\n[4/5] Version snapshot backfill")
     backfilled = backfill_version_snapshots()
 
-    print("\n[4/4] Plaintext credentials")
+    print("\n[5/5] Plaintext credentials")
     moved, stripped = migrate_plaintext_credentials()
 
     print("\n" + "═" * 60)
@@ -277,7 +305,7 @@ def main():
     else:
         print("Migration complete.")
     print(f"  Tables created:        {len(created)}")
-    print(f"  Columns added:         {len(added)}")
+    print(f"  Columns added:         {len(added) + len(approval_added)}")
     print(f"  Snapshots backfilled:  {backfilled}")
     print(f"  Credentials encrypted: {moved}")
     print(f"  Snapshots scrubbed:    {stripped}")

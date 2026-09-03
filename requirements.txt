@@ -13,6 +13,7 @@ psycopg2-binary>=2.9
 
 # YAML support (agent import)
 pyyaml>=6.0
+cryptography>=46.0
 
 # MCP server (optional — for IDE integration)
 # mcp[cli]>=1.0

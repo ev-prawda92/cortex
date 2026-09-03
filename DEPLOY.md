@@ -7,7 +7,10 @@
 git clone https://github.com/YOUR_USER/CortexUpdated.git
 cd CortexUpdated
 cp .env.example .env
-# Edit .env with your values (especially SECRET_KEY and DB_PASSWORD)
+# Edit every required production value before starting.
+# Generate keys with:
+# python3 -c "import secrets; print(secrets.token_hex(32))"
+# python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 
 # 2. Start everything
 docker compose up -d
@@ -28,6 +31,15 @@ That's it. Docker Compose starts PostgreSQL and the CORTEX app together. The dat
 |---|---|
 | `SECRET_KEY` | Session signing key. Generate with `python3 -c "import secrets; print(secrets.token_hex(32))"` |
 | `DB_PASSWORD` | PostgreSQL password |
+| `CORTEX_ENCRYPTION_KEY` | Fernet key used for stored credentials |
+| `BASE_URL` | Public HTTPS URL |
+| `CORS_ORIGINS` | Explicit comma-separated browser origins |
+| `TRUSTED_HOSTS` | Explicit comma-separated public hostnames |
+| `CORTEX_BOOTSTRAP_TOKEN` | 32+ character secret required to register the first administrator |
+
+Production also requires `ALLOW_SIGNUP=false`, `CORTEX_AUTHZ_FAIL_CLOSED=true`,
+and `SEED_SAMPLE_AGENTS=false`. After the first administrator is created, rotate
+or remove the bootstrap token from the running service.
 
 ### OAuth (Optional)
 
@@ -135,4 +147,6 @@ docker compose build
 docker compose up -d
 ```
 
-Database migrations are automatic — new tables are created on startup.
+The container runs the idempotent migration command before starting Cortex.
+For controlled deployments, run `python migrate.py --dry-run` against a backup
+or staging database first, then run `python migrate.py` as a release task.

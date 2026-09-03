@@ -16,6 +16,7 @@
 - **[Consequence-Aware Authorization](./tier2/authorization.md)** — Control which agent actions may execute
 
 ### Reference & Advanced (Tier 3)
+- **[Production Readiness](./production-readiness.md)** — Pilot gates, security backlog, and acquisition diligence
 - **[API Reference](./tier3/api-reference.md)** — Complete endpoint specs
 - **[Use Case Walkthroughs](./tier3/use-cases.md)** — Common scenarios (chatbot, data processing, A/B testing)
 - **[Troubleshooting](./tier3/troubleshooting.md)** — Common errors and fixes

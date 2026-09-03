@@ -549,6 +549,7 @@ class ApprovalRequest(Base):
     decided_at = Column(DateTime(timezone=True), nullable=True)
     decision_note = Column(Text, default="")
     expires_at = Column(DateTime(timezone=True), nullable=True)
+    consumed_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), default=utcnow)
 
     agent = relationship("Agent")

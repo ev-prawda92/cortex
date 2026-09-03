@@ -7,7 +7,7 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_USER: cortex
-      POSTGRES_PASSWORD: ${DB_PASSWORD:-cortex_dev_pass}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD}
       POSTGRES_DB: cortex
     volumes:
       - pgdata:/var/lib/postgresql/data
@@ -28,11 +28,14 @@ services:
       - "${APP_PORT:-3000}:3000"
     environment:
       # Database
-      DATABASE_URL: postgresql://cortex:${DB_PASSWORD:-cortex_dev_pass}@db:5432/cortex
+      DATABASE_URL: postgresql://cortex:${DB_PASSWORD:?set DB_PASSWORD}@db:5432/cortex
 
       # Auth
-      SECRET_KEY: ${SECRET_KEY:-change-me-in-production}
-      BASE_URL: ${BASE_URL:-http://localhost:3000}
+      SECRET_KEY: ${SECRET_KEY:?set SECRET_KEY}
+      CORTEX_ENCRYPTION_KEY: ${CORTEX_ENCRYPTION_KEY:?set CORTEX_ENCRYPTION_KEY}
+      BASE_URL: ${BASE_URL:?set BASE_URL}
+      CORS_ORIGINS: ${CORS_ORIGINS:?set CORS_ORIGINS}
+      TRUSTED_HOSTS: ${TRUSTED_HOSTS:?set TRUSTED_HOSTS}
 
       # OAuth (optional — leave blank to disable)
       GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
@@ -52,6 +55,12 @@ services:
 
       # Misc
       CORTEX_ENV: ${CORTEX_ENV:-production}
+      CORTEX_AUTHZ_FAIL_CLOSED: "true"
+      ALLOW_SIGNUP: "false"
+      CORTEX_BOOTSTRAP_TOKEN: ${CORTEX_BOOTSTRAP_TOKEN:?set CORTEX_BOOTSTRAP_TOKEN}
+      SEED_SAMPLE_AGENTS: "false"
+      SECURE_COOKIES: "true"
+      FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-127.0.0.1}
     volumes:
       - appdata:/app/data
 

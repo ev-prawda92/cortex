@@ -20,9 +20,10 @@ USER cortex
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-    CMD curl -f http://localhost:3000/api/diagnostics || exit 1
+    CMD curl -f http://localhost:3000/health/ready || exit 1
 
 EXPOSE 3000
 
-# Start with uvicorn
-CMD ["uvicorn", "cortex:app", "--host", "0.0.0.0", "--port", "3000", "--workers", "2"]
+# Run controlled migrations before startup. Cortex currently owns its scheduler
+# in-process, so use one worker until scheduler leadership is externalized.
+CMD ["sh", "-c", "python migrate.py && exec uvicorn cortex:app --host 0.0.0.0 --port 3000 --workers 1 --proxy-headers --forwarded-allow-ips=\"${FORWARDED_ALLOW_IPS:-127.0.0.1}\""]

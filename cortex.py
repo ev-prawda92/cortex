@@ -26,12 +26,15 @@ import json
 import time
 import hashlib
 import secrets
-from datetime import datetime, timezone
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone, timedelta
 
 from fastapi import FastAPI, HTTPException, Request, Response, Cookie, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel
+from sqlalchemy import or_, text as sql_text
 import uvicorn
 
 import db as db_mod
@@ -47,6 +50,7 @@ from db import (
 )
 import auth as auth_mod
 from authorization import evaluate as evaluate_authority, validate_profile
+from runtime_config import load_runtime_config, validate_runtime_config
 from auth import (
     hash_password, verify_password, create_token, decode_token,
     get_google_auth_url, get_github_auth_url,
@@ -54,19 +58,56 @@ from auth import (
     oauth_providers_available, BASE_URL,
 )
 
-app = FastAPI(title="Cortex", version="0.3.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+RUNTIME = load_runtime_config()
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    on_startup()
+    try:
+        yield
+    finally:
+        try:
+            daemon_mod.stop_daemon()
+        except Exception:
+            pass
+
+
+app = FastAPI(title="Cortex", version="0.4.0", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=list(RUNTIME.cors_origins),
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "Idempotency-Key"],
+)
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=list(RUNTIME.trusted_hosts))
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "same-origin")
+    response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    response.headers.setdefault("Cross-Origin-Opener-Policy", "same-origin")
+    if RUNTIME.production:
+        response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+    if request.url.path.startswith("/api/"):
+        response.headers.setdefault("Cache-Control", "no-store")
+    return response
 
 
 # ── Startup: initialize database ────────────────────────────────────
-@app.on_event("startup")
 def on_startup():
     global SETTINGS
+    validate_runtime_config(RUNTIME)
     init_db()
     # Seed sample agents if the database is empty
     _db = SessionLocal()
     try:
-        if _db.query(AgentModel).count() == 0:
+        if RUNTIME.seed_sample_agents and _db.query(AgentModel).count() == 0:
             try:
                 _seed_sample_agents(_db)
             except Exception:
@@ -104,6 +145,24 @@ def on_startup():
         except Exception:
             pass
     _start_obs_evaluator()
+
+
+@app.get("/health/live", include_in_schema=False)
+def health_live():
+    return {"status": "live", "version": app.version,
+            "environment": RUNTIME.environment}
+
+
+@app.get("/health/ready", include_in_schema=False)
+def health_ready():
+    try:
+        with db_mod.engine.connect() as connection:
+            connection.execute(sql_text("SELECT 1"))
+        return {"status": "ready", "version": app.version,
+                "environment": RUNTIME.environment,
+                "authorization_fail_closed": RUNTIME.authz_fail_closed}
+    except Exception:
+        return JSONResponse(status_code=503, content={"status": "not_ready"})
 
 
 def _bus_trigger_agent(to_agent: str, instruction: str, triggered_by: str = None,
@@ -203,9 +262,9 @@ def _get_session(request: Request) -> dict | None:
     try:
         db = SessionLocal()
         user = db.query(User).filter(User.id == user_id).first()
-        if not user:
+        if not user or not user.is_active:
             db.close()
-            return None  # User was deleted — treat as unauthenticated
+            return None  # Deleted or disabled users lose access immediately.
         is_admin = user.is_admin or False
         od = user.oauth_data or {}
         role = od.get("role") or "FDE"
@@ -224,6 +283,7 @@ class SignupBody(BaseModel):
     password: str
     role: str = "FDE"
     org: str = ""
+    bootstrap_token: str = ""
 
 class LoginBody(BaseModel):
     email: str
@@ -233,11 +293,20 @@ class LoginBody(BaseModel):
 def signup(body: SignupBody):
     db = SessionLocal()
     try:
+        if len(body.password) < 12:
+            raise HTTPException(400, "Password must be at least 12 characters")
+        user_count = db.query(User).count()
+        if RUNTIME.production:
+            if user_count == 0:
+                if not hmac.compare_digest(body.bootstrap_token, RUNTIME.bootstrap_token):
+                    raise HTTPException(403, "A valid bootstrap token is required")
+            elif not RUNTIME.allow_signup:
+                raise HTTPException(403, "Self-service signup is disabled")
         existing = db.query(User).filter(User.email == body.email.lower()).first()
         if existing:
             raise HTTPException(400, "Email already registered")
         # First user ever registered becomes admin automatically
-        is_first_user = db.query(User).count() == 0
+        is_first_user = user_count == 0
         user = User(
             id=gen_id(), email=body.email.lower(),
             password_hash=hash_password(body.password),
@@ -259,7 +328,8 @@ def login(body: LoginBody):
     db = SessionLocal()
     try:
         user = db.query(User).filter(User.email == body.email.lower()).first()
-        if not user or not user.password_hash or not verify_password(body.password, user.password_hash):
+        if (not user or not user.is_active or not user.password_hash
+                or not verify_password(body.password, user.password_hash)):
             raise HTTPException(401, "Invalid email or password")
         user.last_login = utcnow()
         db.commit()
@@ -324,12 +394,16 @@ async def callback_google(code: str = "", state: str = ""):
         info = await exchange_google_code(code)
         user = db.query(User).filter(User.email == info["email"].lower()).first()
         if not user:
+            if RUNTIME.production and not RUNTIME.allow_signup:
+                raise HTTPException(403, "Account must be provisioned by an administrator")
             user = User(id=gen_id(), email=info["email"].lower(), name=info["name"],
                         avatar_url=info.get("avatar_url", ""),
                         oauth_provider="google", oauth_id=info["oauth_id"],
                         oauth_data={"role": "FDE", "org": ""})
             db.add(user)
         else:
+            if not user.is_active:
+                raise HTTPException(403, "Account is disabled")
             user.oauth_provider = user.oauth_provider or "google"
             user.oauth_id = user.oauth_id or info["oauth_id"]
             user.avatar_url = user.avatar_url or info.get("avatar_url", "")
@@ -338,7 +412,8 @@ async def callback_google(code: str = "", state: str = ""):
         db.refresh(user)
         token = create_token(user.id, user.email, user.name)
         resp = RedirectResponse("/")
-        resp.set_cookie("cortex_session", token, httponly=True, samesite="lax", max_age=72*3600)
+        resp.set_cookie("cortex_session", token, httponly=True, secure=RUNTIME.secure_cookies,
+                        samesite="lax", max_age=72*3600)
         return resp
     finally:
         db.close()
@@ -369,12 +444,16 @@ async def callback_github(code: str = "", state: str = ""):
         info = await exchange_github_code(code)
         user = db.query(User).filter(User.email == info["email"].lower()).first()
         if not user:
+            if RUNTIME.production and not RUNTIME.allow_signup:
+                raise HTTPException(403, "Account must be provisioned by an administrator")
             user = User(id=gen_id(), email=info["email"].lower(), name=info["name"],
                         avatar_url=info.get("avatar_url", ""),
                         oauth_provider="github", oauth_id=info["oauth_id"],
                         oauth_data={"role": "FDE", "org": ""})
             db.add(user)
         else:
+            if not user.is_active:
+                raise HTTPException(403, "Account is disabled")
             user.oauth_provider = user.oauth_provider or "github"
             user.oauth_id = user.oauth_id or info["oauth_id"]
             user.avatar_url = user.avatar_url or info.get("avatar_url", "")
@@ -383,7 +462,8 @@ async def callback_github(code: str = "", state: str = ""):
         db.refresh(user)
         token = create_token(user.id, user.email, user.name)
         resp = RedirectResponse("/")
-        resp.set_cookie("cortex_session", token, httponly=True, samesite="lax", max_age=72*3600)
+        resp.set_cookie("cortex_session", token, httponly=True, secure=RUNTIME.secure_cookies,
+                        samesite="lax", max_age=72*3600)
         return resp
     finally:
         db.close()
@@ -596,7 +676,59 @@ def _check_scope(sess: dict, required_scope: str) -> bool:
         return False
     if not sess.get("is_api_key"):
         return True  # JWT-authenticated users have full access
-    return required_scope in (sess.get("scopes") or [])
+    scopes = sess.get("scopes") or []
+    return "*" in scopes or required_scope in scopes
+
+
+_PUBLIC_API_PATHS = {
+    "/api/auth/signup", "/api/auth/login", "/api/auth/providers",
+    "/api/auth/login/google", "/api/auth/callback/google",
+    "/api/auth/login/github", "/api/auth/callback/github",
+}
+
+
+def _agent_access_allowed(sess: dict, agent_id: str, write: bool = False) -> bool:
+    """Require ownership or an explicitly granted agent/global role."""
+    if sess.get("is_admin"):
+        return True
+    db = SessionLocal()
+    try:
+        agent = db.query(AgentModel).filter(AgentModel.id == agent_id).first()
+        if not agent:
+            return True
+        if agent.owner_id == sess.get("user_id"):
+            return True
+        role_row = db.query(UserRole).filter(
+            UserRole.user_id == sess.get("user_id"),
+            UserRole.scope.in_((f"agent:{agent_id}", "global")),
+        ).first()
+        if not role_row:
+            return not RUNTIME.production and not agent.owner_id
+        allowed = {"admin", "operator"} if write else {"admin", "operator", "viewer"}
+        return role_row.role in allowed
+    finally:
+        db.close()
+
+
+@app.middleware("http")
+async def api_access_boundary(request: Request, call_next):
+    """Authenticate private APIs and enforce agent tenancy centrally."""
+    path = request.url.path.rstrip("/") or "/"
+    if not path.startswith("/api/") or path in _PUBLIC_API_PATHS:
+        return await call_next(request)
+    sess = _get_session(request)
+    if not sess:
+        return JSONResponse(status_code=401, content={"detail": "Not authenticated"})
+    parts = path.split("/")
+    agent_id = None
+    if len(parts) >= 4 and parts[2] == "agents" and parts[3] not in {"register", "import"}:
+        agent_id = parts[3]
+    elif len(parts) >= 5 and parts[2] == "phase2" and parts[3] == "agents":
+        agent_id = parts[4]
+    if agent_id and not _agent_access_allowed(
+            sess, agent_id, write=request.method not in {"GET", "HEAD", "OPTIONS"}):
+        return JSONResponse(status_code=403, content={"detail": "Agent access denied"})
+    return await call_next(request)
 
 
 # ─────────────────────────────────────────────── webhooks
@@ -863,7 +995,7 @@ def _get_user_role(user_id: str, agent_id: str = None) -> str:
         global_role = db.query(UserRole).filter(
             UserRole.user_id == user_id, UserRole.scope == "global"
         ).first()
-        return global_role.role if global_role else "operator"  # default to operator
+        return global_role.role if global_role else "viewer"
     finally:
         db.close()
 
@@ -877,12 +1009,28 @@ def list_approvals(request: Request, status: str = "pending"):
     db = SessionLocal()
     try:
         q = db.query(ApprovalRequest).filter(ApprovalRequest.status == status)
+        if not sess.get("is_admin"):
+            global_role = db.query(UserRole).filter(
+                UserRole.user_id == sess["user_id"], UserRole.scope == "global"
+            ).first()
+            if not global_role:
+                scoped = db.query(UserRole).filter(
+                    UserRole.user_id == sess["user_id"],
+                    UserRole.scope.like("agent:%"),
+                ).all()
+                scoped_ids = [row.scope.split(":", 1)[1] for row in scoped]
+                q = q.join(AgentModel, ApprovalRequest.agent_id == AgentModel.id).filter(
+                    or_(AgentModel.owner_id == sess["user_id"],
+                        ApprovalRequest.requested_by == sess["user_id"],
+                        AgentModel.id.in_(scoped_ids) if scoped_ids else False)
+                )
         approvals = q.order_by(ApprovalRequest.created_at.desc()).limit(50).all()
         return {"approvals": [
             {"id": a.id, "agent_id": a.agent_id, "run_id": a.run_id,
              "action": a.action, "context": a.context or {},
              "status": a.status, "requested_by": a.requested_by,
              "decided_by": a.decided_by, "decision_note": a.decision_note,
+             "consumed_at": a.consumed_at.isoformat() if a.consumed_at else None,
              "created_at": a.created_at.isoformat() if a.created_at else None,
              "expires_at": a.expires_at.isoformat() if a.expires_at else None}
             for a in approvals
@@ -901,15 +1049,21 @@ def decide_approval(approval_id: str, body: ApprovalDecisionBody, request: Reque
         raise HTTPException(401, "Not authenticated")
     if body.decision not in ("approved", "rejected"):
         raise HTTPException(400, "Decision must be 'approved' or 'rejected'")
-    # Check role — viewers can't approve
-    role = _get_user_role(sess["user_id"])
-    if role == "viewer":
-        raise HTTPException(403, "Viewers cannot approve actions")
     db = SessionLocal()
     try:
         approval = db.query(ApprovalRequest).filter(ApprovalRequest.id == approval_id).first()
         if not approval:
             raise HTTPException(404, "Approval request not found")
+        if not _agent_access_allowed(sess, approval.agent_id, write=True):
+            raise HTTPException(403, "Agent access denied")
+        role = _get_user_role(sess["user_id"], approval.agent_id)
+        if role == "viewer" and not sess.get("is_admin"):
+            owned = db.query(AgentModel).filter(
+                AgentModel.id == approval.agent_id,
+                AgentModel.owner_id == sess["user_id"],
+            ).first()
+            if not owned:
+                raise HTTPException(403, "Viewers cannot approve actions")
         if approval.status != "pending":
             raise HTTPException(400, f"Already {approval.status}")
         approval.status = body.decision
@@ -964,8 +1118,12 @@ def _authorize_action(agent_id: str, action_request: dict, sess: dict = None,
             AgentAuthorityProfile.status == "active",
         ).first()
         if not profile_row:
-            return {"configured": False, "decision": "ALLOW",
-                    "reasons": ["No active authority profile; legacy compatibility mode"],
+            decision = "BLOCK" if RUNTIME.authz_fail_closed else "ALLOW"
+            reason = ("No active authority profile; production policy fails closed"
+                      if RUNTIME.authz_fail_closed
+                      else "No active authority profile; legacy compatibility mode")
+            return {"configured": False, "enforced": RUNTIME.authz_fail_closed,
+                    "decision": decision, "reasons": [reason],
                     "obligations": []}
         request_data = dict(action_request)
         request_data["action"] = request_data.get("action") or ""
@@ -984,7 +1142,11 @@ def _authorize_action(agent_id: str, action_request: dict, sess: dict = None,
                               if key not in ("approval", "approval_id")}
                 original = {key: value for key, value in (approval.context or {}).items()
                             if key not in ("approval", "approval_id")}
-                if comparable == original:
+                expires_at = approval.expires_at
+                if expires_at and expires_at.tzinfo is None:
+                    expires_at = expires_at.replace(tzinfo=timezone.utc)
+                unexpired = not expires_at or expires_at > utcnow()
+                if comparable == original and not approval.consumed_at and unexpired:
                     request_data["approval"] = {"status": approval.status,
                                                 "decided_by": approval.decided_by}
                 else:
@@ -1000,7 +1162,7 @@ def _authorize_action(agent_id: str, action_request: dict, sess: dict = None,
             approval = ApprovalRequest(
                 id=gen_id(), agent_id=agent_id,
                 requested_by=(sess or {}).get("user_id"), action=request_data["action"],
-                context=approval_context,
+                context=approval_context, expires_at=utcnow() + timedelta(hours=24),
             )
             db.add(approval)
             db.flush()
@@ -1016,10 +1178,28 @@ def _authorize_action(agent_id: str, action_request: dict, sess: dict = None,
         )
         db.add(row)
         db.commit()
-        result.update({"configured": True, "decision_id": row.id,
+        result.update({"configured": True, "enforced": True, "decision_id": row.id,
                        "request_id": row.request_id, "profile_version": row.profile_version,
                        "approval_id": approval_id})
         return result
+    finally:
+        db.close()
+
+
+def _consume_approval(approval_id: str | None) -> None:
+    """Make an approval single-use after its authorized action executes."""
+    if not approval_id:
+        return
+    db = SessionLocal()
+    try:
+        row = db.query(ApprovalRequest).filter(
+            ApprovalRequest.id == approval_id,
+            ApprovalRequest.status == "approved",
+            ApprovalRequest.consumed_at == None,  # noqa: E711
+        ).first()
+        if row:
+            row.consumed_at = utcnow()
+            db.commit()
     finally:
         db.close()
 
@@ -1958,12 +2138,32 @@ class ApplyIn(BaseModel):
 
 @app.get("/api/agents")
 def list_agents(request: Request):
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "Not authenticated")
     db = SessionLocal()
     try:
         # Exclude soft-deleted agents (they live in the recycle bin)
         agents = db.query(AgentModel).filter(
             (AgentModel.is_deleted == False) | (AgentModel.is_deleted == None)  # noqa: E711,E712
-        ).all()
+        )
+        if not sess.get("is_admin"):
+            global_role = db.query(UserRole).filter(
+                UserRole.user_id == sess["user_id"], UserRole.scope == "global"
+            ).first()
+            if not global_role:
+                scoped = db.query(UserRole).filter(
+                    UserRole.user_id == sess["user_id"],
+                    UserRole.scope.like("agent:%"),
+                ).all()
+                scoped_ids = [row.scope.split(":", 1)[1] for row in scoped]
+                ownership = AgentModel.owner_id == sess["user_id"]
+                if not RUNTIME.production:
+                    ownership = ownership | (AgentModel.owner_id == None)  # noqa: E711
+                if scoped_ids:
+                    ownership = ownership | AgentModel.id.in_(scoped_ids)
+                agents = agents.filter(ownership)
+        agents = agents.all()
         # Build owner name lookup
         owner_ids = {a.owner_id for a in agents if a.owner_id}
         owner_names = {}
@@ -4406,7 +4606,7 @@ def integrations_execute(body: IntegrationActionIn, request: Request):
         proposed["action"] = f"integration.{body.integration}.{body.action}"
         proposed["target_system"] = body.target_system or body.integration
         authorization = _authorize_action(body.agent_id, proposed, sess)
-        if authorization["configured"] and authorization["decision"] not in ("ALLOW", "ALLOW_WITH_LIMITS"):
+        if authorization.get("enforced") and authorization["decision"] not in ("ALLOW", "ALLOW_WITH_LIMITS"):
             attestation_id = _create_attestation(
                 agent_id=body.agent_id, sess=sess, action=proposed["action"],
                 action_input=json.dumps(body.params, default=str)[:500],
@@ -4430,6 +4630,8 @@ def integrations_execute(body: IntegrationActionIn, request: Request):
         )
         result["authorization"] = authorization
         result["attestation_id"] = attestation_id
+        if result.get("ok"):
+            _consume_approval(body.approval_id)
     return result
 
 @app.delete("/api/integrations/{name}")

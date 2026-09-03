@@ -10,7 +10,7 @@
   <img src="https://img.shields.io/badge/FastAPI-0.100+-green?logo=fastapi&logoColor=white" alt="FastAPI"/>
   <img src="https://img.shields.io/badge/PostgreSQL-16-336791?logo=postgresql&logoColor=white" alt="PostgreSQL"/>
   <img src="https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white" alt="Docker"/>
-  <img src="https://img.shields.io/badge/License-MIT-yellow" alt="MIT License"/>
+  <img src="https://img.shields.io/badge/License-BSL_1.1-yellow" alt="Business Source License 1.1"/>
   <img src="https://img.shields.io/badge/PRs-welcome-brightgreen" alt="PRs Welcome"/>
 </p>
 
@@ -70,7 +70,14 @@ python3 cortex.py
 | Variable | Default | Description |
 |---|---|---|
 | `DATABASE_URL` | `postgresql://cortex:cortex@localhost:5432/cortex` | PostgreSQL connection string |
-| `SECRET_KEY` | auto-generated | JWT signing key |
+| `SECRET_KEY` | generated in development | JWT signing key; required in production |
+| `CORTEX_ENCRYPTION_KEY` | generated in development | Fernet key; required in production |
+| `CORS_ORIGINS` | local development origins | Comma-separated trusted origins; required in production |
+| `TRUSTED_HOSTS` | local development hosts | Comma-separated hostnames; required in production |
+| `CORTEX_AUTHZ_FAIL_CLOSED` | environment-based | Must be `true` in production |
+| `ALLOW_SIGNUP` | environment-based | Must be `false` in production; provision users through admins or SSO |
+| `CORTEX_BOOTSTRAP_TOKEN` | — | 32+ character one-time secret for creating the first production administrator |
+| `SEED_SAMPLE_AGENTS` | environment-based | Must be `false` in production |
 | `ANTHROPIC_API_KEY` | — | Enables Anthropic Claude models |
 | `OPENAI_API_KEY` | — | Enables OpenAI GPT models |
 | `GOOGLE_API_KEY` | — | Enables Google Gemini models |
@@ -120,7 +127,7 @@ cortex/
 └── requirements.txt   # Python dependencies
 ```
 
-### Database Schema (14 tables)
+### Database Schema
 
 | Table | Purpose |
 |---|---|
@@ -231,7 +238,8 @@ PRs are welcome. Please:
 
 ## License
 
-MIT License — see [LICENSE](LICENSE) for details.
+Business Source License 1.1, converting to Apache License 2.0 on the Change
+Date specified in [LICENSE](LICENSE).
 
 ---
 

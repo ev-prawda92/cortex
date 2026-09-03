@@ -4,7 +4,7 @@ CORTEX Authentication
 Email/password + Google/GitHub OAuth authentication.
 
 Provides:
-    - Password hashing (bcrypt)
+    - Password hashing (PBKDF2-SHA256)
     - JWT token generation and validation
     - OAuth flow helpers for Google and GitHub
     - FastAPI dependencies for protected routes
@@ -27,6 +27,8 @@ from fastapi.responses import RedirectResponse
 SECRET_KEY = os.environ.get("SECRET_KEY", secrets.token_hex(32))
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRY_HOURS = int(os.environ.get("JWT_EXPIRY_HOURS", "72"))
+JWT_ISSUER = os.environ.get("JWT_ISSUER", "cortex")
+PBKDF2_ITERATIONS = int(os.environ.get("PBKDF2_ITERATIONS", "600000"))
 
 # OAuth credentials (set these in .env)
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
@@ -43,8 +45,8 @@ BASE_URL = os.environ.get("BASE_URL", "http://localhost:3000")
 def hash_password(password: str) -> str:
     """Hash a password using PBKDF2-SHA256."""
     salt = secrets.token_hex(16)
-    dk = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 100_000)
-    return f"pbkdf2:sha256:100000${salt}${dk.hex()}"
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), PBKDF2_ITERATIONS)
+    return f"pbkdf2:sha256:{PBKDF2_ITERATIONS}${salt}${dk.hex()}"
 
 
 def verify_password(password: str, password_hash: str) -> bool:
@@ -53,8 +55,14 @@ def verify_password(password: str, password_hash: str) -> bool:
         parts = password_hash.split("$")
         if len(parts) != 3:
             return False
-        _, salt, stored_hash = parts
-        dk = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 100_000)
+        scheme, salt, stored_hash = parts
+        scheme_parts = scheme.split(":")
+        if len(scheme_parts) != 3 or scheme_parts[:2] != ["pbkdf2", "sha256"]:
+            return False
+        iterations = int(scheme_parts[2])
+        if iterations < 100_000 or iterations > 5_000_000:
+            return False
+        dk = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), iterations)
         return hmac.compare_digest(dk.hex(), stored_hash)
     except Exception:
         return False
@@ -82,6 +90,8 @@ def create_token(user_id: str, email: str, name: str = "") -> str:
         "name": name,
         "iat": int(time.time()),
         "exp": int(time.time()) + JWT_EXPIRY_HOURS * 3600,
+        "iss": JWT_ISSUER,
+        "jti": secrets.token_urlsafe(16),
     }).encode())
     signing_input = f"{header}.{payload}"
     signature = _b64url_encode(
@@ -97,6 +107,9 @@ def decode_token(token: str) -> Optional[dict]:
         if len(parts) != 3:
             return None
         header, payload, signature = parts
+        header_data = json.loads(_b64url_decode(header))
+        if header_data != {"alg": "HS256", "typ": "JWT"}:
+            return None
         # Verify signature
         signing_input = f"{header}.{payload}"
         expected = _b64url_encode(
@@ -108,6 +121,8 @@ def decode_token(token: str) -> Optional[dict]:
         data = json.loads(_b64url_decode(payload))
         # Check expiry
         if data.get("exp", 0) < time.time():
+            return None
+        if data.get("iss") != JWT_ISSUER:
             return None
         return data
     except Exception:
