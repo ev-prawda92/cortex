@@ -1,0 +1,31 @@
+{
+  "status": "active",
+  "default_decision": "BLOCK",
+  "credentials": [
+    {
+      "name": "prior-auth-policy-evaluation",
+      "status": "valid",
+      "expires_at": "2027-09-01T00:00:00Z"
+    }
+  ],
+  "privileges": [
+    {
+      "action": "integration.payer.submit_request",
+      "effect": "allow",
+      "environments": ["production"],
+      "data_scopes": ["assigned_commercial_members"],
+      "target_systems": ["payer"],
+      "required_credentials": ["prior-auth-policy-evaluation"],
+      "required_evidence_types": ["benefit_policy", "clinical_documentation"],
+      "min_evidence_items": 2,
+      "requires_human_review": true,
+      "max_actions_per_hour": 10,
+      "constraints": ["Retain the Cortex attestation with the case record"]
+    }
+  ],
+  "metadata": {
+    "business_owner": "Utilization Management",
+    "policy_owner": "Clinical Operations",
+    "review_cycle_days": 90
+  }
+}

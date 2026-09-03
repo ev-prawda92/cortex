@@ -558,6 +558,49 @@ class ApprovalRequest(Base):
     )
 
 
+class AgentAuthorityProfile(Base):
+    """Versioned, human-approved delegation of authority to one agent."""
+    __tablename__ = "agent_authority_profiles"
+
+    id = Column(String(64), primary_key=True, default=gen_id)
+    agent_id = Column(String(64), ForeignKey("agents.id"), nullable=False, unique=True, index=True)
+    version = Column(Integer, default=1)
+    status = Column(String(32), default="draft")  # draft | active | suspended
+    default_decision = Column(String(32), default="BLOCK")
+    profile = Column(JSON, default=dict)
+    approved_by = Column(String(64), nullable=True)
+    approved_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+    agent = relationship("Agent")
+
+
+class AuthorizationDecision(Base):
+    """Immutable record of an action authorization decision."""
+    __tablename__ = "authorization_decisions"
+
+    id = Column(String(64), primary_key=True, default=gen_id)
+    request_id = Column(String(128), nullable=False, index=True)
+    agent_id = Column(String(64), ForeignKey("agents.id"), nullable=False, index=True)
+    profile_version = Column(Integer, default=1)
+    action = Column(String(128), nullable=False)
+    target_system = Column(String(255), default="")
+    decision = Column(String(32), nullable=False, index=True)
+    reasons = Column(JSON, default=list)
+    obligations = Column(JSON, default=list)
+    request_hash = Column(String(64), nullable=False)
+    approval_id = Column(String(64), nullable=True)
+    attestation_id = Column(String(64), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow)
+
+    agent = relationship("Agent")
+
+    __table_args__ = (
+        Index("ix_authz_agent_time", "agent_id", "created_at"),
+    )
+
+
 # ═══════════════════════════════════════════════════════════════
 #  HELPER FUNCTIONS
 # ═══════════════════════════════════════════════════════════════

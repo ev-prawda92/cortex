@@ -200,11 +200,32 @@ class CortexClient:
             "name": name, "type": integration_type, "config": config,
         })
 
-    def execute_integration(self, agent_id: str, name: str, action: str, params: dict = None) -> dict:
-        """Execute an integration action."""
-        return self._request("POST", f"/api/integrations/{agent_id}/{name}/execute", {
-            "action": action, "params": params or {},
+    def execute_integration(self, agent_id: str, name: str, action: str,
+                            params: dict = None, **authorization_context) -> dict:
+        """Execute through Cortex's authorization-aware integration gateway."""
+        return self._request("POST", "/api/integrations/execute", {
+            "agent_id": agent_id, "integration": name, "action": action,
+            "params": params or {}, **authorization_context,
         })
+
+    # ── Consequence-aware authorization ──
+
+    def get_authority_profile(self, agent_id: str) -> dict:
+        """Get the agent's delegated authority profile."""
+        return self._request("GET", f"/api/agents/{agent_id}/authority")
+
+    def set_authority_profile(self, agent_id: str, profile: dict) -> dict:
+        """Create, revise, activate, or suspend an authority profile."""
+        return self._request("PUT", f"/api/agents/{agent_id}/authority", profile)
+
+    def authorize_action(self, agent_id: str, action: str, **context) -> dict:
+        """Evaluate a proposed action without executing it."""
+        return self._request("POST", f"/api/agents/{agent_id}/authorize",
+                             {"action": action, **context})
+
+    def authorization_decisions(self, agent_id: str) -> dict:
+        """List recent authorization decisions for an agent."""
+        return self._request("GET", f"/api/agents/{agent_id}/decisions")
 
     # ── Teams ──
 

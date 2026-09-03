@@ -40,11 +40,13 @@ from db import (
     User, Agent as AgentModel, Run as RunModel,
     DataSource as DataSourceModel, Setting, AuditLog, OAuthState, ApiKey,
     Webhook, AgentTemplate, Notification, AgentRelease,
-    Attestation, UserRole, ApprovalRequest,
+    Attestation, UserRole, ApprovalRequest, AgentAuthorityProfile,
+    AuthorizationDecision,
     get_or_create_setting, set_setting, log_audit,
     SessionLocal,
 )
 import auth as auth_mod
+from authorization import evaluate as evaluate_authority, validate_profile
 from auth import (
     hash_password, verify_password, create_token, decode_token,
     get_google_auth_url, get_github_auth_url,
@@ -657,7 +659,8 @@ def _create_attestation(agent_id: str, run_id: str = None, sess: dict = None,
                         action_summary: str = "", provider: str = "", model: str = "",
                         data_sources: list = None, input_tokens: int = 0, output_tokens: int = 0,
                         human_approval_required: bool = False, human_approval_granted: bool = False,
-                        human_approver_id: str = None):
+                        human_approver_id: str = None, policy_checked: bool = False,
+                        policy_passed: bool = True, policy_details: dict = None):
     """Create an immutable, hash-chained attestation record."""
     db = SessionLocal()
     try:
@@ -683,6 +686,8 @@ def _create_attestation(agent_id: str, run_id: str = None, sess: dict = None,
             action=action, action_input=(action_input or "")[:500],
             action_result=action_result, action_summary=(action_summary or "")[:500],
             data_sources_accessed=data_sources or [],
+            policy_checked=policy_checked, policy_passed=policy_passed,
+            policy_details=policy_details or {},
             human_approval_required=human_approval_required,
             human_approval_granted=human_approval_granted,
             human_approver_id=human_approver_id,
@@ -919,6 +924,199 @@ def decide_approval(approval_id: str, body: ApprovalDecisionBody, request: Reque
                                  f"Action {'approved' if body.decision == 'approved' else 'rejected'}: {approval.action}",
                                  body.note or "")
         return {"ok": True, "status": body.decision}
+    finally:
+        db.close()
+
+
+# ─────────────────────────────────────────────── agent authority
+
+def _authority_to_dict(row: AgentAuthorityProfile) -> dict:
+    profile = dict(row.profile or {})
+    profile.update({
+        "id": row.id, "agent_id": row.agent_id, "version": row.version,
+        "status": row.status, "default_decision": row.default_decision,
+        "approved_by": row.approved_by,
+        "approved_at": row.approved_at.isoformat() if row.approved_at else None,
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+    })
+    return profile
+
+
+def _decision_to_dict(row: AuthorizationDecision) -> dict:
+    return {
+        "decision_id": row.id, "request_id": row.request_id,
+        "agent_id": row.agent_id, "profile_version": row.profile_version,
+        "action": row.action, "target_system": row.target_system,
+        "decision": row.decision, "reasons": row.reasons or [],
+        "obligations": row.obligations or [], "request_hash": row.request_hash,
+        "approval_id": row.approval_id, "attestation_id": row.attestation_id,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+    }
+
+
+def _authorize_action(agent_id: str, action_request: dict, sess: dict = None,
+                      create_approval: bool = True) -> dict:
+    """Evaluate and persist a decision; return unconfigured for legacy agents."""
+    db = SessionLocal()
+    try:
+        profile_row = db.query(AgentAuthorityProfile).filter(
+            AgentAuthorityProfile.agent_id == agent_id,
+            AgentAuthorityProfile.status == "active",
+        ).first()
+        if not profile_row:
+            return {"configured": False, "decision": "ALLOW",
+                    "reasons": ["No active authority profile; legacy compatibility mode"],
+                    "obligations": []}
+        request_data = dict(action_request)
+        request_data["action"] = request_data.get("action") or ""
+        approval = None
+        approval_id = request_data.get("approval_id")
+        if approval_id:
+            approval = db.query(ApprovalRequest).filter(
+                ApprovalRequest.id == approval_id,
+                ApprovalRequest.agent_id == agent_id,
+                ApprovalRequest.action == request_data["action"],
+            ).first()
+            if approval:
+                # Bind approval to the exact request that originally created it.
+                # Callers may add approval_id, but may not alter the approved case.
+                comparable = {key: value for key, value in request_data.items()
+                              if key not in ("approval", "approval_id")}
+                original = {key: value for key, value in (approval.context or {}).items()
+                            if key not in ("approval", "approval_id")}
+                if comparable == original:
+                    request_data["approval"] = {"status": approval.status,
+                                                "decided_by": approval.decided_by}
+                else:
+                    approval = None
+                    approval_id = None
+        profile = dict(profile_row.profile or {})
+        profile.update({"status": profile_row.status,
+                        "default_decision": profile_row.default_decision})
+        result = evaluate_authority(profile, request_data)
+        if result["decision"] == "HUMAN_REVIEW" and create_approval and not approval:
+            approval_context = {key: value for key, value in request_data.items()
+                                if key not in ("approval", "approval_id")}
+            approval = ApprovalRequest(
+                id=gen_id(), agent_id=agent_id,
+                requested_by=(sess or {}).get("user_id"), action=request_data["action"],
+                context=approval_context,
+            )
+            db.add(approval)
+            db.flush()
+            approval_id = approval.id
+        canonical = json.dumps(request_data, sort_keys=True, separators=(",", ":"), default=str)
+        row = AuthorizationDecision(
+            id=gen_id(), request_id=request_data.get("request_id") or gen_id(),
+            agent_id=agent_id, profile_version=profile_row.version,
+            action=request_data["action"], target_system=request_data.get("target_system", ""),
+            decision=result["decision"], reasons=result["reasons"],
+            obligations=result["obligations"],
+            request_hash=hashlib.sha256(canonical.encode()).hexdigest(), approval_id=approval_id,
+        )
+        db.add(row)
+        db.commit()
+        result.update({"configured": True, "decision_id": row.id,
+                       "request_id": row.request_id, "profile_version": row.profile_version,
+                       "approval_id": approval_id})
+        return result
+    finally:
+        db.close()
+
+
+class AuthorityProfileIn(BaseModel):
+    status: str = "draft"
+    default_decision: str = "BLOCK"
+    credentials: list = []
+    privileges: list = []
+    metadata: dict = {}
+
+
+@app.get("/api/agents/{agent_id}/authority")
+def get_authority_profile(agent_id: str, request: Request):
+    if not _get_session(request):
+        raise HTTPException(401, "not authenticated")
+    db = SessionLocal()
+    try:
+        row = db.query(AgentAuthorityProfile).filter(AgentAuthorityProfile.agent_id == agent_id).first()
+        if not row:
+            raise HTTPException(404, "authority profile not found")
+        return _authority_to_dict(row)
+    finally:
+        db.close()
+
+
+@app.put("/api/agents/{agent_id}/authority")
+def put_authority_profile(agent_id: str, body: AuthorityProfileIn, request: Request):
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "not authenticated")
+    if body.status not in ("draft", "active", "suspended"):
+        raise HTTPException(400, "status must be draft, active, or suspended")
+    if body.status == "active" and _get_user_role(sess["user_id"], agent_id) != "admin":
+        raise HTTPException(403, "Admin authority is required to activate a profile")
+    proposed = body.model_dump()
+    errors = validate_profile(proposed)
+    if errors:
+        raise HTTPException(400, {"message": "Invalid authority profile", "errors": errors})
+    db = SessionLocal()
+    try:
+        if not db.query(AgentModel).filter(AgentModel.id == agent_id).first():
+            raise HTTPException(404, "agent not found")
+        row = db.query(AgentAuthorityProfile).filter(AgentAuthorityProfile.agent_id == agent_id).first()
+        if not row:
+            row = AgentAuthorityProfile(id=gen_id(), agent_id=agent_id)
+            db.add(row)
+        else:
+            row.version = (row.version or 0) + 1
+        row.status = body.status
+        row.default_decision = body.default_decision
+        row.profile = {"credentials": body.credentials, "privileges": body.privileges,
+                       "metadata": body.metadata}
+        if body.status == "active":
+            row.approved_by = sess["user_id"]
+            row.approved_at = utcnow()
+        db.commit()
+        db.refresh(row)
+        log_audit(db, agent_id=agent_id, user_id=sess["user_id"],
+                  event="authority.profile.updated",
+                  data={"version": row.version, "status": row.status})
+        return {"ok": True, "profile": _authority_to_dict(row)}
+    finally:
+        db.close()
+
+
+class AuthorizationIn(BaseModel):
+    request_id: str = ""
+    action: str
+    environment: str = "production"
+    data_scope: str = ""
+    target_system: str = ""
+    evidence: list = []
+    financial_impact: float | None = None
+    actions_last_hour: int = 0
+    approval_id: str | None = None
+    context: dict = {}
+
+
+@app.post("/api/agents/{agent_id}/authorize")
+def authorize_agent_action(agent_id: str, body: AuthorizationIn, request: Request):
+    sess = _get_session(request)
+    if not sess:
+        raise HTTPException(401, "not authenticated")
+    return _authorize_action(agent_id, body.model_dump(), sess)
+
+
+@app.get("/api/agents/{agent_id}/decisions")
+def list_authorization_decisions(agent_id: str, request: Request, limit: int = 50):
+    if not _get_session(request):
+        raise HTTPException(401, "not authenticated")
+    db = SessionLocal()
+    try:
+        rows = db.query(AuthorizationDecision).filter(
+            AuthorizationDecision.agent_id == agent_id
+        ).order_by(AuthorizationDecision.created_at.desc()).limit(min(limit, 200)).all()
+        return {"decisions": [_decision_to_dict(row) for row in rows]}
     finally:
         db.close()
 
@@ -4188,12 +4386,51 @@ class IntegrationActionIn(BaseModel):
     action: str
     params: dict = {}
     agent_id: str = None
+    request_id: str = ""
+    environment: str = "production"
+    data_scope: str = ""
+    target_system: str = ""
+    evidence: list = []
+    financial_impact: float | None = None
+    actions_last_hour: int = 0
+    approval_id: str | None = None
 
 @app.post("/api/integrations/execute")
 def integrations_execute(body: IntegrationActionIn, request: Request):
-    if not _get_session(request):
+    sess = _get_session(request)
+    if not sess:
         raise HTTPException(401, "not authenticated")
-    return integration_manager.execute(body.integration, body.action, body.params, body.agent_id)
+    authorization = None
+    if body.agent_id:
+        proposed = body.model_dump()
+        proposed["action"] = f"integration.{body.integration}.{body.action}"
+        proposed["target_system"] = body.target_system or body.integration
+        authorization = _authorize_action(body.agent_id, proposed, sess)
+        if authorization["configured"] and authorization["decision"] not in ("ALLOW", "ALLOW_WITH_LIMITS"):
+            attestation_id = _create_attestation(
+                agent_id=body.agent_id, sess=sess, action=proposed["action"],
+                action_input=json.dumps(body.params, default=str)[:500],
+                action_result=authorization["decision"],
+                action_summary="; ".join(authorization["reasons"]),
+                policy_checked=True, policy_passed=False, policy_details=authorization,
+                human_approval_required=authorization["decision"] == "HUMAN_REVIEW",
+            )
+            return {"ok": False, "executed": False, "authorization": authorization,
+                    "attestation_id": attestation_id}
+    result = integration_manager.execute(body.integration, body.action, body.params, body.agent_id)
+    if body.agent_id and authorization and authorization["configured"]:
+        attestation_id = _create_attestation(
+            agent_id=body.agent_id, sess=sess,
+            action=f"integration.{body.integration}.{body.action}",
+            action_input=json.dumps(body.params, default=str)[:500],
+            action_result="COMPLETED" if result.get("ok") else "ERROR",
+            action_summary=json.dumps(result, default=str)[:500],
+            policy_checked=True, policy_passed=True, policy_details=authorization,
+            human_approval_granted=bool(body.approval_id),
+        )
+        result["authorization"] = authorization
+        result["attestation_id"] = attestation_id
+    return result
 
 @app.delete("/api/integrations/{name}")
 def integrations_remove(name: str, request: Request, agent_id: str = None):

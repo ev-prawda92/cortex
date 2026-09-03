@@ -13,6 +13,7 @@
 - **[Monitoring & Alerting](./tier2/monitoring.md)** — Set up observability, SLOs, health scoring
 - **[Versioning & Rollout](./tier2/versioning.md)** — Deploy new versions, A/B test, rollback
 - **[Multi-Tenant Setup](./tier2/multi-tenant.md)** — Isolate agents by client or team
+- **[Consequence-Aware Authorization](./tier2/authorization.md)** — Control which agent actions may execute
 
 ### Reference & Advanced (Tier 3)
 - **[API Reference](./tier3/api-reference.md)** — Complete endpoint specs

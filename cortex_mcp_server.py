@@ -290,6 +290,31 @@ async def control_agent(agent_id: str, action: str) -> str:
 
 
 @mcp.tool()
+async def authorize_action(agent_id: str, action: str, environment: str = "production",
+                           data_scope: str = "", target_system: str = "",
+                           evidence_json: str = "[]", financial_impact: float = 0) -> str:
+    """Ask Cortex whether a proposed agent action may execute.
+
+    Returns ALLOW, ALLOW_WITH_LIMITS, REQUEST_MORE_EVIDENCE, HUMAN_REVIEW, or BLOCK.
+    This call evaluates the action but does not execute it.
+    """
+    try:
+        evidence = json.loads(evidence_json)
+    except json.JSONDecodeError:
+        return "Invalid evidence_json: expected a JSON list"
+    payload = {
+        "action": action, "environment": environment, "data_scope": data_scope,
+        "target_system": target_system, "evidence": evidence,
+        "financial_impact": financial_impact,
+    }
+    async with _client() as client:
+        r = await client.post(f"/api/agents/{agent_id}/authorize", json=payload)
+        r.raise_for_status()
+        data = r.json()
+    return json.dumps(data, indent=2)
+
+
+@mcp.tool()
 async def import_agent(config: str, source_format: str = "auto") -> str:
     """Import an agent from another platform (LangChain, CrewAI, OpenAI, or raw JSON/YAML).
 
