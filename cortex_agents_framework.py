@@ -872,3 +872,364 @@ cortex = Cortex(
                 return json.dumps({"diagnosis": "Error requires investigation", "context": context, "suggestion": "Check logs and enable debug mode"})
         
         return json.dumps({"status": "tool not found"})
+
+
+class AuscultAgent(CORTEXAgent):
+    """
+    Auscult — the adjudication gate between ambient AI scribes and EHR systems.
+    Parses clinical encounter transcripts into structured order proposals, runs
+    deterministic safety checks (drug-allergy, dose-range, drug-drug interactions),
+    and routes each proposal through Cortex's approval gate for physician attestation
+    before any chart action is written.
+    """
+
+    def __init__(self, api_key: str):
+        super().__init__(
+            api_key,
+            "Auscult",
+            "Clinical voice-to-chart adjudication agent — transcript in, attested orders out"
+        )
+        # Auscult uses a reasoning-capable model for medical transcript parsing
+        self.model = "claude-opus-4-8"
+
+        # ── Mock chart context (EHR integration point) ──────────────────
+        self._chart_db = {
+            "P-10442": {
+                "patient_id": "P-10442",
+                "name": "Margaret Reeves",
+                "age": 67,
+                "sex": "F",
+                "allergies": [
+                    {"substance": "amoxicillin", "reaction": "anaphylaxis", "severity": "severe"},
+                    {"substance": "sulfa", "reaction": "rash", "severity": "moderate"}
+                ],
+                "active_meds": [
+                    {"name": "lisinopril", "dose": "10mg", "frequency": "daily", "class": "ACE inhibitor"},
+                    {"name": "atorvastatin", "dose": "40mg", "frequency": "daily", "class": "statin"},
+                    {"name": "metformin", "dose": "500mg", "frequency": "BID", "class": "biguanide"}
+                ],
+                "recent_labs": [
+                    {"test": "BMP", "date": "2026-07-15", "results": {"potassium": 4.2, "creatinine": 0.9, "eGFR": 78}},
+                    {"test": "HbA1c", "date": "2026-06-01", "result": 6.8}
+                ],
+                "conditions": ["essential hypertension", "type 2 diabetes", "hyperlipidemia"],
+                "provider": "Dr. Sarah Chen"
+            }
+        }
+
+        # ── Formulary / dose-range reference (integration point) ───────
+        self._formulary = {
+            "lisinopril": {"class": "ACE inhibitor", "min_dose_mg": 2.5, "max_dose_mg": 40, "unit": "mg",
+                           "interactions": ["potassium supplements", "spironolactone", "sacubitril"],
+                           "contraindicated_allergies": []},
+            "amoxicillin": {"class": "penicillin", "min_dose_mg": 250, "max_dose_mg": 3000, "unit": "mg",
+                            "interactions": ["warfarin", "methotrexate"],
+                            "contraindicated_allergies": ["amoxicillin", "penicillin"]},
+            "clindamycin": {"class": "lincosamide", "min_dose_mg": 150, "max_dose_mg": 1800, "unit": "mg",
+                            "interactions": ["erythromycin", "neuromuscular blockers"],
+                            "contraindicated_allergies": ["clindamycin"]},
+            "atorvastatin": {"class": "statin", "min_dose_mg": 10, "max_dose_mg": 80, "unit": "mg",
+                             "interactions": ["cyclosporine", "gemfibrozil", "niacin"],
+                             "contraindicated_allergies": []},
+            "metformin": {"class": "biguanide", "min_dose_mg": 500, "max_dose_mg": 2550, "unit": "mg",
+                          "interactions": ["contrast dye", "alcohol"],
+                          "contraindicated_allergies": []}
+        }
+
+    def get_system_prompt(self) -> str:
+        return """You are Auscult, a clinical adjudication agent operating inside the CORTEX platform.
+
+Your single job: take a raw transcript from a clinical encounter and convert it into
+structured, safety-checked order proposals that a physician can attest to with one action.
+
+Pipeline you follow on every transcript:
+1. PARSE — Extract every clinical action the provider stated or implied (med changes,
+   lab orders, referrals, follow-ups). Output structured proposals.
+2. CHART CONTEXT — Load the patient's current meds, allergies, recent labs, and conditions.
+3. SAFETY CHECK — Run each proposal through deterministic checks:
+   • Drug-allergy cross-reference
+   • Dose-range validation against formulary
+   • Drug-drug interaction screening against active meds
+4. FLAG or CLEAR — Mark each proposal as SAFE, WARNING, or BLOCKED with reasons.
+5. SUBMIT FOR ATTESTATION — Send the batch to Cortex's approval gate. Nothing writes
+   to the chart until a physician attests.
+
+Rules:
+- You NEVER skip the safety check step, even if the transcript seems routine.
+- A BLOCKED proposal must include a safer alternative when one exists.
+- You always call submit_for_attestation at the end — you cannot write to a chart directly.
+- Be concise in your reasoning. Clinicians scan, they don't read essays."""
+
+    def get_tools(self) -> list:
+        return [
+            {
+                "name": "parse_transcript",
+                "description": "Parse a clinical encounter transcript into structured order proposals. Returns a list of proposed actions (medication changes, lab orders, referrals, follow-ups) with dosing details extracted from the conversation.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "transcript": {
+                            "type": "string",
+                            "description": "Raw text transcript of the clinical encounter"
+                        },
+                        "patient_id": {
+                            "type": "string",
+                            "description": "Patient identifier to associate proposals with"
+                        }
+                    },
+                    "required": ["transcript", "patient_id"]
+                }
+            },
+            {
+                "name": "load_chart_context",
+                "description": "Load patient chart context from the EHR — current medications, allergies, recent labs, active conditions. Required before running safety checks.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "patient_id": {
+                            "type": "string",
+                            "description": "Patient identifier"
+                        }
+                    },
+                    "required": ["patient_id"]
+                }
+            },
+            {
+                "name": "run_safety_checks",
+                "description": "Run deterministic safety checks on a batch of proposals against patient chart context. Checks drug-allergy cross-references, dose-range validation, and drug-drug interactions. Returns each proposal marked SAFE, WARNING, or BLOCKED.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "patient_id": {
+                            "type": "string",
+                            "description": "Patient identifier (chart context must be loaded first)"
+                        },
+                        "proposals": {
+                            "type": "array",
+                            "description": "List of structured proposals to check",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "proposal_id": {"type": "string"},
+                                    "type": {"type": "string", "enum": ["medication", "lab_order", "referral", "follow_up"]},
+                                    "action": {"type": "string"},
+                                    "medication": {"type": "string"},
+                                    "dose": {"type": "string"},
+                                    "details": {"type": "string"}
+                                },
+                                "required": ["proposal_id", "type", "action"]
+                            }
+                        }
+                    },
+                    "required": ["patient_id", "proposals"]
+                }
+            },
+            {
+                "name": "submit_for_attestation",
+                "description": "Submit the safety-checked proposal batch to Cortex's approval gate for physician attestation. Creates an ApprovalRequest per proposal. Nothing writes to the chart until the physician attests.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "patient_id": {"type": "string"},
+                        "provider": {"type": "string", "description": "Ordering provider name"},
+                        "proposals": {
+                            "type": "array",
+                            "description": "Safety-checked proposals with status",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "proposal_id": {"type": "string"},
+                                    "type": {"type": "string"},
+                                    "action": {"type": "string"},
+                                    "safety_status": {"type": "string", "enum": ["SAFE", "WARNING", "BLOCKED"]},
+                                    "safety_notes": {"type": "string"},
+                                    "alternative": {"type": "string"}
+                                },
+                                "required": ["proposal_id", "type", "action", "safety_status"]
+                            }
+                        }
+                    },
+                    "required": ["patient_id", "provider", "proposals"]
+                }
+            }
+        ]
+
+    def process_tool_call(self, tool_name: str, tool_input: dict) -> str:
+
+        if tool_name == "parse_transcript":
+            # In production: medical ASR + reasoning model (swappable).
+            # Here we return structured proposals from the mock encounter.
+            patient_id = tool_input.get("patient_id", "P-10442")
+            return json.dumps({
+                "patient_id": patient_id,
+                "encounter_type": "office_visit",
+                "proposals": [
+                    {
+                        "proposal_id": "RX-001",
+                        "type": "medication",
+                        "action": "modify",
+                        "medication": "lisinopril",
+                        "current_dose": "10mg daily",
+                        "new_dose": "20mg daily",
+                        "details": "Increase lisinopril for persistent hypertension — BP 148/92 today"
+                    },
+                    {
+                        "proposal_id": "LAB-001",
+                        "type": "lab_order",
+                        "action": "order",
+                        "details": "Basic Metabolic Panel — recheck potassium and renal function after ACE inhibitor dose increase",
+                        "timing": "2 weeks"
+                    },
+                    {
+                        "proposal_id": "LAB-002",
+                        "type": "lab_order",
+                        "action": "order",
+                        "details": "Lipid panel — overdue, last drawn > 12 months ago",
+                        "timing": "fasting, next visit"
+                    },
+                    {
+                        "proposal_id": "REF-001",
+                        "type": "referral",
+                        "action": "order",
+                        "details": "Cardiology referral — persistent uncontrolled HTN despite medication adjustment",
+                        "urgency": "routine"
+                    },
+                    {
+                        "proposal_id": "RX-002",
+                        "type": "medication",
+                        "action": "new",
+                        "medication": "amoxicillin",
+                        "dose": "500mg TID x 10 days",
+                        "details": "For dental abscess noted during exam"
+                    }
+                ]
+            })
+
+        elif tool_name == "load_chart_context":
+            patient_id = tool_input.get("patient_id")
+            chart = self._chart_db.get(patient_id)
+            if chart:
+                return json.dumps(chart)
+            return json.dumps({"error": f"No chart found for patient {patient_id}"})
+
+        elif tool_name == "run_safety_checks":
+            patient_id = tool_input.get("patient_id")
+            proposals = tool_input.get("proposals", [])
+            chart = self._chart_db.get(patient_id, {})
+            allergies = {a["substance"].lower() for a in chart.get("allergies", [])}
+            active_meds = {m["name"].lower(): m for m in chart.get("active_meds", [])}
+            results = []
+
+            for p in proposals:
+                status = "SAFE"
+                notes = []
+                alternative = None
+                med_name = (p.get("medication") or "").lower()
+
+                if p["type"] == "medication" and med_name:
+                    formulary_entry = self._formulary.get(med_name, {})
+
+                    # ── Drug-allergy cross-check ───────────────────────
+                    contra_allergies = set(formulary_entry.get("contraindicated_allergies", []))
+                    allergy_hit = allergies & (contra_allergies | {med_name})
+                    if allergy_hit:
+                        status = "BLOCKED"
+                        reactions = [a for a in chart.get("allergies", [])
+                                     if a["substance"].lower() in allergy_hit]
+                        reaction_str = "; ".join(
+                            f"{r['substance']}: {r['reaction']} ({r['severity']})" for r in reactions
+                        )
+                        notes.append(f"ALLERGY CONFLICT — {reaction_str}")
+                        # Suggest alternative
+                        if med_name in ("amoxicillin", "penicillin"):
+                            alternative = "clindamycin 300mg TID x 10 days (no cross-reactivity with penicillin allergy)"
+
+                    # ── Dose-range validation ──────────────────────────
+                    if formulary_entry and status != "BLOCKED":
+                        dose_str = p.get("dose") or p.get("new_dose", "")
+                        import re
+                        dose_match = re.search(r'(\d+(?:\.\d+)?)\s*mg', dose_str, re.IGNORECASE)
+                        if dose_match:
+                            dose_val = float(dose_match.group(1))
+                            min_d = formulary_entry.get("min_dose_mg", 0)
+                            max_d = formulary_entry.get("max_dose_mg", 99999)
+                            if dose_val > max_d:
+                                status = "BLOCKED"
+                                notes.append(f"DOSE EXCEEDS MAX — {dose_val}mg > formulary max {max_d}mg")
+                            elif dose_val < min_d:
+                                status = "WARNING"
+                                notes.append(f"DOSE BELOW MIN — {dose_val}mg < formulary min {min_d}mg")
+                            else:
+                                notes.append(f"Dose in range ({min_d}–{max_d}mg)")
+
+                    # ── Drug-drug interaction screening ────────────────
+                    if formulary_entry and status != "BLOCKED":
+                        known_interactions = set(i.lower() for i in formulary_entry.get("interactions", []))
+                        active_names = set(active_meds.keys())
+                        active_classes = set(m.get("class", "").lower() for m in active_meds.values())
+                        interaction_hits = known_interactions & (active_names | active_classes)
+                        if interaction_hits:
+                            if status != "BLOCKED":
+                                status = "WARNING"
+                            notes.append(f"INTERACTION — with active: {', '.join(interaction_hits)}")
+
+                if not notes:
+                    notes.append("No safety concerns identified")
+
+                results.append({
+                    "proposal_id": p["proposal_id"],
+                    "type": p["type"],
+                    "action": p.get("action", ""),
+                    "safety_status": status,
+                    "safety_notes": " | ".join(notes),
+                    "alternative": alternative
+                })
+
+            return json.dumps({"checked": len(results), "results": results})
+
+        elif tool_name == "submit_for_attestation":
+            # In production: creates ApprovalRequest records in Cortex DB
+            # and notifies the provider via Cortex's notification system.
+            patient_id = tool_input.get("patient_id")
+            provider = tool_input.get("provider")
+            proposals = tool_input.get("proposals", [])
+            approvals_created = []
+
+            for p in proposals:
+                approval = {
+                    "approval_id": f"APR-{p['proposal_id']}",
+                    "agent_id": "auscult",
+                    "run_id": f"auscult-run-{datetime.now().strftime('%Y%m%d%H%M%S')}",
+                    "action": f"{p['type']}: {p['action']}",
+                    "context": {
+                        "patient_id": patient_id,
+                        "provider": provider,
+                        "proposal": p,
+                        "safety_status": p.get("safety_status"),
+                        "safety_notes": p.get("safety_notes"),
+                        "alternative": p.get("alternative")
+                    },
+                    "status": "pending",
+                    "expires_at": (datetime.now().replace(hour=23, minute=59)).isoformat(),
+                    "note": "[INTEGRATION POINT] In production, creates ApprovalRequest in Cortex DB and notifies provider"
+                }
+                approvals_created.append(approval)
+
+            blocked_count = sum(1 for p in proposals if p.get("safety_status") == "BLOCKED")
+            warning_count = sum(1 for p in proposals if p.get("safety_status") == "WARNING")
+            safe_count = sum(1 for p in proposals if p.get("safety_status") == "SAFE")
+
+            return json.dumps({
+                "submitted": True,
+                "patient_id": patient_id,
+                "provider": provider,
+                "total_proposals": len(proposals),
+                "safe": safe_count,
+                "warnings": warning_count,
+                "blocked": blocked_count,
+                "approval_requests": approvals_created,
+                "awaiting_attestation": True,
+                "note": "All proposals routed through Cortex approval gate. Chart write is gated on physician attestation."
+            })
+
+        return json.dumps({"error": f"Unknown tool: {tool_name}"})
