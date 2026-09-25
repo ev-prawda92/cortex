@@ -10,6 +10,8 @@ The proposed boundary is deliberately small: **one tenant, one authority, one ex
 
 ## Read the proposal
 
+- [International framework](FRAMEWORK.md): proposed UN stewardship, national AI delegations, public contribution, adoption, assurance, and appeals.
+- [Security architecture](SECURITY-ARCHITECTURE.md): policy-release trust, runtime enforcement, threats, incident response, and proposed commerce/blockchain extensions.
 - [Specification](SPEC.md): normative message semantics, trust boundaries, authorization, approval, revocation, execution, and receipts.
 - [Message schema](schemas/gap-v0.1.schema.json): JSON Schema for the draft payloads. Structural validity does not establish authorization or security.
 - [Examples](examples/): unsigned, synthetic message bodies. They are not usable credentials.
