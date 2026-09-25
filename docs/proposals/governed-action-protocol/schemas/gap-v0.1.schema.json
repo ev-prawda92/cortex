@@ -1,0 +1,560 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:gap:experimental:0.1:messages",
+  "title": "GAP v0.1 experimental message payloads",
+  "$comment": "Select a $defs entry for a specific message. Schema checks do not verify signatures, canonical encoding, identity, timing relations, state transitions, revocation, or authority.",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/action"
+    },
+    {
+      "$ref": "#/$defs/permit"
+    },
+    {
+      "$ref": "#/$defs/decision"
+    },
+    {
+      "$ref": "#/$defs/receipt"
+    },
+    {
+      "$ref": "#/$defs/execute"
+    },
+    {
+      "$ref": "#/$defs/permitHeader"
+    },
+    {
+      "$ref": "#/$defs/receiptHeader"
+    },
+    {
+      "$ref": "#/$defs/admission"
+    }
+  ],
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "time": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "compactJws": {
+      "type": "string",
+      "minLength": 5,
+      "maxLength": 16384,
+      "pattern": "^[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+$"
+    },
+    "action": {
+      "type": "object",
+      "properties": {
+        "profile": {
+          "const": "gap/0.1"
+        },
+        "operation_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "tenant_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "principal_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "agent_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "audience": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "action_type": {
+          "const": "refund.original-payment/v1"
+        },
+        "resource_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "amount_minor": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "currency": {
+              "const": "USD"
+            }
+          },
+          "required": [
+            "amount_minor",
+            "currency"
+          ],
+          "additionalProperties": false
+        },
+        "context_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        }
+      },
+      "required": [
+        "profile",
+        "operation_id",
+        "tenant_id",
+        "principal_id",
+        "agent_id",
+        "audience",
+        "action_type",
+        "resource_id",
+        "parameters",
+        "context_digest"
+      ],
+      "additionalProperties": false
+    },
+    "permit": {
+      "type": "object",
+      "properties": {
+        "profile": {
+          "const": "gap/0.1"
+        },
+        "permit_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "iss": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "aud": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "tenant_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "principal_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "agent_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "operation_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "action_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "policy_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "context_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "iat": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "nbf": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "exp": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "cnf": {
+          "type": "object",
+          "properties": {
+            "x5t#S256": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_-]{43}$"
+            }
+          },
+          "required": [
+            "x5t#S256"
+          ],
+          "additionalProperties": false
+        },
+        "approval_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/uuid"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "max_uses": {
+          "const": 1
+        },
+        "delegation": {
+          "const": false
+        }
+      },
+      "required": [
+        "profile",
+        "permit_id",
+        "iss",
+        "aud",
+        "tenant_id",
+        "principal_id",
+        "agent_id",
+        "operation_id",
+        "action_digest",
+        "policy_digest",
+        "context_digest",
+        "iat",
+        "nbf",
+        "exp",
+        "cnf",
+        "approval_id",
+        "max_uses",
+        "delegation"
+      ],
+      "additionalProperties": false
+    },
+    "decision": {
+      "type": "object",
+      "properties": {
+        "profile": {
+          "const": "gap/0.1"
+        },
+        "decision_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "operation_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "action_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "outcome": {
+          "enum": [
+            "PERMIT",
+            "DENY",
+            "REVIEW"
+          ]
+        },
+        "reason_code": {
+          "type": "string",
+          "pattern": "^[A-Z][A-Z0-9_]{0,63}$"
+        },
+        "policy_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "evaluated_at": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "permit": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/compactJws"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "profile",
+        "decision_id",
+        "operation_id",
+        "action_digest",
+        "outcome",
+        "reason_code",
+        "policy_digest",
+        "evaluated_at",
+        "permit"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "PERMIT"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "permit": {
+                "$ref": "#/$defs/compactJws"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "permit": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "receipt": {
+      "type": "object",
+      "properties": {
+        "profile": {
+          "const": "gap/0.1"
+        },
+        "receipt_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "iss": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "tenant_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "operation_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "action_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "permit_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "policy_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "admission_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "state": {
+          "enum": [
+            "ADMITTED",
+            "SUCCEEDED",
+            "FAILED",
+            "UNKNOWN"
+          ]
+        },
+        "recorded_at": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "result_digest": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/digest"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "previous_receipt_digest": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/digest"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "profile",
+        "receipt_id",
+        "iss",
+        "tenant_id",
+        "operation_id",
+        "action_digest",
+        "permit_id",
+        "policy_digest",
+        "admission_id",
+        "state",
+        "recorded_at",
+        "result_digest",
+        "previous_receipt_digest"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "state": {
+                "enum": [
+                  "SUCCEEDED",
+                  "FAILED"
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "result_digest": {
+                "$ref": "#/$defs/digest"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "result_digest": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "execute": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/action"
+        },
+        "permit": {
+          "$ref": "#/$defs/compactJws"
+        }
+      },
+      "required": [
+        "action",
+        "permit"
+      ],
+      "additionalProperties": false
+    },
+    "permitHeader": {
+      "type": "object",
+      "properties": {
+        "alg": {
+          "const": "ES256"
+        },
+        "kid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "typ": {
+          "const": "gap-permit+jws"
+        }
+      },
+      "required": [
+        "alg",
+        "kid",
+        "typ"
+      ],
+      "additionalProperties": false
+    },
+    "receiptHeader": {
+      "type": "object",
+      "properties": {
+        "alg": {
+          "const": "ES256"
+        },
+        "kid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "typ": {
+          "const": "gap-receipt+jws"
+        }
+      },
+      "required": [
+        "alg",
+        "kid",
+        "typ"
+      ],
+      "additionalProperties": false
+    },
+    "admission": {
+      "type": "object",
+      "properties": {
+        "profile": {
+          "const": "gap/0.1"
+        },
+        "admission_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "tenant_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "operation_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "action_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "permit_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "executor_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "admitted_at": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "state": {
+          "const": "ADMITTED"
+        }
+      },
+      "required": [
+        "profile",
+        "admission_id",
+        "tenant_id",
+        "operation_id",
+        "action_digest",
+        "permit_id",
+        "executor_id",
+        "admitted_at",
+        "state"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

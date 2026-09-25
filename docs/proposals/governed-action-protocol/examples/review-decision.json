@@ -1,0 +1,11 @@
+{
+  "profile": "gap/0.1",
+  "decision_id": "00000000-0000-4000-8000-000000000003",
+  "operation_id": "00000000-0000-4000-8000-000000000001",
+  "action_digest": "sha256:34e2df0e1bf9cf82669005d96ed7e238b0c65e7aa41a5730f6ee21e21ea16cf5",
+  "outcome": "REVIEW",
+  "reason_code": "APPROVAL_REQUIRED",
+  "policy_digest": "sha256:67eaba7f1798a5a9b5cfc8ddb60e7855da22f4c453d29719b19b2ccf7162938e",
+  "evaluated_at": 1790366400,
+  "permit": null
+}

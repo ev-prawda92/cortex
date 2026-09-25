@@ -1,0 +1,15 @@
+{
+  "profile": "gap/0.1",
+  "operation_id": "00000000-0000-4000-8000-000000000001",
+  "tenant_id": "merchant-demo",
+  "principal_id": "merchant-owner-demo",
+  "agent_id": "refund-agent-demo",
+  "audience": "https://executor.example.test",
+  "action_type": "refund.original-payment/v1",
+  "resource_id": "order-demo-100",
+  "parameters": {
+    "amount_minor": 4000,
+    "currency": "USD"
+  },
+  "context_digest": "sha256:4f72b7d8ff6074c6fd6e5f4ad3fc7495c8f837c6871fac1652cee5d6ca07c924"
+}
