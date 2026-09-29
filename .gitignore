@@ -26,3 +26,6 @@ venv/
 # Local backups
 *.bundle
 .cortex-key
+
+# Release archives
+*.tar.gz

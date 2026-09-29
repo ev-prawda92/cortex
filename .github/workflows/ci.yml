@@ -23,3 +23,15 @@ jobs:
       - run: python -m py_compile *.py
       - run: DATABASE_URL=sqlite:///migration-test.db python migrate.py
       - run: DATABASE_URL=sqlite:///migration-test.db python migrate.py --dry-run
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t cortex:ci .
+      - name: Start container and check health
+        run: |
+          docker run -d --name cortex -p 3000:3000 -e DATABASE_URL=sqlite:////tmp/cortex.db cortex:ci
+          for i in $(seq 1 30); do curl -fsS http://127.0.0.1:3000/health/ready && exit 0; sleep 2; done
+          docker logs cortex; exit 1
