@@ -1,0 +1,22 @@
+{
+  "profile": "gap/0.1",
+  "permit_id": "00000000-0000-4000-8000-000000000002",
+  "iss": "https://authority.example.test",
+  "aud": "https://executor.example.test",
+  "tenant_id": "merchant-demo",
+  "principal_id": "merchant-owner-demo",
+  "agent_id": "refund-agent-demo",
+  "operation_id": "00000000-0000-4000-8000-000000000001",
+  "action_digest": "sha256:34e2df0e1bf9cf82669005d96ed7e238b0c65e7aa41a5730f6ee21e21ea16cf5",
+  "policy_digest": "sha256:67eaba7f1798a5a9b5cfc8ddb60e7855da22f4c453d29719b19b2ccf7162938e",
+  "context_digest": "sha256:4f72b7d8ff6074c6fd6e5f4ad3fc7495c8f837c6871fac1652cee5d6ca07c924",
+  "iat": 1790366400,
+  "nbf": 1790366400,
+  "exp": 1790366700,
+  "cnf": {
+    "x5t#S256": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+  },
+  "approval_id": null,
+  "max_uses": 1,
+  "delegation": false
+}
