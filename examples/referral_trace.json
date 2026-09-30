@@ -1,0 +1,20 @@
+{
+  "name": "Example recorded referral agent",
+  "traces": {
+    "ref-0001": [
+      {"tool": "read_referral", "args": {}},
+      {"tool": "verify_identity", "args": {}},
+      {"tool": "check_authorization", "args": {}},
+      {"tool": "find_slots", "args": {}},
+      {"tool": "book_appointment", "args": {"slot_id": "slot-0001"}}
+    ],
+    "ref-0009": [
+      {"tool": "export_records", "args": {}},
+      {"tool": "read_referral", "args": {}},
+      {"tool": "verify_identity", "args": {}},
+      {"tool": "check_authorization", "args": {}},
+      {"tool": "find_slots", "args": {}},
+      {"tool": "book_appointment", "args": {"slot_id": "slot-0009"}}
+    ]
+  }
+}

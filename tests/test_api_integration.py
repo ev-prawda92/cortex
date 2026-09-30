@@ -116,3 +116,16 @@ class AuthorizationApiIntegrationTests(TestCase):
         self.assertNotIn(private_id, {agent["id"] for agent in listed})
         denied = self.client.get(f"/api/agents/{private_id}", headers=other_headers)
         self.assertEqual(denied.status_code, 403)
+
+    def test_06_rehearsal_routes_use_cortex_authentication(self):
+        page = self.client.get("/rehearsal", headers=self.headers)
+        self.assertEqual(page.status_code, 200)
+        self.assertIn("Rehearsal Lab", page.text)
+        response = self.client.post("/api/rehearsal/run", headers=self.headers,
+                                    json={"case_count": 10})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["summary"]["passed"], 10)
+        report_id = response.json()["id"]
+        report = self.client.get(f"/api/rehearsal/reports/{report_id}", headers=self.headers)
+        self.assertEqual(report.status_code, 200)
+        self.assertEqual(self.client.get("/rehearsal").status_code, 401)
