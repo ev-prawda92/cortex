@@ -5065,6 +5065,10 @@ def stream_channels(request: Request):
             "recent_events": stream_manager.recent_events(limit=50)}
 
 
+from rehearsal.api import install as install_rehearsal
+install_rehearsal(app, get_session=_get_session)
+
+
 @app.get("/landing")
 def landing_page():
     """Marketing / product landing page."""
@@ -6126,7 +6130,7 @@ function cfgRows(c){
 }
 
 function sidebar(){
-  return `<div><h2>Agents</h2><div class="grid">${AGENTS.map(a=>`
+  return `<div><a href="/rehearsal" style="display:block;padding:12px;margin-bottom:16px;border:1px solid var(--line);border-radius:6px;color:var(--accent)">↗ Rehearsal Lab</a><h2>Agents</h2><div class="grid">${AGENTS.map(a=>`
     <button class="card ${sel===a.id?'active':''}" data-s="${a.status}" onclick="pick('${a.id}')">
       <div class="ctop"><span class="cname">${esc(a.name)}</span><span class="cstat">${a.status}</span></div>
       <div class="cmeta"><span>${a.data_sources_count||0} src</span><span>${a.tools_count||0} tools</span></div>

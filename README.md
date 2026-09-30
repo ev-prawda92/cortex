@@ -27,6 +27,11 @@
 
 ## What is Cortex?
 
+**New: [Rehearsal Lab](docs/rehearsal.md).** Test synthetic referral workflows,
+compare the same agent with and without authorization enforcement, and inspect
+final records and action evidence. Run `python3 -m rehearsal --serve` and open
+`http://127.0.0.1:3010/rehearsal`, or sign in to Cortex and open `/rehearsal`.
+
 Cortex is a **self-hosted agent operations platform** — register, configure, run, and monitor any AI agent from a single dashboard. It doesn't own your data or lock you into a provider. It controls access, enforces policy, and gives you a complete audit trail.
 
 **Cortex sits at layer 3** of the modern AI stack — the orchestration layer between your agents and the outside world:
