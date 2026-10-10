@@ -29,6 +29,26 @@
 
 Cortex is a **self-hosted agent operations platform** — register, configure, run, and monitor any AI agent from a single dashboard. It doesn't own your data or lock you into a provider. It controls access, enforces policy, and gives you a complete audit trail.
 
+### Create an agent in plain text
+
+Open **Agents → Describe your agent**. Start with vendor invoice checking,
+payment follow-up, unanswered inquiries, subscription review, document collection,
+or an owner's daily brief, or write your own job description.
+
+Review the instructions, then **Create stopped draft**. This saves the exact text
+as the agent's system prompt and standing instruction, using the model selected
+in Settings. Draft creation needs no API key and starts no background work.
+
+**Test with sample data** runs one model preview on pasted records, with no
+external tools. Starter records and example outcomes are fictional. A preview
+needs a configured model key; it does not verify financial correctness or connect
+to customer accounts. Live operation still requires the relevant data connections,
+implemented tool handlers, authorization, and a schedule. The builder does not
+generate executable code or grant those capabilities from a prompt.
+
+Builder APIs: `GET /api/builder/starters`, and `POST /api/builder/draft`,
+`/api/builder/create`, `/api/builder/preview`. All require authentication.
+
 **Cortex sits at layer 3** of the modern AI stack — the orchestration layer between your agents and the outside world:
 
 ```
@@ -246,3 +266,4 @@ Date specified in [LICENSE](LICENSE).
 <p align="center">
   <strong>CORTEX</strong> — The control plane that safely connects AI agents to the real world.
 </p>
+

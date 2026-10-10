@@ -116,3 +116,78 @@ class AuthorizationApiIntegrationTests(TestCase):
         self.assertNotIn(private_id, {agent["id"] for agent in listed})
         denied = self.client.get(f"/api/agents/{private_id}", headers=other_headers)
         self.assertEqual(denied.status_code, 403)
+
+    def test_06_builder_requires_authentication(self):
+        self.assertEqual(self.client.get("/api/builder/starters").status_code, 401)
+        self.assertEqual(self.client.post("/api/builder/create", json={
+            "description": "Review the records I provide."}).status_code, 401)
+
+    def test_07_reviewing_a_brief_does_not_create_an_agent(self):
+        before = self.client.get("/api/agents", headers=self.headers).json()["agents"]
+        response = self.client.post("/api/builder/draft", headers=self.headers,
+                                    json={"description": "Review invoices and cite every price difference."})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["draft"]["status"], "stopped")
+        after = self.client.get("/api/agents", headers=self.headers).json()["agents"]
+        self.assertEqual(len(before), len(after))
+
+    def test_08_plain_text_creation_preserves_instructions_and_stays_stopped(self):
+        text = "Review invoices and cite every price difference. Draft requests for my approval."
+        response = self.client.post("/api/builder/create", headers=self.headers, json={
+            "name": "Plain text checker", "description": text, "starter_id": "invoice-check"})
+        self.assertEqual(response.status_code, 200, response.text)
+        agent = response.json()["agent"]
+        self.assertEqual(agent["status"], "stopped")
+        self.assertEqual(agent["endpoint"]["type"], "embedded")
+        self.assertEqual(agent["config"]["standing_instruction"], text)
+        self.assertEqual(agent["config"]["system_prompt"], text)
+        self.assertEqual(agent["config"]["tools"], [])
+        self.assertEqual(agent["config"]["data_sources"], [])
+        self.assertTrue(agent["config"]["behavior"]["confirm_before_action"])
+        self.assertEqual(agent["config"]["builder"]["setup_status"], "needs_connections")
+        self.assertIn(text, cortex.build_system_prompt(agent))
+        versions = self.client.get(f"/api/agents/{agent['id']}/versions", headers=self.headers)
+        self.assertEqual(versions.status_code, 200)
+        self.assertEqual(len(versions.json()["versions"]), 1)
+
+    def test_09_preview_uses_current_text_without_tools_or_agent_writes(self):
+        before = self.client.get("/api/agents", headers=self.headers).json()["agents"]
+        result = {"ok": True, "final_text": "NW-104 differs by $7.", "input_tokens": 25, "output_tokens": 10}
+        with patch.object(cortex, "get_key", return_value="test-only"), \
+             patch.object(cortex.providers_mod, "run_tool_loop", return_value=result) as run:
+            response = self.client.post("/api/builder/preview", headers=self.headers, json={
+                "description": "Compare the supplied prices and cite each difference.",
+                "sample_input": "NW-104: billed $147; agreed $140."})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["output"], result["final_text"])
+        self.assertTrue(response.json()["preview"])
+        self.assertEqual(run.call_args.kwargs["tools"], [])
+        self.assertEqual(run.call_args.kwargs["max_iterations"], 1)
+        self.assertEqual(run.call_args.kwargs["user_message"], "NW-104: billed $147; agreed $140.")
+        self.assertIn("Compare the supplied prices", run.call_args.kwargs["system"])
+        after = self.client.get("/api/agents", headers=self.headers).json()["agents"]
+        self.assertEqual(len(before), len(after))
+
+    def test_10_preview_without_a_model_explains_setup(self):
+        with patch.object(cortex, "get_key", return_value=""), \
+             patch.object(cortex.providers_mod, "run_tool_loop") as run:
+            response = self.client.post("/api/builder/preview", headers=self.headers, json={
+                "description": "Review the records I provide.", "sample_input": "Example record."})
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("Settings", response.json()["detail"])
+        run.assert_not_called()
+
+    def test_11_invalid_briefs_are_rejected(self):
+        for body, status in [({"description": " " * 20}, 400),
+                             ({"description": "Review the records I provide.", "starter_id": "unknown"}, 400),
+                             ({"description": "short"}, 422)]:
+            response = self.client.post("/api/builder/create", headers=self.headers, json=body)
+            self.assertEqual(response.status_code, status, response.text)
+
+    def test_12_model_failure_does_not_return_a_successful_preview(self):
+        with patch.object(cortex, "get_key", return_value="test-only"), \
+             patch.object(cortex.providers_mod, "run_tool_loop", return_value={"ok": False, "error": "bad key"}):
+            response = self.client.post("/api/builder/preview", headers=self.headers, json={
+                "description": "Review the records I provide.", "sample_input": "Example record."})
+        self.assertEqual(response.status_code, 502)
+
