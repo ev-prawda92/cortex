@@ -6972,8 +6972,10 @@ async function renderSettings(){
         <button class="btn accent" style="padding:6px 14px" onclick="createApiKey()">Create Key</button>
       </div>
       <div class="hint" style="margin:8px 0 16px">
-        Connect to Claude Code? <button class="btn accent" style="padding:6px 12px;margin-left:8px" onclick="createClaudeCodeKey()">Create Claude Code key</button>
-        <div style="margin-top:6px">Creates a least-privilege key with experience:read and experience:write only. No training export.</div>
+        Connect to Claude Code?
+        <button id="cortex_download_setup" class="btn accent" style="padding:7px 14px;margin-left:8px" onclick="downloadClaudeCodeSetup()">Download setup file (no copying)</button>
+        <button class="btn" style="padding:7px 14px;margin-left:8px" onclick="createClaudeCodeKey()">Show new API key</button>
+        <div style="margin-top:8px">Recommended: downloads a one-time setup file for your local installer. The file contains a secret, so import it immediately and don't share it. Both options create a limited key with experience:read and experience:write only; no training export.</div>
       </div>
       <div id="new_key_result" style="display:none;margin-bottom:16px;padding:12px;background:#f0fdf4;border:1px solid #86efac;border-radius:4px;font-family:'IBM Plex Mono';font-size:12px;word-break:break-all"></div>
       ${keys.length?`<table style="width:100%;border-collapse:collapse;font-size:13px">
@@ -7142,6 +7144,41 @@ async function createApiKey(){
     showNewApiKey(d.key);
     document.getElementById('new_key_name').value='';
   }else alert('Unable to create key; check your session');
+}
+async function downloadClaudeCodeSetup(){
+  const ok=confirm('Cortex will create a new Claude Code read/write key and download a temporary setup file containing it. Import the file on this Mac and do not share it. Continue?');
+  if(!ok)return;
+  const button=document.getElementById('cortex_download_setup');
+  if(button)button.disabled=true;
+  try{
+    const response=await fetch('/api/keys',{
+      method:'POST',credentials:'same-origin',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({name:'Claude Code — Cortex Experience',scopes:['experience:read','experience:write']})
+    });
+    if(!response.ok)throw new Error('Key creation failed ('+response.status+').');
+    const created=await response.json();
+    if(!created.ok || typeof created.key!=='string' || !created.key.startsWith('ctx_')){
+      throw new Error('Cortex did not return a usable key.');
+    }
+    const contents=JSON.stringify({
+      format:'cortex-claude-code',version:1,
+      url:window.location.origin,api_key:created.key
+    });
+    const objectUrl=URL.createObjectURL(new Blob([contents],{type:'application/json'}));
+    const link=document.createElement('a');
+    link.href=objectUrl;link.download='cortex-claude-code-setup.json';
+    link.style.display='none';
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(()=>URL.revokeObjectURL(objectUrl),10000);
+    alert('Cortex setup file download requested. Open Terminal and run:\n\ncd ~/cortex\nsource .venv/bin/activate\npython scripts/setup_claude_code.py --from-download\n\nThe installer deletes the downloaded secret after successful import. If no file downloaded, check your browser downloads; revoke the unused key before retrying.');
+  }catch(error){
+    alert('Unable to download Cortex setup: '+error.message+'\nIf a key was created, revoke the unused key in Settings before trying again.');
+  }finally{
+    if(button)button.disabled=false;
+  }
 }
 async function createClaudeCodeKey(){
   const r=await fetch('/api/keys',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
