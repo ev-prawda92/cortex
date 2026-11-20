@@ -39,9 +39,11 @@ Keep Cortex running in one terminal:
 
     python cortex.py
 
-In another terminal:
+In the signed-in Cortex browser, open **Settings → API Keys → Download setup file (no copying)**. Then in another terminal:
 
-    python scripts/setup_claude_code.py
+    python scripts/setup_claude_code.py --from-download
+
+The one-time JSON download contains a secret; the installer verifies the local server, stores the scoped key securely, and deletes the temporary file after success. An email/password installer remains available as `python scripts/setup_claude_code.py`.
 
 Restart Claude Code and run **/cortex recall Python API conventions**. The installer creates a scoped key, stores it privately outside Git, registers the MCP server, and installs the skill globally.
 
