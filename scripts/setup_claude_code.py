@@ -124,15 +124,22 @@ def register_mcp() -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Connect Cortex Experience to Claude Code")
     parser.add_argument("--url", default=os.environ.get("CORTEX_URL", "http://127.0.0.1:3000"))
+    parser.add_argument("--use-existing-key", action="store_true",
+                        help="Paste an existing Cortex API key privately; works with OAuth accounts")
     args = parser.parse_args()
     try:
         url = normalize_base_url(args.url)
         print(f"Cortex Experience setup → {url}")
-        email = input("Cortex account email: ").strip()
-        password = getpass.getpass("Cortex account password (hidden): ")
-        if not email or not password:
-            raise CortexConnectionError("Email and password are required.")
-        key = provision_key(url, email, password)
+        if args.use_existing_key:
+            key = getpass.getpass("Cortex API key (hidden): ").strip()
+            if not key.startswith("ctx_"):
+                raise CortexConnectionError("Expected a Cortex API key beginning with ctx_.")
+        else:
+            email = input("Cortex account email: ").strip()
+            password = getpass.getpass("Cortex account password (hidden): ")
+            if not email or not password:
+                raise CortexConnectionError("Email and password are required.")
+            key = provision_key(url, email, password)
         try:
             summary = CortexExperienceClient(base_url=url, api_key=key).status()
         except CortexConnectionError:
