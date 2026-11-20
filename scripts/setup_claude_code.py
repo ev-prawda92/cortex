@@ -56,7 +56,9 @@ def provision_key(url: str, email: str, password: str) -> str:
             if login.status_code != 200:
                 raise CortexConnectionError(
                     f"Login failed (HTTP {login.status_code}). "
-                    "Use the same email and password as the Cortex browser account."
+                    "Use the same email and password as the Cortex browser account, or "
+                    "create a Claude Code key in Cortex Settings > API Keys and rerun "
+                    "setup with --use-existing-key."
                 )
             token = login.json().get("token")
             if not token:
@@ -100,18 +102,23 @@ def install_skill() -> Path:
 
 
 def register_mcp() -> str:
-    if not shutil.which("claude"):
+    claude_cli = "claude" if shutil.which("claude") else None
+    if claude_cli is None:
+        local_cli = Path.home() / ".local" / "bin" / "claude"
+        if local_cli.is_file():
+            claude_cli = str(local_cli)
+    if claude_cli is None:
         return ("Claude Code CLI not found. Install Claude Code, then run:\n"
                 f'  claude mcp add --scope user --transport stdio cortex-experience -- '
                 f'{sys.executable} {ROOT / "cortex_experience_mcp.py"}')
-    check = subprocess.run(["claude", "mcp", "get", "cortex-experience"],
+    check = subprocess.run([claude_cli, "mcp", "get", "cortex-experience"],
                            capture_output=True, text=True, check=False)
     if check.returncode == 0:
         return ("An MCP server named cortex-experience is already configured. "
                 "Check its launch command with: claude mcp get cortex-experience. "
                 "To replace an old installation, remove it manually with "
                 "claude mcp remove --scope user cortex-experience, then rerun setup.")
-    cmd = ["claude", "mcp", "add", "--scope", "user", "--transport", "stdio",
+    cmd = [claude_cli, "mcp", "add", "--scope", "user", "--transport", "stdio",
            "cortex-experience", "--", sys.executable,
            str(ROOT / "cortex_experience_mcp.py")]
     result = subprocess.run(cmd, capture_output=True, text=True, check=False)
