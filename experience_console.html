@@ -104,11 +104,11 @@ function renderMemories(root){
  const results=el("div");function update(){results.replaceChildren();const q=state.query.trim().toLowerCase();const matches=state.memories.filter(x=>(x.title+" "+x.content).toLowerCase().includes(q));if(!matches.length)results.append(el("div","empty","No matching memories yet."));else matches.forEach(x=>results.appendChild(memoryCard(x,false)));}search.addEventListener("input",()=>{state.query=search.value;update();});list.append(search,results);update();
  const f=document.createElement("form");f.id="memory-form";
  function field(labelText,input){const wrap=el("div","field"),label=el("label",null,labelText);label.htmlFor=input.id;wrap.append(label,input);return wrap;}
- const title=el("input");title.id="mem-title";title.required=true;title.maxLength=160;title.placeholder="e.g. Prefer typed FastAPI endpoints";
+ const title=el("input");title.type="text";title.id="mem-title";title.required=true;title.maxLength=160;title.placeholder="e.g. Prefer typed FastAPI endpoints";
  const content=el("textarea");content.id="mem-content";content.required=true;content.maxLength=8000;content.placeholder="What should future agents know or do differently?";
  const kind=el("select");kind.id="mem-kind";["knowledge","preference","correction","skill"].forEach(k=>{const o=el("option",null,k);o.value=k;kind.append(o);});
  const agent=el("select");agent.id="mem-agent";let none=el("option",null,"General (all my agents)");none.value="";agent.append(none);state.agents.forEach(a=>{const o=el("option",null,a.name);o.value=a.id;agent.append(o);});
- const tags=el("input");tags.id="mem-tags";tags.placeholder="api, python, design";
+ const tags=el("input");tags.type="text";tags.id="mem-tags";tags.placeholder="api, python, design";
  const opt=el("input");opt.type="checkbox";opt.id="mem-training";const check=el("div","check");const optLabel=el("label",null,"Permit manual dataset export after separate verification. Off by default.");optLabel.htmlFor=opt.id;check.append(opt,optLabel);
  const submit=el("button","btn","Save as draft");submit.type="submit";
  f.append(field("Title",title),field("Knowledge type",kind),field("Agent",agent),field("Experience",content),field("Tags (comma-separated)",tags),check,el("div","sep"),submit);
