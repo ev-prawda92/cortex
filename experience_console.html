@@ -87,11 +87,48 @@ function memoryCard(memory,compact){
  x.append(el("div","memory-content",memory.content));
  const tags=el("div");(memory.tags||[]).forEach(t=>tags.appendChild(el("span","tag",t)));x.append(tags);
  if(!compact){const actions=el("div","actions");
+ actions.append(button("Edit",()=>editMemory(memory,x),"alt"));
  if(memory.status!=="verified")actions.append(button("Verify",()=>verifyMemory(memory),"alt"));
  else actions.append(el("span","small muted","Verified: "+memory.verification_note));
  if(memory.training_opt_in)actions.append(el("span","tag verified","Training opt-in"));
  actions.append(button("Delete",()=>deleteMemory(memory),"ghost"));x.append(actions);}
  return x;
+}
+function editMemory(memory,container){
+ container.replaceChildren();
+ const heading=el("h3",null,"Edit memory");container.append(heading);
+ const note=el("p","muted small","Any changes reset verification and training export consent so the updated memory can be reviewed again.");container.append(note);
+ const form=document.createElement("form");form.style.marginTop="14px";
+ function field(name,node){
+  const wrap=el("div","field");const lab=el("label",null,name);
+  lab.htmlFor=node.id;wrap.append(lab,node);return wrap;
+ }
+ const title=el("input");title.type="text";title.id="edit-title-"+memory.id;title.value=memory.title;title.required=true;title.minLength=2;title.maxLength=160;
+ const content=el("textarea");content.id="edit-content-"+memory.id;content.value=memory.content;content.required=true;content.minLength=2;content.maxLength=8000;
+ const kind=el("select");kind.id="edit-kind-"+memory.id;
+ ["knowledge","preference","correction","skill"].forEach(k=>{
+  const opt=el("option",null,k);opt.value=k;kind.append(opt);
+ });kind.value=memory.kind;
+ const tags=el("input");tags.type="text";tags.id="edit-tags-"+memory.id;tags.value=(memory.tags||[]).join(", ");tags.placeholder="python, backend, fastapi";
+ const buttons=el("div","actions");
+ const save=el("button","btn","Save changes");save.type="submit";
+ buttons.append(save,button("Cancel",()=>render(),"alt"));
+ form.append(field("Title",title),field("Knowledge type",kind),field("Experience",content),field("Tags (comma-separated)",tags),buttons);
+ form.addEventListener("submit",async event=>{
+  event.preventDefault();save.disabled=true;
+  try{
+   const nextTags=tags.value.split(",").map(t=>t.trim()).filter(Boolean);
+   const update={title:title.value,kind:kind.value,content:content.value,tags:nextTags};
+   await api("/memories/"+encodeURIComponent(memory.id)+"/content",{
+    method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify(update)
+   });
+   toast("Memory updated. Review required before training export.");
+   await refresh();
+  }catch(e){toast(e.message,true);}
+  finally{save.disabled=false;}
+ });
+ container.append(form);
+ title.focus();
 }
 async function verifyMemory(memory){const note=window.prompt("Verification evidence (at least 10 characters):","Reviewed and confirmed against a trusted source.");if(note===null)return;
  if(note.trim().length<10){toast("Please provide at least 10 characters of verification evidence.",true);return;}
