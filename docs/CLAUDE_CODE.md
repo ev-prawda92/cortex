@@ -20,6 +20,22 @@ Keep the first terminal open. Your Cortex API is at http://127.0.0.1:3000 and th
 
 ## 2. Install the Claude Code integration
 
+### Recommended: no clipboard, no password
+
+From the **signed-in Cortex browser session**, go to **Settings → API Keys**, then click **Download setup file (no copying)**. Approve the download. It creates a dedicated key with only experience:read and experience:write and downloads a sensitive, one-time JSON setup file to your Mac.
+
+In a second terminal, run:
+
+    cd ~/cortex
+    source .venv/bin/activate
+    python scripts/setup_claude_code.py --from-download
+
+The installer finds the latest matching file in ~/Downloads, verifies it works with your local Cortex server, installs the global /cortex skill and MCP registration, stores credentials at mode 0600, then **deletes the temporary setup file after successful import**.
+
+Keep the download private. Anyone who can read that JSON before import can use the token; don't share it or check it into Git. If import fails, remove the download manually after troubleshooting. Browser settings can block file downloads, so check the browser's download indicator if the file isn't found.
+
+### Alternative: Cortex login
+
 Open a second terminal:
 
     cd ~/cortex
@@ -44,6 +60,8 @@ This prompts for the key privately. Do not type API keys as shell arguments.
 ### If Cortex rejects the password (HTTP 401)
 
 A 401 may mean the email or password differs from the existing browser session, or your account uses OAuth without a password. Do not reset the database or create another account.
+
+**Preferred solution:** Use the **Download setup file (no copying)** button in Cortex Settings and run `python scripts/setup_claude_code.py --from-download`. This bypasses the password prompt and avoids copying secrets.
 
 1. In the **same browser where Cortex is already signed in**, open http://localhost:3000 and go to **Settings → API Keys**.
 2. Click **Create Claude Code key**. This generates a key limited to **experience:read** and **experience:write**, without training export permission.
