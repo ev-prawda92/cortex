@@ -1,0 +1,3 @@
+# Optional Claude Code / MCP integration; core Cortex API needs only requirements.txt
+-r requirements.txt
+mcp>=1.25,<2
