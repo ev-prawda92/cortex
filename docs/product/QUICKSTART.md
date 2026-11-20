@@ -47,6 +47,8 @@ Create a memory:
       -H "Idempotency-Key: first-memory-001" \
       -d '{"title":"Prefer typed FastAPI APIs","kind":"preference","content":"Use Pydantic request and response models.","tags":["python","api"]}'
 
+Editing a saved memory resets verification and training-export consent, so reviewers must approve the changed content again. Use the **Edit** button in the Memory console or PATCH `/api/v1/experience/memories/{id}/content` with `title`, `kind`, `content`, and `tags`.
+
 Review:
 
     curl -X PATCH http://localhost:3000/api/v1/experience/memories/MEMORY_ID \
@@ -75,6 +77,7 @@ The FastAPI-generated OpenAPI explorer is at http://localhost:3000/docs. The new
 | POST | /api/v1/experience/memories | experience:write |
 | GET | /api/v1/experience/memories | experience:read |
 | PATCH | /api/v1/experience/memories/{id} | experience:write |
+| PATCH | /api/v1/experience/memories/{id}/content | experience:write |
 | DELETE | /api/v1/experience/memories/{id} | experience:write |
 | POST | /api/v1/experience/feedback | experience:write |
 | GET | /api/v1/experience/agents/{agent_id}/performance | experience:read |
