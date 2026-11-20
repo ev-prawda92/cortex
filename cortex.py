@@ -7070,20 +7070,65 @@ async function saveSettings(){
 }
 
 function showNewApiKey(key){
-  const box=document.getElementById('new_key_result');
-  if(!box)return;
-  box.style.display='block';
-  box.replaceChildren();
-  const label=document.createElement('strong');label.textContent='Copy this key now — it will not be shown again:';
-  label.style.color='#16a34a';
-  const code=document.createElement('code');code.textContent=key;
-  code.style.display='block';code.style.margin='10px 0';code.style.wordBreak='break-all';
-  const copy=document.createElement('button');copy.textContent='Copy Key';copy.className='btn accent';
-  copy.onclick=async()=>{
-    try{await navigator.clipboard.writeText(key);copy.textContent='Copied';}
-    catch(_){copy.textContent='Select key above to copy manually';}
+  // Show secrets in a focused, persistent modal: never rely on a box that
+  // might be scrolled out of view or replaced by an async settings re-render.
+  if(typeof key!=='string' || !key.startsWith('ctx_')){
+    alert('Cortex did not return an API key. Please try again.');return;
+  }
+  const previous=document.getElementById('cortex-key-modal');
+  if(previous)previous.remove();
+  const backdrop=document.createElement('div');
+  backdrop.id='cortex-key-modal';
+  backdrop.style.cssText='position:fixed;inset:0;z-index:100000;display:flex;align-items:center;justify-content:center;padding:20px;background:rgba(20,31,27,.68)';
+  const dialog=document.createElement('div');
+  dialog.setAttribute('role','dialog');
+  dialog.setAttribute('aria-modal','true');
+  dialog.setAttribute('aria-labelledby','cortex-key-modal-title');
+  dialog.style.cssText='width:min(560px,100%);max-height:90vh;overflow-y:auto;background:#fff;color:#23302c;border-radius:16px;padding:28px;box-shadow:0 25px 70px rgba(0,0,0,.25)';
+  const title=document.createElement('h2');
+  title.id='cortex-key-modal-title';title.textContent='Your new Cortex API key';
+  title.style.cssText='font-size:22px;margin:0 0 9px;font-weight:750';
+  const instructions=document.createElement('p');
+  instructions.textContent='This is the only time the full key will be shown. Copy it into your local Claude Code installer, not a chat or GitHub.';
+  instructions.style.cssText='font-size:14px;line-height:1.55;color:#566761;margin:0 0 15px';
+  const label=document.createElement('label');
+  label.textContent='Full API key';label.htmlFor='cortex-generated-api-key';
+  label.style.cssText='display:block;font-size:12px;font-weight:700;margin-bottom:8px';
+  const input=document.createElement('input');
+  input.id='cortex-generated-api-key';input.type='text';input.readOnly=true;
+  input.value=key;input.autocomplete='off';input.spellcheck=false;
+  input.style.cssText='width:100%;padding:13px;box-sizing:border-box;border-radius:9px;border:1px solid #b5cac0;background:#f5f9f6;color:#173c33;font:13px monospace';
+  input.addEventListener('click',()=>input.select());
+  const buttons=document.createElement('div');
+  buttons.style.cssText='display:flex;gap:10px;flex-wrap:wrap;margin-top:17px';
+  const copy=document.createElement('button');
+  copy.type='button';copy.className='btn accent';copy.textContent='Copy API key';
+  const select=document.createElement('button');
+  select.type='button';select.className='btn';select.textContent='Select key manually';
+  select.onclick=()=>{input.focus();input.select();};
+  const done=document.createElement('button');
+  done.type='button';done.className='btn';done.textContent='I saved the key — close';
+  done.onclick=()=>{
+    input.value='';backdrop.remove();
   };
-  box.append(label,code,copy);
+  copy.onclick=async()=>{
+    try{
+      if(!navigator.clipboard || !navigator.clipboard.writeText)throw Error('Clipboard unavailable');
+      await navigator.clipboard.writeText(key);
+      copy.textContent='Copied! Paste into the local installer.';
+    }catch(err){
+      input.focus();input.select();
+      copy.textContent='Selected — press Command+C';
+      select.textContent='Select again';
+    }
+  };
+  const foot=document.createElement('p');
+  foot.textContent='If you close this window before copying, the key cannot be revealed again. Create a replacement key and revoke the unused one.';
+  foot.style.cssText='font-size:12px;color:#89583d;margin:17px 0 0;line-height:1.5';
+  buttons.append(copy,select,done);
+  dialog.append(title,instructions,label,input,buttons,foot);
+  backdrop.append(dialog);document.body.append(backdrop);
+  input.focus();input.select();
 }
 async function createApiKey(){
   const name=document.getElementById('new_key_name').value.trim();
