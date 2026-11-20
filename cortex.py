@@ -5472,6 +5472,7 @@ h4{font-size:10.5px;font-weight:600;letter-spacing:.1em;text-transform:uppercase
     <div class="more-wrap">
       <button class="more-btn" id="more-toggle" onclick="toggleMoreMenu(event)">More ▾</button>
       <div class="more-menu" id="more-menu">
+        <button class="navbtn" id="nav-experience" onclick="window.location.href='/experience'" style="color:#f7bf87;font-weight:700">✦ Experience v1</button>
         <button class="navbtn" id="nav-control" onclick="setView('control');closeMore()">Control</button>
         <button class="navbtn" id="nav-integrations" onclick="setView('integrations');closeMore()">Integrations</button>
         <button class="navbtn" id="nav-deploy" onclick="setView('deploy');closeMore()">Deploy</button>
