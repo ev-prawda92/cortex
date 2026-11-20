@@ -83,6 +83,14 @@ class MemoryReview(BaseModel):
     training_opt_in: Optional[bool] = None
 
 
+class MemoryEdit(BaseModel):
+    """Edits reset prior human verification and training consent."""
+    kind: Literal["knowledge", "preference", "correction", "skill"]
+    title: str = Field(min_length=2, max_length=160)
+    content: str = Field(min_length=2, max_length=8000)
+    tags: list[str] = Field(default_factory=list, max_length=12)
+
+
 class FeedbackCreate(BaseModel):
     run_id: str = Field(min_length=1, max_length=64)
     rating: Literal["helpful", "unhelpful"]
@@ -277,6 +285,37 @@ def install_experience(app, session_for_request, scope_allowed, agent_access_all
             rows = records.order_by(ExperienceMemory.created_at.desc()).offset(offset).limit(limit).all()
             return {"data": [memory_out(m) for m in rows], "total": total, "limit": limit, "offset": offset,
                     "search": "lexical", "note": "Semantic retrieval is not implemented in v1."}
+
+    @router.patch("/memories/{memory_id}/content")
+    def edit_memory(memory_id: str, body: MemoryEdit, request: Request):
+        sess = identity(request, "experience:write")
+        title, content = body.title.strip(), body.content.strip()
+        tags = [tag.strip() for tag in body.tags]
+        if len(title) < 2 or len(content) < 2:
+            raise HTTPException(422, "Title and content must not be blank")
+        if any(not tag or len(tag) > 40 for tag in tags):
+            raise HTTPException(422, "Tags must be between 1 and 40 characters")
+        with SessionLocal() as db:
+            memory = db.query(ExperienceMemory).filter(
+                ExperienceMemory.id == memory_id,
+                ExperienceMemory.owner_id == sess["user_id"]).first()
+            if not memory:
+                raise HTTPException(404, "Memory not found")
+            if (memory.title, memory.content, memory.kind, memory.tags or []) == (
+                    title, content, body.kind, tags):
+                return memory_out(memory)
+            memory.title = title
+            memory.content = content
+            memory.kind = body.kind
+            memory.tags = tags
+            # Once edited, the previous approval no longer applies to this content.
+            memory.status = "draft"
+            memory.verification_note = ""
+            memory.training_opt_in = False
+            record_usage(db, sess["user_id"], "memory.edit")
+            db.commit()
+            db.refresh(memory)
+            return memory_out(memory)
 
     @router.patch("/memories/{memory_id}")
     def review_memory(memory_id: str, body: MemoryReview, request: Request):
