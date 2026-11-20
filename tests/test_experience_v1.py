@@ -106,6 +106,29 @@ class ExperienceV1Tests(TestCase):
                     assert "Validate each request" in export.text
                     assert "second@example.test" not in export.text
 
+                    edited_payload = {
+                        "title": "API schema check", "kind": "skill",
+                        "content": "Validate each request with typed input models.",
+                        "tags": ["python", "fastapi"],
+                    }
+                    assert client.patch(b + "/memories/" + mem["id"] + "/content",
+                                        headers=u2, json=edited_payload).status_code == 404
+                    invalid_edit = client.patch(b + "/memories/" + mem["id"] + "/content",
+                                               headers=u1, json={**edited_payload, "tags": ["x" * 41]})
+                    assert invalid_edit.status_code == 422
+                    modified = client.patch(b + "/memories/" + mem["id"] + "/content",
+                                            headers=u1, json=edited_payload)
+                    assert modified.status_code == 200, modified.text
+                    assert modified.json()["tags"] == ["python", "fastapi"]
+                    assert modified.json()["status"] == "draft"
+                    assert modified.json()["training_opt_in"] is False
+                    assert modified.json()["verification_note"] == ""
+                    assert client.get(b + "/datasets/preview", headers=u1).json()["eligible"] == 0
+                    no_change = client.patch(b + "/memories/" + mem["id"] + "/content",
+                                             headers=u1, json=edited_payload)
+                    assert no_change.status_code == 200
+                    assert client.get(b + "/usage", headers=u1).json()["units"] != []
+
                     no_data = client.get(b + "/agents/agent1/performance", headers=u1).json()
                     assert no_data["verdict"]["direction"] == "insufficient_data"
                     assert client.get(b + "/agents/agent2/performance", headers=u1).status_code == 403
