@@ -49,7 +49,7 @@ def test_experience_v1_end_to_end():
 
                 assert client.get(b + "/summary").status_code == 401
                 assert client.get(b + "/summary", headers=u1).json()["memory_count"] == 0
-                assert client.get("/experience").status_code == 303 or client.get("/experience").status_code == 200
+                assert client.get("/experience", follow_redirects=False).status_code == 303
                 page = client.get("/experience", headers=u1)
                 assert page.status_code == 200
                 assert "Experience" in page.text
