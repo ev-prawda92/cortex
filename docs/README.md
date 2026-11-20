@@ -4,6 +4,13 @@
 
 ## Quick Navigation
 
+### Cortex Experience (developer-first)
+- **[Claude Code + MCP 5-minute setup](./CLAUDE_CODE.md)** — Install /cortex, connect the MCP server, and use the Python/REST API
+- **[Experience product vision](./product/README.md)** — Agent learning infrastructure, memory, interoperability, trusted expertise
+- **[Experience local API quickstart](./product/QUICKSTART.md)** — Run and test the new REST endpoints
+- **[YC demo and production launch gates](./product/LAUNCH_GATES.md)** — Objective readiness requirements
+
+
 ### Getting Started (Tier 1 — Start here)
 - **[Quickstart](./tier1/quickstart.md)** — Get Cortex running and deploy your first agent (15 min)
 - **[Agent Integration Guide](./tier1/agent-integration.md)** — Connect existing agents to Cortex
