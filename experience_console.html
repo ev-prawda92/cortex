@@ -55,7 +55,7 @@ const BASE="/api/v1/experience";
 const state={view:"overview",summary:{},agents:[],memories:[],usage:[],dataset:{},selectedAgent:"",query:""};
 const descriptions={
  overview:["Give your agents a memory.","Capture experience, verify what works, and prepare portable agent knowledge."],
- memories:["Experience library.","Create, search, review, and share knowledge intentionally."],
+ memories:["Experience library.","Create, search, and review agent knowledge deliberately."],
  learning:["Did that change help?","Compare completed agent runs across configuration versions. Numbers alone are not proof of correctness."],
  datasets:["Own your training data.","Export only human-verified, explicitly approved memories."],
  usage:["Know what you use.","Transparent diagnostic counters now; no charges in the v1 preview."],
@@ -107,7 +107,7 @@ function renderMemories(root){
  const title=el("input");title.type="text";title.id="mem-title";title.required=true;title.maxLength=160;title.placeholder="e.g. Prefer typed FastAPI endpoints";
  const content=el("textarea");content.id="mem-content";content.required=true;content.maxLength=8000;content.placeholder="What should future agents know or do differently?";
  const kind=el("select");kind.id="mem-kind";["knowledge","preference","correction","skill"].forEach(k=>{const o=el("option",null,k);o.value=k;kind.append(o);});
- const agent=el("select");agent.id="mem-agent";let none=el("option",null,"General (all my agents)");none.value="";agent.append(none);state.agents.forEach(a=>{const o=el("option",null,a.name);o.value=a.id;agent.append(o);});
+ const agent=el("select");agent.id="mem-agent";let none=el("option",null,"General (no agent assigned)");none.value="";agent.append(none);state.agents.forEach(a=>{const o=el("option",null,a.name);o.value=a.id;agent.append(o);});
  const tags=el("input");tags.type="text";tags.id="mem-tags";tags.placeholder="api, python, design";
  const opt=el("input");opt.type="checkbox";opt.id="mem-training";const check=el("div","check");const optLabel=el("label",null,"Permit manual dataset export after separate verification. Off by default.");optLabel.htmlFor=opt.id;check.append(opt,optLabel);
  const submit=el("button","btn","Save as draft");submit.type="submit";
