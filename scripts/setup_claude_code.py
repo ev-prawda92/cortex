@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -44,6 +45,51 @@ def save_credentials(url: str, key: str) -> Path:
         if os.path.exists(temp_name):
             os.unlink(temp_name)
     return path
+
+
+
+SETUP_FILENAME = "cortex-claude-code-setup"
+
+
+def find_setup_download(downloads: Path | None = None) -> Path:
+    """Locate the newest setup download, even if the browser appended (1)."""
+    folder = downloads or Path.home() / "Downloads"
+    candidates = [
+        path for path in folder.glob("cortex-claude-code-setup*.json")
+        if path.is_file() and not path.is_symlink()
+        and (path.name == SETUP_FILENAME + ".json"
+             or (path.name.startswith(SETUP_FILENAME + " (")
+                 and path.name.endswith(").json")))
+    ]
+    if not candidates:
+        raise CortexConnectionError(
+            "No Cortex setup file found in Downloads. In Cortex Settings > API Keys, "
+            "click 'Download Claude Code setup'."
+        )
+    return max(candidates, key=lambda item: item.stat().st_mtime)
+
+
+def load_setup_file(path: Path) -> tuple[str, str]:
+    """Parse an explicit one-time local transfer file, never executing its contents."""
+    path = path.expanduser()
+    if path.is_symlink() or not path.is_file():
+        raise CortexConnectionError("Cortex setup file must be a regular, non-symlink file.")
+    if path.stat().st_size > 4096:
+        raise CortexConnectionError("Cortex setup file is unexpectedly large.")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (ValueError, OSError) as exc:
+        raise CortexConnectionError("Could not read the Cortex setup file.") from exc
+    if not isinstance(data, dict) or data.get("format") != "cortex-claude-code" or data.get("version") != 1:
+        raise CortexConnectionError("Not a recognized Cortex Claude Code setup file.")
+    url = normalize_base_url(str(data.get("url", "")))
+    parts = urlsplit(url)
+    if parts.hostname not in {"localhost", "127.0.0.1", "::1"}:
+        raise CortexConnectionError("This preview only imports credentials for a local Cortex server.")
+    key = data.get("api_key", "")
+    if not isinstance(key, str) or not key.startswith("ctx_") or len(key) > 256:
+        raise CortexConnectionError("Cortex setup file is missing a valid API key.")
+    return url, key
 
 
 def provision_key(url: str, email: str, password: str) -> str:
@@ -131,17 +177,28 @@ def register_mcp() -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Connect Cortex Experience to Claude Code")
     parser.add_argument("--url", default=os.environ.get("CORTEX_URL", "http://127.0.0.1:3000"))
-    parser.add_argument("--use-existing-key", action="store_true",
+    method = parser.add_mutually_exclusive_group()
+    method.add_argument("--use-existing-key", action="store_true",
                         help="Paste an existing Cortex API key privately; works with OAuth accounts")
+    method.add_argument("--from-download", action="store_true",
+                        help="Import newest Cortex setup file from Downloads without copying a key")
+    method.add_argument("--from-file", type=Path, metavar="PATH",
+                        help="Import a downloaded Cortex setup JSON file")
     args = parser.parse_args()
+    imported_file = None
     try:
         url = normalize_base_url(args.url)
-        print(f"Cortex Experience setup → {url}")
-        if args.use_existing_key:
+        if args.from_download or args.from_file:
+            imported_file = find_setup_download() if args.from_download else args.from_file.expanduser()
+            url, key = load_setup_file(imported_file)
+            print(f"Cortex Experience setup file → {imported_file}")
+        elif args.use_existing_key:
+            print(f"Cortex Experience setup → {url}")
             key = getpass.getpass("Cortex API key (hidden): ").strip()
             if not key.startswith("ctx_"):
                 raise CortexConnectionError("Expected a Cortex API key beginning with ctx_.")
         else:
+            print(f"Cortex Experience setup → {url}")
             email = input("Cortex account email: ").strip()
             password = getpass.getpass("Cortex account password (hidden): ")
             if not email or not password:
@@ -157,6 +214,13 @@ def main() -> int:
         print(f"API key stored securely: {path} (mode 600)")
         print(f"Claude skill installed: {skill_path}")
         print(register_mcp())
+        if imported_file is not None:
+            try:
+                imported_file.unlink()
+                print("Temporary downloaded setup file deleted after successful import.")
+            except OSError:
+                print(f"IMPORTANT: Manually delete the sensitive setup download: {imported_file}",
+                      file=sys.stderr)
         print("Next: start/restart 'claude' in any project, run /mcp, then /cortex.")
         return 0
     except (CortexConnectionError, OSError) as exc:
