@@ -41,6 +41,18 @@ If you use Google/GitHub OAuth instead of a Cortex account password, create a sc
 
 This prompts for the key privately. Do not type API keys as shell arguments.
 
+### If Cortex rejects the password (HTTP 401)
+
+A 401 may mean the email or password differs from the existing browser session, or your account uses OAuth without a password. Do not reset the database or create another account.
+
+1. In the **same browser where Cortex is already signed in**, open http://localhost:3000 and go to **Settings → API Keys**.
+2. Click **Create Claude Code key**. This generates a key limited to **experience:read** and **experience:write**, without training export permission.
+3. Click **Copy Key**. It is shown only once. Do not paste it into a chat or add it to Git.
+4. From the Cortex virtual environment, run `python scripts/setup_claude_code.py --use-existing-key`, then paste the key into the hidden Terminal prompt.
+5. Confirm that the installer reports the expected number of visible memories. A zero count may indicate a different Cortex account; it does not mean the memory was deleted.
+
+Use the updated feature branch and restart the Cortex server before opening Settings, so that the new one-click key option is available.
+
 ### Manual Claude MCP registration
 
 If the installer reports that the Claude Code CLI is missing, install Claude Code using [Anthropic's instructions](https://code.claude.com/docs/en/overview), then, inside the Cortex virtualenv, run:
