@@ -1,3 +1,4 @@
-# Optional Claude Code / MCP integration; core Cortex API needs only requirements.txt
+# Optional MCP bridge using the last v1 FastMCP-compatible SDK line.
+# v1.30.0 includes published protocol-security fixes; v2 uses a different API.
 -r requirements.txt
-mcp>=1.25,<2
+mcp>=1.30.0,<2
