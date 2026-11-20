@@ -106,9 +106,23 @@ class ExperienceV1Tests(TestCase):
                     assert "Validate each request" in export.text
                     assert "second@example.test" not in export.text
 
-                    edited_payload = {
+                    # No-op edits should preserve the already verified status.
+                    unchanged = {
                         "title": "API schema check", "kind": "skill",
                         "content": "Validate each request with typed input models.",
+                        "tags": ["python", "fastapi"],
+                    }
+                    still_verified = client.patch(
+                        b + "/memories/" + mem["id"] + "/content",
+                        headers=u1, json=unchanged
+                    )
+                    assert still_verified.status_code == 200
+                    assert still_verified.json()["status"] == "verified"
+
+                    # A real text change invalidates previous approval.
+                    edited_payload = {
+                        "title": "Updated API schema check", "kind": "skill",
+                        "content": "Validate each request with typed input models and clear API errors.",
                         "tags": ["python", "fastapi"],
                     }
                     assert client.patch(b + "/memories/" + mem["id"] + "/content",
