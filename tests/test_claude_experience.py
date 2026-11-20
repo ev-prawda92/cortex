@@ -122,6 +122,45 @@ class SetupTests(unittest.TestCase):
                 self.assertEqual(client_mod.load_credentials()["url"],
                                  "http://localhost:3000")
 
+    def test_setup_download_import_and_duplicate_names(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            older = folder / "cortex-claude-code-setup.json"
+            newer = folder / "cortex-claude-code-setup (1).json"
+            old_payload = {"format": "cortex-claude-code", "version": 1,
+                           "url": "http://localhost:3000", "api_key": "ctx_older"}
+            new_payload = {**old_payload, "api_key": "ctx_latest"}
+            older.write_text(json.dumps(old_payload))
+            newer.write_text(json.dumps(new_payload))
+            os.utime(older, (10, 10))
+            os.utime(newer, (20, 20))
+            self.assertEqual(installer.find_setup_download(folder), newer)
+            url, key = installer.load_setup_file(newer)
+            self.assertEqual(url, "http://localhost:3000")
+            self.assertEqual(key, "ctx_latest")
+
+    def test_setup_download_rejects_remote_url_invalid_format_and_symlink(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            path = folder / "cortex-claude-code-setup.json"
+            path.write_text(json.dumps({
+                "format": "cortex-claude-code", "version": 1,
+                "url": "https://attacker.example", "api_key": "ctx_fake"
+            }))
+            with self.assertRaises(client_mod.CortexConnectionError):
+                installer.load_setup_file(path)
+            path.write_text(json.dumps({
+                "format": "wrong-format", "version": 1,
+                "url": "http://localhost:3000", "api_key": "ctx_fake"
+            }))
+            with self.assertRaises(client_mod.CortexConnectionError):
+                installer.load_setup_file(path)
+            if hasattr(os, "symlink"):
+                alias = folder / "cortex-claude-code-setup (1).json"
+                alias.symlink_to(path)
+                with self.assertRaises(client_mod.CortexConnectionError):
+                    installer.load_setup_file(alias)
+
     def test_installer_register_command_user_scope(self):
         def command(args, **kwargs):
             if args[:3] == ["claude", "mcp", "get"]:
