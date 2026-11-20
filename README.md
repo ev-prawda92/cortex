@@ -25,6 +25,32 @@
 
 ---
 
+## Cortex Experience × Claude Code — developer preview
+
+Bring **verified, portable agent memory into Claude Code** with a /cortex skill and an MCP server. It uses the same Cortex Experience API and database as the existing web console.
+
+**Get running (from your Cortex checkout):**
+
+    git switch feat/experience-v1
+    source .venv/bin/activate
+    python -m pip install -r requirements-mcp.txt
+
+Keep Cortex running in one terminal:
+
+    python cortex.py
+
+In the signed-in Cortex browser, open **Settings → API Keys → Download setup file (no copying)**. Then in another terminal:
+
+    python scripts/setup_claude_code.py --from-download
+
+The one-time JSON download contains a secret; the installer verifies the local server, stores the scoped key securely, and deletes the temporary file after success. An email/password installer remains available as `python scripts/setup_claude_code.py`.
+
+Restart Claude Code and run **/cortex recall Python API conventions**. The installer creates a scoped key, stores it privately outside Git, registers the MCP server, and installs the skill globally.
+
+**[Full Claude Code quickstart and MCP/API reference](docs/CLAUDE_CODE.md)** · **[Experience product vision](docs/product/README.md)** · **[YC and production launch gates](docs/product/LAUNCH_GATES.md)**
+
+The v1 connector supports recall, user-approved draft memory capture, manual verification and performance inspection. It does **not** auto-train models or silently capture conversations.
+
 ## What is Cortex?
 
 Cortex is a **self-hosted agent operations platform** — register, configure, run, and monitor any AI agent from a single dashboard. It doesn't own your data or lock you into a provider. It controls access, enforces policy, and gives you a complete audit trail.
@@ -50,7 +76,7 @@ Cortex is a **self-hosted agent operations platform** — register, configure, r
 ### Docker (recommended)
 
 ```bash
-git clone https://github.com/cortex-ai/cortex.git
+git clone https://github.com/ev-prawda92/cortex.git
 cd cortex
 docker compose up -d
 ```

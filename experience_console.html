@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cortex — Experience</title>
+<style>
+:root{color-scheme:light;--bg:#f7f7f3;--panel:#fff;--ink:#202c29;--muted:#6b7975;--line:#e5e9e4;--accent:#28766a;--soft:#edf6f1;--warm:#f5efe4;--warn:#9d5737;--shadow:0 12px 35px rgba(31,53,45,.045)}
+*{box-sizing:border-box}body{margin:0;font-family:Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:var(--bg);color:var(--ink);font-size:14px;line-height:1.5}a{color:var(--accent)}
+button,input,textarea,select{font:inherit}button{cursor:pointer}
+.app{min-height:100vh;display:grid;grid-template-columns:230px minmax(0,1fr)}
+aside{border-right:1px solid var(--line);padding:26px 18px;background:#fbfcf9;display:flex;flex-direction:column;gap:30px}
+.brand{display:flex;align-items:center;gap:11px;font-weight:800;letter-spacing:-.05em;font-size:21px;padding-left:10px}.mark{background:var(--ink);border-radius:10px;color:white;width:31px;height:31px;display:grid;place-items:center;font-size:19px}
+nav{display:grid;gap:5px}nav button{background:transparent;color:#5a6863;border:none;text-align:left;border-radius:10px;padding:11px 13px;font-size:13px;font-weight:600}nav button:hover,nav button.active{background:#e9f2ec;color:#235e55}
+.side-note{margin-top:auto;border-top:1px solid var(--line);padding:16px 10px;color:var(--muted);font-size:12px}
+main{padding:31px clamp(18px,4vw,64px);max-width:1450px;width:100%;margin:auto}
+.top{display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:38px}.eyebrow{font-size:11px;font-weight:800;letter-spacing:.14em;text-transform:uppercase;color:var(--accent)}h1{font-size:clamp(29px,3vw,42px);line-height:1.16;letter-spacing:-.047em;margin:8px 0 8px;font-weight:750}h2{font-size:18px;letter-spacing:-.035em;margin:0}h3{font-size:14px;margin:0}.sub{color:var(--muted);font-size:14px;margin:0;max-width:650px}.pill{border:1px solid #d8e6dc;background:var(--soft);color:#28685c;border-radius:100px;padding:6px 11px;font-size:11px;font-weight:700;white-space:nowrap}.muted{color:var(--muted)}.small{font-size:12px}
+.btn{background:var(--accent);color:#fff;border:1px solid var(--accent);border-radius:9px;padding:10px 15px;font-size:13px;font-weight:700;transition:transform .15s,background .15s}.btn:hover{background:#205d54}.btn:active{transform:scale(.98)}.btn.alt{background:#fff;border-color:var(--line);color:var(--ink)}.btn.ghost{border:0;background:none;color:var(--accent);padding:6px}.btn.danger{background:#fff;color:#a2423f;border-color:#edcdca}.btn:disabled{opacity:.5;cursor:not-allowed}
+.metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin:28px 0 22px}.card,.panel{background:var(--panel);border:1px solid var(--line);box-shadow:var(--shadow);border-radius:15px}.card{padding:20px}.metric{font-size:28px;font-weight:750;letter-spacing:-.05em;margin:10px 0 0}.panel{padding:23px;margin-top:17px}.cols{display:grid;grid-template-columns:1.35fr 1fr;gap:17px}.stack{display:grid;gap:15px}.row{display:flex;align-items:center;justify-content:space-between;gap:12px}.actions{display:flex;gap:9px;align-items:center;flex-wrap:wrap}.divider{height:1px;background:var(--line);margin:17px 0}.hint{background:var(--warm);border:1px solid #ebe0c8;border-radius:12px;padding:13px 16px;color:#735d3a;font-size:12px}
+input[type=text],input[type=search],textarea,select{border:1px solid #dce3de;border-radius:9px;background:#fff;padding:11px 12px;outline:none;width:100%;color:var(--ink)}:focus-visible{outline:3px solid #9acdc0;outline-offset:2px}input:focus,textarea:focus,select:focus{border-color:#7aac9e}textarea{resize:vertical;min-height:98px}label{font-size:12px;font-weight:700;color:#4c625a;display:block;margin:0 0 6px}.field{margin-bottom:14px}.check{display:flex;align-items:flex-start;gap:9px;font-size:12px;color:var(--muted)}.check input{margin:2px 0}.check label{margin:0;font-weight:500}
+.memory{padding:17px 0;border-bottom:1px solid var(--line)}.memory:last-child{border-bottom:0}.memory-title{font-weight:750;font-size:14px}.memory-content{white-space:pre-wrap;overflow-wrap:anywhere;color:#4f5f5a;margin:8px 0;font-size:13px;max-height:140px;overflow:auto}.tag{display:inline-block;background:#f0f3ef;border:1px solid #e3e9e2;border-radius:6px;padding:3px 6px;font-size:10px;font-weight:600;color:#566963;margin:0 4px 4px 0}.tag.verified{background:#e6f4ea;color:#276b53;border-color:#bfe4ca}.tag.draft{background:#faf3e7;color:#916738;border-color:#f0dfbe}.tag.hint-tag{background:#f5f5f5}
+.empty{text-align:center;padding:55px 16px;color:var(--muted)}.empty strong{display:block;color:var(--ink);font-size:15px;margin-bottom:6px}.verdict{padding:17px;border-radius:11px;background:#eff5f0;border:1px solid #d8e9df}.verdict.worse{background:#fff0ec;border-color:#f1cfc7}.verdict.insufficient_data{background:#f7f5ed;border-color:#e9e2ce}
+.code{background:#1d2927;color:#d1eade;padding:18px;border-radius:11px;overflow-x:auto;font-size:12px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;overflow-wrap:anywhere}
+.toast{position:fixed;right:24px;bottom:24px;padding:12px 16px;border-radius:11px;background:#243a33;color:#fff;box-shadow:0 12px 40px #0002;font-size:13px;max-width:min(370px,calc(100vw - 48px));display:none;z-index:10}.toast.error{background:#923f3b}.sep{height:1px;background:var(--line);margin:14px 0}.status{color:var(--muted);font-size:12px;padding:8px 0}
+@media(max-width:1000px){.metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.cols{grid-template-columns:1fr}}
+@media(max-width:680px){.app{display:block}aside{padding:14px;border-right:0;border-bottom:1px solid var(--line);gap:10px}.brand{font-size:18px}nav{display:flex;overflow:auto;gap:4px}nav button{white-space:nowrap;padding:9px}.side-note{display:none}main{padding:20px 15px}.top{margin-bottom:22px}.metrics{gap:9px}.card{padding:14px}.panel{padding:17px}.metric{font-size:24px}}
+</style>
+</head>
+<body>
+<div class="app">
+<aside>
+  <div class="brand"><span class="mark">◈</span> cortex<span style="color:#8b9a91;font-size:12px;letter-spacing:0"> / experience</span></div>
+  <nav aria-label="Primary navigation" id="nav">
+    <button class="active" data-view="overview">Overview</button>
+    <button data-view="memories">Memory</button>
+    <button data-view="learning">Learning</button>
+    <button data-view="datasets">Datasets</button>
+    <button data-view="usage">Usage</button>
+    <button data-view="api">API & SDK</button>
+  </nav>
+  <div class="side-note">EXPERIENCE V1 · DEVELOPER PREVIEW<br>Capture knowledge. Review evidence. Improve deliberately.<br><br><a href="/">← Agent Ops Hub</a></div>
+</aside>
+<main>
+<div class="top">
+  <div><div class="eyebrow">Cortex Experience / developer preview</div><h1 id="page-title">Give your agents a memory.</h1><p id="page-desc" class="sub">Capture experience, verify what works, and prepare portable agent knowledge.</p></div>
+  <span class="pill">● API connected</span>
+</div>
+<section id="view" aria-live="polite"><div class="status">Loading your workspace…</div></section>
+</main>
+</div>
+<div role="status" aria-live="polite" id="toast" class="toast"></div>
+<script>
+"use strict";
+const BASE="/api/v1/experience";
+const state={view:"overview",summary:{},agents:[],memories:[],usage:[],dataset:{},selectedAgent:"",query:""};
+const descriptions={
+ overview:["Give your agents a memory.","Capture experience, verify what works, and prepare portable agent knowledge."],
+ memories:["Experience library.","Create, search, and review agent knowledge deliberately."],
+ learning:["Did that change help?","Compare completed agent runs across configuration versions. Numbers alone are not proof of correctness."],
+ datasets:["Own your training data.","Export only human-verified, explicitly approved memories."],
+ usage:["Know what you use.","Transparent diagnostic counters now; no charges in the v1 preview."],
+ api:["Build with the API.","Use your existing agents and runtime. No forced migrations."]};
+const el=(tag,cls,text)=>{const node=document.createElement(tag);if(cls)node.className=cls;if(text!==undefined)node.textContent=text;return node;};
+const qs=(id)=>document.getElementById(id);
+function toast(message,error){const t=qs("toast");t.textContent=message;t.className="toast"+(error?" error":"");t.style.display="block";clearTimeout(toast.timer);toast.timer=setTimeout(()=>t.style.display="none",4400);}
+async function api(path,options){const settings=Object.assign({credentials:"same-origin"},options||{});const response=await fetch(BASE+path,settings);if(!response.ok){let message="Request failed ("+response.status+")";try{const body=await response.json();message=typeof body.detail==="string"?body.detail:message;}catch(e){}if(response.status===401)message="Session expired. Return to the main Cortex login.";throw new Error(message);}if(response.status===204)return null;return response.json();}
+async function refresh(){try{const values=await Promise.all([api("/summary"),api("/agents"),api("/memories?limit=100"),api("/usage"),api("/datasets/preview")]);state.summary=values[0];state.agents=values[1].data;state.memories=values[2].data;state.usage=values[3].units;state.dataset=values[4];render();}catch(e){qs("view").replaceChildren(el("div","hint","Unable to load Cortex Experience: "+e.message));}}
+function go(view){state.view=view;document.querySelectorAll("#nav button").forEach(b=>b.classList.toggle("active",b.dataset.view===view));render();window.scrollTo({top:0,behavior:"smooth"});}
+document.querySelectorAll("#nav button").forEach(b=>b.addEventListener("click",()=>go(b.dataset.view)));
+function section(title){const x=el("section","panel");x.appendChild(el("h2",null,title));return x;}
+function button(text,fn,cls){const x=el("button","btn "+(cls||""),text);x.type="button";x.addEventListener("click",fn);return x;}
+function metric(label,value,note){const card=el("div","card");card.append(el("div","muted small",label),el("div","metric",String(value)),el("div","muted small",note));return card;}
+function render(){const desc=descriptions[state.view];qs("page-title").textContent=desc[0];qs("page-desc").textContent=desc[1];const root=qs("view");root.replaceChildren();({
+overview:renderOverview,memories:renderMemories,learning:renderLearning,
+datasets:renderDatasets,usage:renderUsage,api:renderApi})[state.view](root);}
+function renderOverview(root){
+ const m=el("div","metrics");m.append(metric("Saved memories",state.summary.memory_count||0,"Owned by your workspace"),metric("Verified memories",state.summary.verified_count||0,"Human reviewed"),metric("Training-eligible",state.summary.training_eligible||0,"Explicit opt-in"),metric("Run feedback",state.summary.feedback_count||0,"Human ratings"));root.append(m);
+ const cols=el("div","cols"),a=section("Start building"),b=section("How Cortex learns");
+ const p=el("p","muted","Add your first experience and verify it after review. Nothing is trained automatically.");a.append(p,button("Create a memory →",()=>go("memories")));
+ const steps=["01  Capture successful work or a correction","02  Review the source and verification evidence","03  Compare agent performance across versions","04  Approve examples for dataset export"];steps.forEach(x=>b.appendChild(el("div","memory small",x)));cols.append(a,b);root.append(cols);
+ const c=section("Recently captured");if(!state.memories.length){const blank=el("div","empty");blank.append(el("strong",null,"Your workspace is ready"),el("span",null,"Add a memory to see your experience history here."));c.append(blank);}else state.memories.slice(0,4).forEach(x=>c.appendChild(memoryCard(x,true)));root.append(c);
+}
+function memoryCard(memory,compact){
+ const x=el("div","memory"),top=el("div","row"),left=el("div");
+ left.append(el("div","memory-title",memory.title),el("div","muted small",memory.kind+" · "+(memory.created_at||"").slice(0,10)));
+ top.append(left,el("span","tag "+memory.status,memory.status));x.append(top);
+ x.append(el("div","memory-content",memory.content));
+ const tags=el("div");(memory.tags||[]).forEach(t=>tags.appendChild(el("span","tag",t)));x.append(tags);
+ if(!compact){const actions=el("div","actions");
+ actions.append(button("Edit",()=>editMemory(memory,x),"alt"));
+ if(memory.status!=="verified")actions.append(button("Verify",()=>verifyMemory(memory),"alt"));
+ else actions.append(el("span","small muted","Verified: "+memory.verification_note));
+ if(memory.training_opt_in)actions.append(el("span","tag verified","Training opt-in"));
+ actions.append(button("Delete",()=>deleteMemory(memory),"ghost"));x.append(actions);}
+ return x;
+}
+function editMemory(memory,container){
+ container.replaceChildren();
+ const heading=el("h3",null,"Edit memory");container.append(heading);
+ const note=el("p","muted small","Any changes reset verification and training export consent so the updated memory can be reviewed again.");container.append(note);
+ const form=document.createElement("form");form.style.marginTop="14px";
+ function field(name,node){
+  const wrap=el("div","field");const lab=el("label",null,name);
+  lab.htmlFor=node.id;wrap.append(lab,node);return wrap;
+ }
+ const title=el("input");title.type="text";title.id="edit-title-"+memory.id;title.value=memory.title;title.required=true;title.minLength=2;title.maxLength=160;
+ const content=el("textarea");content.id="edit-content-"+memory.id;content.value=memory.content;content.required=true;content.minLength=2;content.maxLength=8000;
+ const kind=el("select");kind.id="edit-kind-"+memory.id;
+ ["knowledge","preference","correction","skill"].forEach(k=>{
+  const opt=el("option",null,k);opt.value=k;kind.append(opt);
+ });kind.value=memory.kind;
+ const tags=el("input");tags.type="text";tags.id="edit-tags-"+memory.id;tags.value=(memory.tags||[]).join(", ");tags.placeholder="python, backend, fastapi";
+ const buttons=el("div","actions");
+ const save=el("button","btn","Save changes");save.type="submit";
+ buttons.append(save,button("Cancel",()=>render(),"alt"));
+ form.append(field("Title",title),field("Knowledge type",kind),field("Experience",content),field("Tags (comma-separated)",tags),buttons);
+ form.addEventListener("submit",async event=>{
+  event.preventDefault();save.disabled=true;
+  try{
+   const nextTags=tags.value.split(",").map(t=>t.trim()).filter(Boolean);
+   const update={title:title.value,kind:kind.value,content:content.value,tags:nextTags};
+   await api("/memories/"+encodeURIComponent(memory.id)+"/content",{
+    method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify(update)
+   });
+   toast("Memory updated. Review required before training export.");
+   await refresh();
+  }catch(e){toast(e.message,true);}
+  finally{save.disabled=false;}
+ });
+ container.append(form);
+ title.focus();
+}
+async function verifyMemory(memory){const note=window.prompt("Verification evidence (at least 10 characters):","Reviewed and confirmed against a trusted source.");if(note===null)return;
+ if(note.trim().length<10){toast("Please provide at least 10 characters of verification evidence.",true);return;}
+ const consent=window.confirm("Allow this verified memory to be included in future manual training dataset exports? Cancel keeps it excluded.");
+ try{await api("/memories/"+encodeURIComponent(memory.id),{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({status:"verified",verification_note:note,training_opt_in:consent})});toast("Memory verified. No model training was initiated.");await refresh();}catch(e){toast(e.message,true);}}
+async function deleteMemory(memory){if(!window.confirm("Permanently delete this memory from Cortex?"))return;try{await api("/memories/"+encodeURIComponent(memory.id),{method:"DELETE"});toast("Memory deleted");await refresh();}catch(e){toast(e.message,true);}}
+function renderMemories(root){
+ const cols=el("div","cols"),list=section("Your experience library"),form=section("Capture experience");
+ const search=el("input");search.type="search";search.placeholder="Search saved memory…";search.value=state.query;search.setAttribute("aria-label","Search saved memory");
+ const results=el("div");function update(){results.replaceChildren();const q=state.query.trim().toLowerCase();const matches=state.memories.filter(x=>(x.title+" "+x.content).toLowerCase().includes(q));if(!matches.length)results.append(el("div","empty","No matching memories yet."));else matches.forEach(x=>results.appendChild(memoryCard(x,false)));}search.addEventListener("input",()=>{state.query=search.value;update();});list.append(search,results);update();
+ const f=document.createElement("form");f.id="memory-form";
+ function field(labelText,input){const wrap=el("div","field"),label=el("label",null,labelText);label.htmlFor=input.id;wrap.append(label,input);return wrap;}
+ const title=el("input");title.type="text";title.id="mem-title";title.required=true;title.maxLength=160;title.placeholder="e.g. Prefer typed FastAPI endpoints";
+ const content=el("textarea");content.id="mem-content";content.required=true;content.maxLength=8000;content.placeholder="What should future agents know or do differently?";
+ const kind=el("select");kind.id="mem-kind";["knowledge","preference","correction","skill"].forEach(k=>{const o=el("option",null,k);o.value=k;kind.append(o);});
+ const agent=el("select");agent.id="mem-agent";let none=el("option",null,"General (no agent assigned)");none.value="";agent.append(none);state.agents.forEach(a=>{const o=el("option",null,a.name);o.value=a.id;agent.append(o);});
+ const tags=el("input");tags.type="text";tags.id="mem-tags";tags.placeholder="api, python, design";
+ const opt=el("input");opt.type="checkbox";opt.id="mem-training";const check=el("div","check");const optLabel=el("label",null,"Permit manual dataset export after separate verification. Off by default.");optLabel.htmlFor=opt.id;check.append(opt,optLabel);
+ const submit=el("button","btn","Save as draft");submit.type="submit";
+ f.append(field("Title",title),field("Knowledge type",kind),field("Agent",agent),field("Experience",content),field("Tags (comma-separated)",tags),check,el("div","sep"),submit);
+ f.addEventListener("submit",async e=>{e.preventDefault();submit.disabled=true;try{const payload={title:title.value,content:content.value,kind:kind.value,agent_id:agent.value||null,tags:tags.value.split(",").map(x=>x.trim()).filter(Boolean),training_opt_in:opt.checked};
+ await api("/memories",{method:"POST",headers:{"Content-Type":"application/json","Idempotency-Key":crypto.randomUUID()},body:JSON.stringify(payload)});f.reset();toast("Saved as a draft. Review before trusting.");await refresh();}catch(err){toast(err.message,true);}finally{submit.disabled=false;}});
+ form.append(el("p","muted small","Memories remain private to the authenticated owner. The first version uses lexical search, not embeddings."),f);cols.append(list,form);root.append(cols);
+}
+function renderLearning(root){
+ const panel=section("Version performance"),label=el("label",null,"Choose an agent"),select=el("select");select.id="learning-agent";label.htmlFor=select.id;
+ const blank=el("option",null,"Select an agent");blank.value="";select.append(blank);state.agents.forEach(a=>{const o=el("option",null,a.name+" · v"+a.version);o.value=a.id;select.append(o);});
+ const result=el("div");panel.append(el("p","muted small","This reads actual run history by configuration version. A completed run does not by itself prove a correct result."),label,select,el("div","sep"),result);root.append(panel);
+ select.value=state.selectedAgent;select.addEventListener("change",()=>{state.selectedAgent=select.value;loadLearning();});
+ async function loadLearning(){result.replaceChildren();if(!select.value){result.append(el("div","empty","Choose an agent to inspect version performance."));return;}
+ try{const data=await api("/agents/"+encodeURIComponent(select.value)+"/performance");const v=data.verdict;const note=el("div","verdict "+v.direction);note.append(el("h3",null,v.direction.replaceAll("_"," ")),el("div","muted small",v.reason));if(v.delta!==undefined)note.append(el("div","metric",(v.delta>0?"+":"")+(v.delta*100).toFixed(1)+"pp"));result.append(note);
+ if(data.versions.length){data.versions.forEach(t=>{const line=el("div","memory");line.append(el("h3",null,"Version "+t.version+" · "+t.runs+" runs"),el("div","muted small",(t.completion_rate*100).toFixed(1)+"% completed · "+(t.escalation_rate*100).toFixed(1)+"% escalated · "+t.average_tokens+" average tokens"));result.append(line);});}else result.append(el("div","empty","No recorded runs yet. Execute this agent through Cortex to generate version history."));
+ result.append(el("p","muted small",data.caution));
+ }catch(e){result.append(el("div","hint",e.message));}}
+ loadLearning();
+ const next=section("What comes next");next.append(el("p","muted","The next milestone adds curated held-out task datasets and direct skill effectiveness experiments. This release reports operational signals only; it does not claim statistical significance."));root.append(next);
+}
+function renderDatasets(root){
+ const p=section("Curated training examples"),count=el("div","metric",String(state.dataset.eligible||0));p.append(el("p","muted","Memories explicitly marked as training-eligible and verified by a human."),count,el("div","muted small","Approved JSONL records"));
+ p.append(el("div","divider"));p.append(el("div","hint","Export is an explicit download. No data is sent to model providers or used to train a model automatically."));
+ p.append(el("div","divider"));p.append(button("Export approved JSONL",async()=>{try{const response=await fetch(BASE+"/datasets/export",{credentials:"same-origin"});if(!response.ok)throw new Error("Export is not permitted for this session.");const blob=await response.blob();const url=URL.createObjectURL(blob);const a=document.createElement("a");a.href=url;a.download="cortex-experience.jsonl";document.body.append(a);a.click();a.remove();URL.revokeObjectURL(url);await refresh();toast("Dataset exported.");}catch(e){toast(e.message,true);}}));root.append(p);
+ const guide=section("The data lifecycle");["1. Capture a draft memory with a source or correction.","2. Verify the information and document why it is reliable.","3. Explicitly opt that specific memory into dataset export.","4. Review the downloaded dataset before any separate training job."].forEach(t=>guide.append(el("div","memory small",t)));root.append(guide);
+}
+function renderUsage(root){
+ const wrap=el("div","metrics");const total=state.usage.reduce((n,x)=>n+x.count,0);wrap.append(metric("Recorded operations",total,"This owner"),metric("Charge", "$0.00","Preview does not invoice"),metric("Metered categories",state.usage.length,"Transparent units"),metric("Retention","Database","Operational counters"));root.append(wrap);
+ const panel=section("Usage ledger");if(!state.usage.length)panel.append(el("div","empty","Operations will appear here after your first write."));state.usage.forEach(x=>{const r=el("div","memory row");r.append(el("span",null,x.operation),el("strong",null,String(x.count)));panel.append(r);});root.append(panel);root.append(el("div","hint","This is an informational meter, not revenue-grade billing. Before charging customers, Cortex needs durable idempotent event ingestion, invoice reconciliation, budget controls, pricing versions and billing-provider integration."));
+}
+function renderApi(root){
+ const p=section("The first API request");p.append(el("p","muted","Generate an API key in the existing Cortex account controls. Select the experience:read, experience:write and (only if needed) experience:export scopes."));p.append(el("pre","code","curl -X POST http://localhost:3000/api/v1/experience/memories \\\n  -H 'Authorization: Bearer ctx_YOUR_API_KEY' \\\n  -H 'Content-Type: application/json' \\\n  -H 'Idempotency-Key: first-memory' \\\n  -d '{\"title\":\"Prefer typed APIs\",\"kind\":\"preference\",\"content\":\"Use typed FastAPI request models.\"}'"));
+ p.append(el("p","muted small","The current v1 uses REST and the existing Cortex authentication system. SDK wrappers and automated learning are on the roadmap."));root.append(p);
+ const refs=section("Resources");["GET /summary · overview metrics","GET /memories · lexical search","POST /memories · save draft experience","PATCH /memories/{id} · human verification","POST /feedback · rate a recorded run","GET /agents/{id}/performance · compare versions","GET /datasets/preview · training eligibility","GET /datasets/export · approved JSONL","GET /usage · informational meter"].forEach(x=>refs.append(el("div","memory small",x)));root.append(refs);
+}
+refresh();
+</script>
+</body>
+</html>

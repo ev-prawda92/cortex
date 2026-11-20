@@ -731,6 +731,13 @@ async def api_access_boundary(request: Request, call_next):
     return await call_next(request)
 
 
+
+# Additive v1: persistent experience, opt-in memory, and version comparisons.
+# Import before the application lifespan initializes SQLAlchemy metadata.
+from experience_v1 import install_experience
+install_experience(app, _get_session, _check_scope, _agent_access_allowed)
+
+
 # ─────────────────────────────────────────────── webhooks
 import hmac
 import threading
@@ -5465,6 +5472,7 @@ h4{font-size:10.5px;font-weight:600;letter-spacing:.1em;text-transform:uppercase
     <div class="more-wrap">
       <button class="more-btn" id="more-toggle" onclick="toggleMoreMenu(event)">More ▾</button>
       <div class="more-menu" id="more-menu">
+        <button class="navbtn" id="nav-experience" onclick="window.location.href='/experience'" style="color:#f7bf87;font-weight:700">✦ Experience v1</button>
         <button class="navbtn" id="nav-control" onclick="setView('control');closeMore()">Control</button>
         <button class="navbtn" id="nav-integrations" onclick="setView('integrations');closeMore()">Integrations</button>
         <button class="navbtn" id="nav-deploy" onclick="setView('deploy');closeMore()">Deploy</button>
@@ -6953,13 +6961,21 @@ async function renderSettings(){
           <input type="text" id="new_key_name" placeholder="e.g. CI Pipeline" style="width:100%;padding:6px 8px;border:1px solid var(--line);border-radius:3px;font-size:12px">
         </div>
         <div><label style="font-size:11px;display:block;margin-bottom:4px">Scopes</label>
-          <select id="new_key_scopes" multiple style="padding:4px 6px;border:1px solid var(--line);border-radius:3px;font-size:11px;min-width:160px" size="3">
+          <select id="new_key_scopes" multiple style="padding:4px 6px;border:1px solid var(--line);border-radius:3px;font-size:11px;min-width:160px" size="5">
             <option value="agents:read" selected>agents:read</option>
             <option value="agents:run" selected>agents:run</option>
             <option value="agents:write">agents:write</option>
+            <option value="experience:read">experience:read</option>
+            <option value="experience:write">experience:write</option>
           </select>
         </div>
         <button class="btn accent" style="padding:6px 14px" onclick="createApiKey()">Create Key</button>
+      </div>
+      <div class="hint" style="margin:8px 0 16px">
+        Connect to Claude Code?
+        <button id="cortex_download_setup" class="btn accent" style="padding:7px 14px;margin-left:8px" onclick="downloadClaudeCodeSetup()">Download setup file (no copying)</button>
+        <button class="btn" style="padding:7px 14px;margin-left:8px" onclick="createClaudeCodeKey()">Show new API key</button>
+        <div style="margin-top:8px">Recommended: downloads a one-time setup file for your local installer. The file contains a secret, so import it immediately and don't share it. Both options create a limited key with experience:read and experience:write only; no training export.</div>
       </div>
       <div id="new_key_result" style="display:none;margin-bottom:16px;padding:12px;background:#f0fdf4;border:1px solid #86efac;border-radius:4px;font-family:'IBM Plex Mono';font-size:12px;word-break:break-all"></div>
       ${keys.length?`<table style="width:100%;border-collapse:collapse;font-size:13px">
@@ -7055,20 +7071,123 @@ async function saveSettings(){
   await boot();
 }
 
+function showNewApiKey(key){
+  // Show secrets in a focused, persistent modal: never rely on a box that
+  // might be scrolled out of view or replaced by an async settings re-render.
+  if(typeof key!=='string' || !key.startsWith('ctx_')){
+    alert('Cortex did not return an API key. Please try again.');return;
+  }
+  const previous=document.getElementById('cortex-key-modal');
+  if(previous)previous.remove();
+  const backdrop=document.createElement('div');
+  backdrop.id='cortex-key-modal';
+  backdrop.style.cssText='position:fixed;inset:0;z-index:100000;display:flex;align-items:center;justify-content:center;padding:20px;background:rgba(20,31,27,.68)';
+  const dialog=document.createElement('div');
+  dialog.setAttribute('role','dialog');
+  dialog.setAttribute('aria-modal','true');
+  dialog.setAttribute('aria-labelledby','cortex-key-modal-title');
+  dialog.style.cssText='width:min(560px,100%);max-height:90vh;overflow-y:auto;background:#fff;color:#23302c;border-radius:16px;padding:28px;box-shadow:0 25px 70px rgba(0,0,0,.25)';
+  const title=document.createElement('h2');
+  title.id='cortex-key-modal-title';title.textContent='Your new Cortex API key';
+  title.style.cssText='font-size:22px;margin:0 0 9px;font-weight:750';
+  const instructions=document.createElement('p');
+  instructions.textContent='This is the only time the full key will be shown. Copy it into your local Claude Code installer, not a chat or GitHub.';
+  instructions.style.cssText='font-size:14px;line-height:1.55;color:#566761;margin:0 0 15px';
+  const label=document.createElement('label');
+  label.textContent='Full API key';label.htmlFor='cortex-generated-api-key';
+  label.style.cssText='display:block;font-size:12px;font-weight:700;margin-bottom:8px';
+  const input=document.createElement('input');
+  input.id='cortex-generated-api-key';input.type='text';input.readOnly=true;
+  input.value=key;input.autocomplete='off';input.spellcheck=false;
+  input.style.cssText='width:100%;padding:13px;box-sizing:border-box;border-radius:9px;border:1px solid #b5cac0;background:#f5f9f6;color:#173c33;font:13px monospace';
+  input.addEventListener('click',()=>input.select());
+  const buttons=document.createElement('div');
+  buttons.style.cssText='display:flex;gap:10px;flex-wrap:wrap;margin-top:17px';
+  const copy=document.createElement('button');
+  copy.type='button';copy.className='btn accent';copy.textContent='Copy API key';
+  const select=document.createElement('button');
+  select.type='button';select.className='btn';select.textContent='Select key manually';
+  select.onclick=()=>{input.focus();input.select();};
+  const done=document.createElement('button');
+  done.type='button';done.className='btn';done.textContent='I saved the key — close';
+  done.onclick=()=>{
+    input.value='';backdrop.remove();
+  };
+  copy.onclick=async()=>{
+    try{
+      if(!navigator.clipboard || !navigator.clipboard.writeText)throw Error('Clipboard unavailable');
+      await navigator.clipboard.writeText(key);
+      copy.textContent='Copied! Paste into the local installer.';
+    }catch(err){
+      input.focus();input.select();
+      copy.textContent='Selected — press Command+C';
+      select.textContent='Select again';
+    }
+  };
+  const foot=document.createElement('p');
+  foot.textContent='If you close this window before copying, the key cannot be revealed again. Create a replacement key and revoke the unused one.';
+  foot.style.cssText='font-size:12px;color:#89583d;margin:17px 0 0;line-height:1.5';
+  buttons.append(copy,select,done);
+  dialog.append(title,instructions,label,input,buttons,foot);
+  backdrop.append(dialog);document.body.append(backdrop);
+  input.focus();input.select();
+}
 async function createApiKey(){
   const name=document.getElementById('new_key_name').value.trim();
   if(!name){alert('Enter a key name');return;}
   const sel=document.getElementById('new_key_scopes');
   const scopes=Array.from(sel.selectedOptions).map(o=>o.value);
+  if(!scopes.length){alert('Select at least one scope');return;}
   const r=await fetch('/api/keys',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,scopes})});
   const d=await r.json();
   if(d.ok){
-    const box=document.getElementById('new_key_result');
-    box.style.display='block';
-    box.innerHTML='<strong style="color:#16a34a">Copy this key now — it will not be shown again:</strong><br><br>'+esc(d.key);
+    showNewApiKey(d.key);
     document.getElementById('new_key_name').value='';
-    setTimeout(()=>renderSettings(),8000);
+  }else alert('Unable to create key; check your session');
+}
+async function downloadClaudeCodeSetup(){
+  const ok=confirm('Cortex will create a new Claude Code read/write key and download a temporary setup file containing it. Import the file on this Mac and do not share it. Continue?');
+  if(!ok)return;
+  const button=document.getElementById('cortex_download_setup');
+  if(button)button.disabled=true;
+  try{
+    const response=await fetch('/api/keys',{
+      method:'POST',credentials:'same-origin',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({name:'Claude Code — Cortex Experience',scopes:['experience:read','experience:write']})
+    });
+    if(!response.ok)throw new Error('Key creation failed ('+response.status+').');
+    const created=await response.json();
+    if(!created.ok || typeof created.key!=='string' || !created.key.startsWith('ctx_')){
+      throw new Error('Cortex did not return a usable key.');
+    }
+    const contents=JSON.stringify({
+      format:'cortex-claude-code',version:1,
+      url:window.location.origin,api_key:created.key
+    });
+    const objectUrl=URL.createObjectURL(new Blob([contents],{type:'application/json'}));
+    const link=document.createElement('a');
+    link.href=objectUrl;link.download='cortex-claude-code-setup.json';
+    link.style.display='none';
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(()=>URL.revokeObjectURL(objectUrl),10000);
+    alert('Cortex setup file download requested. Open Terminal and run:\n\ncd ~/cortex\nsource .venv/bin/activate\npython scripts/setup_claude_code.py --from-download\n\nThe installer deletes the downloaded secret after successful import. If no file downloaded, check your browser downloads; revoke the unused key before retrying.');
+  }catch(error){
+    alert('Unable to download Cortex setup: '+error.message+'\nIf a key was created, revoke the unused key in Settings before trying again.');
+  }finally{
+    if(button)button.disabled=false;
   }
+}
+async function createClaudeCodeKey(){
+  const r=await fetch('/api/keys',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+    name:'Claude Code — Cortex Experience',
+    scopes:['experience:read','experience:write']
+  })});
+  const d=await r.json();
+  if(d.ok)showNewApiKey(d.key);
+  else alert('Unable to create key; check your Cortex login');
 }
 async function revokeApiKey(id){
   if(!confirm('Revoke this API key? Any systems using it will stop working.'))return;
