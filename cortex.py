@@ -6961,13 +6961,19 @@ async function renderSettings(){
           <input type="text" id="new_key_name" placeholder="e.g. CI Pipeline" style="width:100%;padding:6px 8px;border:1px solid var(--line);border-radius:3px;font-size:12px">
         </div>
         <div><label style="font-size:11px;display:block;margin-bottom:4px">Scopes</label>
-          <select id="new_key_scopes" multiple style="padding:4px 6px;border:1px solid var(--line);border-radius:3px;font-size:11px;min-width:160px" size="3">
+          <select id="new_key_scopes" multiple style="padding:4px 6px;border:1px solid var(--line);border-radius:3px;font-size:11px;min-width:160px" size="5">
             <option value="agents:read" selected>agents:read</option>
             <option value="agents:run" selected>agents:run</option>
             <option value="agents:write">agents:write</option>
+            <option value="experience:read">experience:read</option>
+            <option value="experience:write">experience:write</option>
           </select>
         </div>
         <button class="btn accent" style="padding:6px 14px" onclick="createApiKey()">Create Key</button>
+      </div>
+      <div class="hint" style="margin:8px 0 16px">
+        Connect to Claude Code? <button class="btn accent" style="padding:6px 12px;margin-left:8px" onclick="createClaudeCodeKey()">Create Claude Code key</button>
+        <div style="margin-top:6px">Creates a least-privilege key with experience:read and experience:write only. No training export.</div>
       </div>
       <div id="new_key_result" style="display:none;margin-bottom:16px;padding:12px;background:#f0fdf4;border:1px solid #86efac;border-radius:4px;font-family:'IBM Plex Mono';font-size:12px;word-break:break-all"></div>
       ${keys.length?`<table style="width:100%;border-collapse:collapse;font-size:13px">
@@ -7063,20 +7069,43 @@ async function saveSettings(){
   await boot();
 }
 
+function showNewApiKey(key){
+  const box=document.getElementById('new_key_result');
+  if(!box)return;
+  box.style.display='block';
+  box.replaceChildren();
+  const label=document.createElement('strong');label.textContent='Copy this key now — it will not be shown again:';
+  label.style.color='#16a34a';
+  const code=document.createElement('code');code.textContent=key;
+  code.style.display='block';code.style.margin='10px 0';code.style.wordBreak='break-all';
+  const copy=document.createElement('button');copy.textContent='Copy Key';copy.className='btn accent';
+  copy.onclick=async()=>{
+    try{await navigator.clipboard.writeText(key);copy.textContent='Copied';}
+    catch(_){copy.textContent='Select key above to copy manually';}
+  };
+  box.append(label,code,copy);
+}
 async function createApiKey(){
   const name=document.getElementById('new_key_name').value.trim();
   if(!name){alert('Enter a key name');return;}
   const sel=document.getElementById('new_key_scopes');
   const scopes=Array.from(sel.selectedOptions).map(o=>o.value);
+  if(!scopes.length){alert('Select at least one scope');return;}
   const r=await fetch('/api/keys',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,scopes})});
   const d=await r.json();
   if(d.ok){
-    const box=document.getElementById('new_key_result');
-    box.style.display='block';
-    box.innerHTML='<strong style="color:#16a34a">Copy this key now — it will not be shown again:</strong><br><br>'+esc(d.key);
+    showNewApiKey(d.key);
     document.getElementById('new_key_name').value='';
-    setTimeout(()=>renderSettings(),8000);
-  }
+  }else alert('Unable to create key; check your session');
+}
+async function createClaudeCodeKey(){
+  const r=await fetch('/api/keys',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+    name:'Claude Code — Cortex Experience',
+    scopes:['experience:read','experience:write']
+  })});
+  const d=await r.json();
+  if(d.ok)showNewApiKey(d.key);
+  else alert('Unable to create key; check your Cortex login');
 }
 async function revokeApiKey(id){
   if(!confirm('Revoke this API key? Any systems using it will stop working.'))return;
