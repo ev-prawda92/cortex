@@ -731,6 +731,13 @@ async def api_access_boundary(request: Request, call_next):
     return await call_next(request)
 
 
+
+# Additive v1: persistent experience, opt-in memory, and version comparisons.
+# Import before the application lifespan initializes SQLAlchemy metadata.
+from experience_v1 import install_experience
+install_experience(app, _get_session, _check_scope, _agent_access_allowed)
+
+
 # ─────────────────────────────────────────────── webhooks
 import hmac
 import threading
